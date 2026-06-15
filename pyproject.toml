@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sm121-kernels"
+version = "0.1.0"
+description = "Python ctypes bindings for sm121-kernels — CUDA/PTX kernels for the NVIDIA DGX Spark (GB10, SM121)"
+readme = "README.md"
+license = { text = "MIT OR Apache-2.0" }
+authors = [
+    { name = "Blake Ledden, Second Nature Computing" },
+]
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
+    "Environment :: GPU :: NVIDIA CUDA",
+]
+
+[tool.setuptools.packages.find]
+where = ["python"]
+include = ["sm121_kernels*"]

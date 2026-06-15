@@ -1,0 +1,85 @@
+// f32_weighted_sum_to_bf16.ptx
+//
+// Fused weighted column sum + cast: for each column j in [0, n):
+//   out_bf16[j] = bf16( sum_{i=0}^{num_rows-1} weights[i] * in_f32[i, j] )
+//
+// Replaces (num_rows × f32_axpy) + (f32_to_bf16) launches with a single kernel.
+// Used by the MoE per-expert decode path to combine the [num_active, hidden]
+// down-projection outputs with their routing weights into the final BF16 mlp_out.
+//
+// Layout:
+//   in_f32:   [num_rows, n] f32 row-major
+//   weights:  [num_rows]   f32 (on device — htod once per layer, ~24 B at top_k=6)
+//   out_bf16: [n]          bf16
+//
+// Constraints: num_rows ≤ MAX_ROWS (=16, plenty for top_k=6/8). n any positive value.
+// Grid: ceil(n / 256), block 256.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+.visible .entry f32_weighted_sum_to_bf16(
+    .param .u64 param_in_f32,        // [num_rows, n] f32
+    .param .u64 param_weights,       // [num_rows] f32 device buffer
+    .param .u64 param_out_bf16,      // [n] bf16
+    .param .u32 param_num_rows,      // number of rows to weight-sum
+    .param .u32 param_n              // columns
+)
+{
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<8>;
+    .reg .b16 %h<4>;
+    .reg .pred %p<6>;
+
+    mov.u32         %r0, BLOCK_ID_X;
+    mov.u32         %r1, %ntid.x;
+    mov.u32         %r2, THREAD_ID;
+    mad.lo.u32      %r3, %r0, %r1, %r2;     // col
+
+    ld.param.u64    %rd0, [param_in_f32];
+    ld.param.u64    %rd1, [param_weights];
+    ld.param.u64    %rd2, [param_out_bf16];
+    ld.param.u32    %r10, [param_num_rows];
+    ld.param.u32    %r11, [param_n];
+
+    setp.ge.u32     %p0, %r3, %r11;
+    @%p0 bra        done;
+
+    mov.f32         %f0, 0.0;                // accumulator
+
+    mov.u32         %r12, 0;                 // row idx
+sum_loop:
+    setp.ge.u32     %p1, %r12, %r10;
+    @%p1 bra        sum_done;
+
+    // weights[row]
+    mul.wide.u32    %rd3, %r12, 4;
+    add.u64         %rd4, %rd1, %rd3;
+    ld.global.f32   %f1, [%rd4];
+
+    // in_f32[row, col]: row * n + col, in f32 (×4 bytes)
+    mul.lo.u32      %r13, %r12, %r11;
+    add.u32         %r13, %r13, %r3;
+    mul.wide.u32    %rd5, %r13, 4;
+    add.u64         %rd6, %rd0, %rd5;
+    ld.global.f32   %f2, [%rd6];
+
+    fma.rn.f32      %f0, %f1, %f2, %f0;
+
+    add.u32         %r12, %r12, 1;
+    bra             sum_loop;
+
+sum_done:
+    CVT_F32_BF16(%h0, %f0)
+    mul.wide.u32    %rd7, %r3, 2;
+    add.u64         %rd8, %rd2, %rd7;
+    st.global.b16   [%rd8], %h0;
+
+done:
+    ret;
+}

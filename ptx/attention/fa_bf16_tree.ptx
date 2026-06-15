@@ -1,0 +1,220 @@
+// fa_bf16_tree.ptx
+//
+// Tree attention — BF16 reference.
+// Used by EAGLE-3, Medusa, and other speculative decoding schemes where a
+// draft tree is verified in parallel against a target model.
+//
+// Each draft token attends to only its ancestors (plus the base context).
+// Mask is passed as an explicit [seq_q, seq_kv] uint8 matrix, shared across
+// batches and heads (standard EAGLE-3 convention).
+//
+// Layouts:
+//   Q: [B, seq_q, H, D=128] BF16
+//   K, V: [B, seq_kv, H, D] BF16
+//   mask: [seq_q, seq_kv] u8  (1 = attend, 0 = -inf)
+//   O: [B, seq_q, H, D] BF16
+//
+// Grid: (seq_q, num_heads, batch). Block: (32, 1, 1) — one warp per (q, h, b).
+// Each thread handles 4 elements of D=128 (32 * 4 = 128).
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+#include "reduction.ptxh"
+
+#define D 128
+#define BLOCK_DIM 32
+
+.visible .entry fa_bf16_tree(
+    .param .u64 param_Q,
+    .param .u64 param_K,
+    .param .u64 param_V,
+    .param .u64 param_mask,      // [seq_q, seq_kv] u8
+    .param .u64 param_O,
+    .param .u32 param_num_heads,
+    .param .u32 param_seq_q,
+    .param .u32 param_seq_kv,
+    .param .f32 param_scale
+)
+{
+    .reg .b32 %r<48>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<32>;
+    .reg .b16 %h<8>;
+    .reg .pred %p<8>;
+
+    mov.u32     %r0, %tid.x;               // 0..31
+    mov.u32     %r30, %ctaid.x;            // q_idx
+    mov.u32     %r1, %ctaid.y;             // head
+    mov.u32     %r2, %ctaid.z;             // batch
+
+    ld.param.u64 %rd0, [param_Q];
+    ld.param.u64 %rd1, [param_K];
+    ld.param.u64 %rd2, [param_V];
+    ld.param.u64 %rd3, [param_mask];
+    ld.param.u64 %rd4, [param_O];
+    ld.param.u32 %r3, [param_num_heads];
+    ld.param.u32 %r31, [param_seq_q];
+    ld.param.u32 %r4, [param_seq_kv];
+    ld.param.f32 %f0, [param_scale];
+
+    // Q/O address: &Q[b, q, h, 0] = Q + ((b*Sq + q)*H + h)*D*2
+    //              + t*4*2 for this thread's 4 dims
+    mul.lo.u32  %r7, %r2, %r31;
+    add.u32     %r7, %r7, %r30;
+    mul.lo.u32  %r7, %r7, %r3;
+    add.u32     %r7, %r7, %r1;             // row_q
+    mul.lo.u32  %r8, %r7, D;
+    mul.wide.u32 %rd5, %r8, 2;
+    add.u64     %rd6, %rd0, %rd5;          // &Q[b,q,h,0]
+
+    // K/V base: &K[b, 0, h, 0] = K + ((b*Skv + 0)*H + h)*D*2
+    mul.lo.u32  %r9, %r2, %r4;
+    mul.lo.u32  %r9, %r9, %r3;             // (b*Skv)*H
+    add.u32     %r9, %r9, %r1;             // + h
+    mul.lo.u32  %r10, %r9, D;
+    mul.wide.u32 %rd5, %r10, 2;
+    add.u64     %rd7, %rd1, %rd5;          // &K[b,0,h,0]
+    add.u64     %rd8, %rd2, %rd5;          // &V[b,0,h,0]
+
+    // K/V stride between s positions: H*D*2 bytes
+    mul.lo.u32  %r11, %r3, D;
+    shl.b32     %r11, %r11, 1;             // stride bytes = H*D*2
+
+    // Mask base: &mask[q, 0] = mask + q * seq_kv
+    mul.lo.u32  %r12, %r30, %r4;
+    cvt.u64.u32 %rd9, %r12;
+    add.u64     %rd10, %rd3, %rd9;         // &mask[q, 0]
+
+    // Load Q into 4 FP32 registers per thread
+    shl.b32     %r13, %r0, 3;              // t*8 bytes = 4 BF16
+    cvt.u64.u32 %rd11, %r13;
+    add.u64     %rd12, %rd6, %rd11;
+    ld.global.v2.b32 {%r14, %r15}, [%rd12];
+    mov.b32     {%h0, %h1}, %r14;
+    mov.b32     {%h2, %h3}, %r15;
+    CVT_BF16_F32(%f1, %h0)
+    CVT_BF16_F32(%f2, %h1)
+    CVT_BF16_F32(%f3, %h2)
+    CVT_BF16_F32(%f4, %h3)
+
+    // Online softmax state
+    mov.f32     %f10, 0.0;  mov.f32 %f11, 0.0;  mov.f32 %f12, 0.0;  mov.f32 %f13, 0.0;
+    mov.b32     %f6, 0xff800000;
+    mov.f32     %f7, 0.0;
+
+    // Loop over s in [0, seq_kv)
+    mov.u32     %r20, 0;
+s_loop:
+    setp.ge.u32 %p1, %r20, %r4;
+    @%p1 bra    s_done;
+
+    // Load mask[q, s] (1 byte)
+    cvt.u64.u32 %rd11, %r20;
+    add.u64     %rd13, %rd10, %rd11;
+    ld.global.u8 %r21, [%rd13];
+    setp.eq.u32 %p2, %r21, 0;              // masked out?
+    @%p2 bra    s_next;
+
+    // Load K[b, s, h, t*4..t*4+3]
+    mul.lo.u32  %r22, %r20, %r11;          // s * stride
+    cvt.u64.u32 %rd11, %r22;
+    add.u64     %rd14, %rd7, %rd11;
+    cvt.u64.u32 %rd11, %r13;
+    add.u64     %rd14, %rd14, %rd11;
+    ld.global.v2.b32 {%r23, %r24}, [%rd14];
+    mov.b32     {%h0, %h1}, %r23;
+    mov.b32     {%h2, %h3}, %r24;
+    .reg .f32 _k0, _k1, _k2, _k3;
+    CVT_BF16_F32(_k0, %h0)
+    CVT_BF16_F32(_k1, %h1)
+    CVT_BF16_F32(_k2, %h2)
+    CVT_BF16_F32(_k3, %h3)
+
+    // Load V[b, s, h, t*4..t*4+3]
+    add.u64     %rd14, %rd8, %rd11;       // wait, need to rebuild; use rd15
+    cvt.u64.u32 %rd11, %r22;
+    add.u64     %rd15, %rd8, %rd11;
+    cvt.u64.u32 %rd11, %r13;
+    add.u64     %rd15, %rd15, %rd11;
+    ld.global.v2.b32 {%r25, %r26}, [%rd15];
+    mov.b32     {%h0, %h1}, %r25;
+    mov.b32     {%h2, %h3}, %r26;
+    .reg .f32 _v0, _v1, _v2, _v3;
+    CVT_BF16_F32(_v0, %h0)
+    CVT_BF16_F32(_v1, %h1)
+    CVT_BF16_F32(_v2, %h2)
+    CVT_BF16_F32(_v3, %h3)
+
+    // Partial dot Q . K
+    mul.f32     %f20, %f1, _k0;
+    fma.rn.f32  %f20, %f2, _k1, %f20;
+    fma.rn.f32  %f20, %f3, _k2, %f20;
+    fma.rn.f32  %f20, %f4, _k3, %f20;
+
+    // Warp reduce (32 threads — no SMEM needed)
+    shfl.sync.bfly.b32  %f21|%p5, %f20, 0x10, 0x1f, 0xffffffff;
+    add.f32     %f20, %f20, %f21;
+    shfl.sync.bfly.b32  %f21|%p5, %f20, 0x08, 0x1f, 0xffffffff;
+    add.f32     %f20, %f20, %f21;
+    shfl.sync.bfly.b32  %f21|%p5, %f20, 0x04, 0x1f, 0xffffffff;
+    add.f32     %f20, %f20, %f21;
+    shfl.sync.bfly.b32  %f21|%p5, %f20, 0x02, 0x1f, 0xffffffff;
+    add.f32     %f20, %f20, %f21;
+    shfl.sync.bfly.b32  %f21|%p5, %f20, 0x01, 0x1f, 0xffffffff;
+    add.f32     %f20, %f20, %f21;
+    // All threads now hold full score
+    mul.f32     %f20, %f20, %f0;           // apply scale
+
+    // Online softmax update
+    max.f32     %f30, %f6, %f20;
+    sub.f32     %f22, %f6, %f30;
+    mul.f32     %f22, %f22, LOG2E;
+    ex2.approx.ftz.f32 %f22, %f22;         // correction for old
+    sub.f32     %f23, %f20, %f30;
+    mul.f32     %f23, %f23, LOG2E;
+    ex2.approx.ftz.f32 %f23, %f23;         // p (new)
+
+    mov.f32     %f6, %f30;
+    mul.f32     %f7, %f7, %f22;
+    add.f32     %f7, %f7, %f23;
+
+    mul.f32     %f10, %f10, %f22;  fma.rn.f32 %f10, %f23, _v0, %f10;
+    mul.f32     %f11, %f11, %f22;  fma.rn.f32 %f11, %f23, _v1, %f11;
+    mul.f32     %f12, %f12, %f22;  fma.rn.f32 %f12, %f23, _v2, %f12;
+    mul.f32     %f13, %f13, %f22;  fma.rn.f32 %f13, %f23, _v3, %f13;
+
+s_next:
+    add.u32     %r20, %r20, 1;
+    bra         s_loop;
+
+s_done:
+    // Normalize O /= row_sum
+    setp.eq.f32 %p6, %f7, 0f00000000;
+    @%p6 mov.f32 %f7, 0f3f800000;
+    rcp.approx.f32 %f22, %f7;
+    mul.f32     %f10, %f10, %f22;
+    mul.f32     %f11, %f11, %f22;
+    mul.f32     %f12, %f12, %f22;
+    mul.f32     %f13, %f13, %f22;
+
+    // Store O[b, q, h, t*4..t*4+3]
+    mul.lo.u32  %r8, %r7, D;
+    mul.wide.u32 %rd5, %r8, 2;
+    add.u64     %rd12, %rd4, %rd5;
+    cvt.u64.u32 %rd11, %r13;
+    add.u64     %rd12, %rd12, %rd11;
+
+    cvt.rn.bf16.f32 %h0, %f10;
+    cvt.rn.bf16.f32 %h1, %f11;
+    mov.b32     %r14, {%h0, %h1};
+    cvt.rn.bf16.f32 %h0, %f12;
+    cvt.rn.bf16.f32 %h1, %f13;
+    mov.b32     %r15, {%h0, %h1};
+    st.global.v2.b32 [%rd12], {%r14, %r15};
+
+    ret;
+}

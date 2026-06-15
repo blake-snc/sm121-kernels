@@ -1,0 +1,104 @@
+// paged_kv_gather_bf16.ptx
+//
+// Materialize a paged KV tensor into contiguous per-sequence layout for the
+// backward orchestrator.
+//
+//   K/V (paged):        [num_pages, page_size, num_kv_heads, D] bf16
+//   page_table:         [B, max_pages] u32 (per-sequence page indices)
+//   K/V (gathered):     [B, num_kv_heads, S_kv, D] bf16
+//
+// where S_kv = pages_per_seq * page_size, pages_per_seq = ceil(seq_kv / page_size).
+// The gather copies the actual valid tokens (caller is responsible for not
+// reading past valid range).
+//
+// Each block handles (batch, page_in_seq, slot_in_page) -- ctaid.x = page slot
+// (= pages_per_seq * page_size), ctaid.y = batch. Threads cover (head * D).
+//
+// Grid: (pages_per_seq * page_size, batch, 1), Block: (256, 1, 1).
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+
+.visible .entry paged_kv_gather_bf16(
+    .param .u64 param_kv_paged,     // [num_pages, page_size, H_kv, D]
+    .param .u64 param_kv_out,       // [B, H_kv, S_kv, D]
+    .param .u64 param_page_table,   // [B, max_pages] u32
+    .param .u32 param_h_kv,
+    .param .u32 param_d,
+    .param .u32 param_page_size,
+    .param .u32 param_max_pages,
+    .param .u32 param_s_kv          // pages_per_seq * page_size (== seq_kv padded up)
+)
+{
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<14>;
+    .reg .b16 %sh<2>;
+    .reg .pred %p<3>;
+
+    mov.u32         %r0, %ctaid.x;          // slot_in_seq (0..S_kv)
+    mov.u32         %r1, %ctaid.y;          // batch idx
+    mov.u32         %r2, THREAD_ID;
+    mov.u32         %r3, %ntid.x;
+
+    ld.param.u64    %rd0, [param_kv_paged];
+    ld.param.u64    %rd1, [param_kv_out];
+    ld.param.u64    %rd2, [param_page_table];
+    ld.param.u32    %r4, [param_h_kv];
+    ld.param.u32    %r5, [param_d];
+    ld.param.u32    %r6, [param_page_size];
+    ld.param.u32    %r7, [param_max_pages];
+    ld.param.u32    %r8, [param_s_kv];
+
+    // page_in_seq = slot / page_size; slot_in_page = slot % page_size.
+    div.u32         %r9, %r0, %r6;          // page_in_seq
+    rem.u32         %r10, %r0, %r6;         // slot_in_page
+
+    // Load page_table[batch, page_in_seq]
+    mad.lo.u32      %r11, %r1, %r7, %r9;    // b * max_pages + page_in_seq
+    mul.wide.u32    %rd3, %r11, 4;
+    add.u64         %rd4, %rd2, %rd3;
+    ld.global.u32   %r12, [%rd4];           // physical_page_idx
+
+    // src base: KV[physical_page_idx, slot_in_page, 0, 0] in [P, page_size, H_kv, D]
+    // offset = ((physical_page * page_size + slot_in_page) * H_kv) * D
+    mad.lo.u32      %r13, %r12, %r6, %r10;  // phys * page_size + slot_in_page
+    mul.lo.u32      %r14, %r13, %r4;        // * H_kv
+    mul.lo.u32      %r15, %r14, %r5;        // * D
+    mul.wide.u32    %rd5, %r15, 2;
+    add.u64         %rd6, %rd0, %rd5;       // &kv_paged[phys, slot, 0, 0]
+
+    // Loop over (h * d) for thread coverage.
+    mul.lo.u32      %r16, %r4, %r5;         // total = H_kv * D
+    mov.u32         %r17, %r2;              // i = tid
+
+iloop:
+    setp.ge.u32     %p0, %r17, %r16;
+    @%p0 bra        idone;
+
+    // Decompose i into (h, d_in)
+    div.u32         %r18, %r17, %r5;        // h
+    rem.u32         %r19, %r17, %r5;        // d_in
+
+    // src_off = h * D + d_in (within slot's [H_kv, D] block)
+    mul.wide.u32    %rd7, %r17, 2;
+    add.u64         %rd8, %rd6, %rd7;
+    ld.global.b16   %sh0, [%rd8];
+
+    // dst: kv_out[batch, h, page_in_seq * page_size + slot_in_page, d_in]
+    //    = kv_out[(batch * H_kv + h) * S_kv + slot_in_seq) * D + d_in]
+    mad.lo.u32      %r20, %r1, %r4, %r18;   // batch * H_kv + h
+    mad.lo.u32      %r21, %r20, %r8, %r0;   // * S_kv + slot_in_seq
+    mad.lo.u32      %r22, %r21, %r5, %r19;  // * D + d_in
+    mul.wide.u32    %rd9, %r22, 2;
+    add.u64         %rd10, %rd1, %rd9;
+    st.global.b16   [%rd10], %sh0;
+
+    add.u32         %r17, %r17, %r3;
+    bra             iloop;
+
+idone:
+    ret;
+}

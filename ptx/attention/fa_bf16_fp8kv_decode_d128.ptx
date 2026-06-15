@@ -1,0 +1,245 @@
+// fa_bf16_fp8kv_decode_d128.ptx
+//
+// Standard MHA decode (Sq=1) with BF16 Q/O and FP8 E4M3 KV cache.
+// Per-tensor kv_scale dequantizes K and V at SMEM staging.
+//
+// Layout:
+//   Q       : [B, H, D]       BF16          (single token per batch position)
+//   K       : [B, H, Skv, D]  FP8 E4M3 (u8) (full KV cache)
+//   V       : [B, H, Skv, D]  FP8 E4M3 (u8)
+//   O       : [B, H, D]       BF16          (output)
+//   B,H,Skv : runtime dims; D = 128 (compile-time)
+//   scale, kv_scale : f32
+//
+// Algorithm (per CTA = 1 batch × 1 head):
+//   m_i = -inf, l_i = 0, O_acc[D] = 0
+//   for k = 0 to Skv-1:
+//     score = (Q · dequant(K[k])) * scale
+//     m_new = max(m_i, score)
+//     alpha = exp(m_i - m_new)
+//     p = exp(score - m_new)
+//     l_i = l_i * alpha + p
+//     O_acc[d] = O_acc[d] * alpha + p * dequant(V[k, d])
+//     m_i = m_new
+//   O[d] = O_acc[d] / l_i
+//
+// Grid: (num_heads, batch_size). Block: (128, 1, 1) — D=128, 1 thread per d.
+// Each thread holds: 1 Q[d], 1 O_acc[d], shares m_i / l_i / score via SMEM.
+//
+// Compute is fully scalar (no MMA). Slower than V21 BF16 path but unblocks
+// FP8 KV inference for non-MLA models. MMA-optimized variant is follow-on.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+#define D 128
+
+// SMEM layout:
+//   smem_Q      : 128 BF16  = 256 B  (broadcast Q values to all threads via SMEM)
+//   smem_K      : 128 BF16  = 256 B  (one K row decoded per Skv iter)
+//   smem_V      : 128 BF16  = 256 B  (one V row decoded per Skv iter)
+//   smem_score  :   1 FP32  =   4 B  (cross-warp score reduction)
+//   smem_red    :   4 FP32  =  16 B  (per-warp reduction scratch)
+//   total       : ~ 800 B (rounded to 1024 for alignment)
+.shared .align 128 .b8 smem_fp8kv[1024];
+
+#define OFF_Q       0
+#define OFF_K       256
+#define OFF_V       512
+#define OFF_SCORE   768
+#define OFF_RED     784
+
+.visible .entry fa_bf16_fp8kv_decode_d128(
+    .param .u64 param_Q,
+    .param .u64 param_K,
+    .param .u64 param_V,
+    .param .u64 param_O,
+    .param .u32 param_num_heads,
+    .param .u32 param_seq_kv,
+    .param .f32 param_scale,
+    .param .f32 param_kv_scale
+)
+{
+    .reg .b32  %r<60>;
+    .reg .b64  %rd<24>;
+    .reg .f32  %f<32>;
+    .reg .b16  %h<8>;
+    .reg .pred %p<8>;
+
+    mov.u32      %r0, %tid.x;                 // d (0..127)
+    mov.u32      %r1, %ctaid.x;               // head
+    mov.u32      %r2, %ctaid.y;               // batch
+    shr.b32      %r3, %r0, 5;                 // warp_id (0..3)
+    and.b32      %r4, %r0, 31;                // lane (0..31)
+
+    ld.param.u64 %rd0, [param_Q];
+    ld.param.u64 %rd1, [param_K];
+    ld.param.u64 %rd2, [param_V];
+    ld.param.u64 %rd3, [param_O];
+    ld.param.u32 %r10, [param_num_heads];
+    ld.param.u32 %r11, [param_seq_kv];
+    ld.param.f32 %f20, [param_scale];
+    ld.param.f32 %f21, [param_kv_scale];
+
+    // === Compute base addresses ===
+    // batch_off = batch * num_heads * D
+    mul.lo.u32   %r12, %r2, %r10;
+    mul.lo.u32   %r12, %r12, D;
+    // head_off = head * D
+    mul.lo.u32   %r13, %r1, D;
+    add.u32      %r12, %r12, %r13;            // bh_off in elements
+    mul.wide.u32 %rd4, %r12, 2;
+    add.u64      %rd4, %rd0, %rd4;            // &Q[batch, head, 0] BF16
+    mul.wide.u32 %rd6, %r12, 2;
+    add.u64      %rd6, %rd3, %rd6;            // &O[batch, head, 0] BF16
+
+    // KV base: K/V is [B, H, Skv, D] FP8. KV bh-stride = num_heads * Skv * D
+    mul.lo.u32   %r14, %r10, %r11;
+    mul.lo.u32   %r14, %r14, D;               // num_heads * Skv * D
+    mul.lo.u32   %r15, %r2, %r14;             // batch base offset (bytes since FP8)
+    mul.lo.u32   %r16, %r11, D;               // Skv * D
+    mul.lo.u32   %r17, %r1, %r16;             // head offset within batch
+    add.u32      %r15, %r15, %r17;            // KV base (bytes for FP8)
+    cvt.u64.u32  %rd5, %r15;
+    add.u64      %rd16, %rd1, %rd5;           // &K[batch, head, 0, 0] FP8
+    add.u64      %rd17, %rd2, %rd5;           // &V[batch, head, 0, 0] FP8
+
+    // === Load Q[d] for this thread, store to SMEM (broadcast) ===
+    shl.b32      %r20, %r0, 1;                // d * 2
+    cvt.u64.u32  %rd7, %r20;
+    add.u64      %rd7, %rd4, %rd7;
+    ld.global.b16 %h0, [%rd7];                // Q[d] BF16
+    CVT_BF16_F32(%f0, %h0)                    // Q[d] FP32
+
+    mov.u32      %r21, smem_fp8kv;
+    add.u32      %r22, %r21, OFF_Q;
+    add.u32      %r22, %r22, %r20;            // smem_Q + d*2
+    st.shared.b16 [%r22], %h0;                // we don't actually need Q in SMEM
+                                              // (each thread holds its own %f0)
+
+    // === Init online softmax state ===
+    mov.f32      %f25, 0fFF800000;            // m_i = -inf
+    mov.f32      %f26, 0.0;                   // l_i = 0
+    mov.f32      %f27, 0.0;                   // O_acc[d] = 0
+
+    bar.sync 0;
+
+    // === KV loop ===
+    mov.u32      %r30, 0;                     // k = 0
+kv_loop:
+    setp.ge.u32  %p0, %r30, %r11;
+    @%p0 bra     kv_done;
+
+    // --- Load K[k, d] FP8, decode to BF16, store to SMEM ---
+    // KV addr = base + k*D + d (bytes for FP8)
+    mul.lo.u32   %r31, %r30, D;
+    add.u32      %r31, %r31, %r0;
+    cvt.u64.u32  %rd8, %r31;
+    add.u64      %rd9, %rd16, %rd8;
+    ld.global.u8 %r32, [%rd9];                // FP8 byte
+    // FP8 → FP16 → FP32
+    .reg .b16 _fp8b, _h0, _h1;
+    .reg .b32 _f16x2;
+    .reg .f32 _kv;
+    cvt.u16.u32  _fp8b, %r32;
+    cvt.rn.f16x2.e4m3x2 _f16x2, _fp8b;
+    mov.b32      {_h0, _h1}, _f16x2;
+    cvt.f32.f16  _kv, _h0;
+    mul.f32      _kv, _kv, %f21;              // * kv_scale → K[k, d] FP32
+
+    // --- QK partial: this thread contributes Q[d] * K[k, d] ---
+    .reg .f32 _qk;
+    mul.f32      _qk, %f0, _kv;
+
+    // Warp reduce sum (5 butterflies for 32 lanes)
+    .reg .f32 _t;
+    shfl.sync.bfly.b32 _t|%p1, _qk, 0x10, 0x1f, 0xffffffff; add.f32 _qk, _qk, _t;
+    shfl.sync.bfly.b32 _t|%p1, _qk, 0x08, 0x1f, 0xffffffff; add.f32 _qk, _qk, _t;
+    shfl.sync.bfly.b32 _t|%p1, _qk, 0x04, 0x1f, 0xffffffff; add.f32 _qk, _qk, _t;
+    shfl.sync.bfly.b32 _t|%p1, _qk, 0x02, 0x1f, 0xffffffff; add.f32 _qk, _qk, _t;
+    shfl.sync.bfly.b32 _t|%p1, _qk, 0x01, 0x1f, 0xffffffff; add.f32 _qk, _qk, _t;
+
+    // warp 0 lane 0 of each warp writes its partial to SMEM_RED[warp_id]
+    add.u32      %r33, %r21, OFF_RED;
+    setp.eq.u32  %p2, %r4, 0;
+    shl.b32      %r34, %r3, 2;
+    add.u32      %r35, %r33, %r34;
+    @%p2 st.shared.f32 [%r35], _qk;
+
+    bar.sync 0;
+
+    // Lane 0 reduces 4 warp-partials and broadcasts via SMEM_SCORE
+    setp.ne.u32  %p2, %r0, 0;
+    @%p2 bra     score_ready;
+    .reg .f32 _w0, _w1, _w2, _w3, _sum;
+    ld.shared.f32 _w0, [%r33];
+    ld.shared.f32 _w1, [%r33 + 4];
+    ld.shared.f32 _w2, [%r33 + 8];
+    ld.shared.f32 _w3, [%r33 + 12];
+    add.f32      _sum, _w0, _w1;
+    add.f32      _sum, _sum, _w2;
+    add.f32      _sum, _sum, _w3;
+    mul.f32      _sum, _sum, %f20;            // * scale
+    add.u32      %r36, %r21, OFF_SCORE;
+    st.shared.f32 [%r36], _sum;
+score_ready:
+
+    bar.sync 0;
+
+    // All threads load the score
+    .reg .f32 _score;
+    add.u32      %r36, %r21, OFF_SCORE;
+    ld.shared.f32 _score, [%r36];
+
+    // --- Online softmax update ---
+    .reg .f32 _m_new, _alpha, _p;
+    max.f32      _m_new, %f25, _score;
+    sub.f32      _alpha, %f25, _m_new;
+    ex2.approx.f32 _alpha, _alpha;            // exp(m_i - m_new) — using ex2 (base 2)
+    sub.f32      _p, _score, _m_new;
+    ex2.approx.f32 _p, _p;
+    // l_i = l_i * alpha + p
+    fma.rn.f32   %f26, %f26, _alpha, _p;
+    // O_acc[d] = O_acc[d] * alpha (rescale) — V update happens after V load
+    mul.f32      %f27, %f27, _alpha;
+
+    // --- Load V[k, d] FP8, decode, accumulate into O_acc[d] ---
+    mul.lo.u32   %r31, %r30, D;
+    add.u32      %r31, %r31, %r0;
+    cvt.u64.u32  %rd8, %r31;
+    add.u64      %rd9, %rd17, %rd8;
+    ld.global.u8 %r32, [%rd9];
+    cvt.u16.u32  _fp8b, %r32;
+    cvt.rn.f16x2.e4m3x2 _f16x2, _fp8b;
+    mov.b32      {_h0, _h1}, _f16x2;
+    cvt.f32.f16  _kv, _h0;
+    mul.f32      _kv, _kv, %f21;              // V[k, d] FP32
+
+    fma.rn.f32   %f27, _p, _kv, %f27;         // O_acc[d] += p * V[k, d]
+
+    // m_i = m_new
+    mov.f32      %f25, _m_new;
+
+    add.u32      %r30, %r30, 1;
+    bra          kv_loop;
+kv_done:
+
+    // === Final normalize and write ===
+    rcp.approx.f32 %f28, %f26;                // 1 / l_i
+    mul.f32      %f27, %f27, %f28;            // O[d] = O_acc[d] / l_i
+
+    .reg .b16 _o_bf16;
+    CVT_F32_BF16(_o_bf16, %f27)
+    add.u64      %rd10, %rd6, %rd7;           // recompute? We already had %rd7 = &Q[d]
+                                              // O addr = O_base + d*2 = rd6 + d*2
+    shl.b32      %r40, %r0, 1;
+    cvt.u64.u32  %rd11, %r40;
+    add.u64      %rd12, %rd6, %rd11;
+    st.global.b16 [%rd12], _o_bf16;
+
+    ret;
+}

@@ -1,0 +1,50 @@
+// scale_bf16_inplace_host.ptx
+//
+// Multiply BF16 buffer in place by a host-provided f32 scale.
+//
+//   buf[i] *= scale
+//
+// Layout: buf [n] BF16. Grid: (ceil(n/256), 1, 1), Block: (256, 1, 1).
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+.visible .entry scale_bf16_inplace_host(
+    .param .u64 param_buf,
+    .param .u32 param_n,
+    .param .f32 param_scale
+)
+{
+    .reg .b32  %r<8>;
+    .reg .b64  %rd<8>;
+    .reg .f32  %f<4>;
+    .reg .b16  %h<4>;
+    .reg .pred %p<2>;
+
+    mov.u32         %r0, %ctaid.x;
+    mov.u32         %r1, %ntid.x;
+    mov.u32         %r2, %tid.x;
+    mad.lo.u32      %r3, %r0, %r1, %r2;
+
+    ld.param.u32    %r4, [param_n];
+    setp.ge.u32     %p0, %r3, %r4;
+    @%p0 bra        done;
+
+    ld.param.u64    %rd0, [param_buf];
+    ld.param.f32    %f0, [param_scale];
+
+    mul.wide.u32    %rd1, %r3, 2;
+    add.u64         %rd2, %rd0, %rd1;
+    ld.global.b16   %h0, [%rd2];
+    CVT_BF16_F32(%f1, %h0)
+    mul.f32         %f2, %f1, %f0;
+    CVT_F32_BF16(%h1, %f2)
+    st.global.b16   [%rd2], %h1;
+
+done:
+    ret;
+}

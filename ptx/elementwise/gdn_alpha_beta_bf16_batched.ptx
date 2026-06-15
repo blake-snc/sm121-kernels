@@ -1,0 +1,124 @@
+// gdn_alpha_beta_bf16_batched.ptx
+//
+// M-batched variant of gdn_alpha_beta_bf16.
+// Computes per-(seq, head) alpha/beta scalars for M decode tokens in
+// one launch. dt_bias and a_log are per-head model weights (no M offset);
+// a_logits and b_logits are per-(seq, head) (computed from input proj).
+//
+// dt[m, h]    = softplus(a_logits[m, h] + dt_bias[h])
+// A_pos[h]    = exp(a_log[h])
+// alpha[m, h] = exp(-A_pos[h] * dt[m, h])
+// beta[m, h]  = sigmoid(b_logits[m, h])
+//
+// Grid: (ceil(n / 128), M, 1).  Block: (128, 1, 1).
+// Total work covered: M * n elements.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#define LOG2E_F32       0f3FB8AA3B
+#define MINUS_LOG2E_F32 0fBFB8AA3B
+#define ONE_F32         0f3F800000
+#define LN2_F32         0f3F317218
+
+.visible .entry gdn_alpha_beta_bf16_batched(
+    .param .u64 param_a_logits,   // [M, n] BF16
+    .param .u64 param_b_logits,   // [M, n] BF16
+    .param .u64 param_dt_bias,    // [n] BF16 (shared across M)
+    .param .u64 param_a_log,      // [n] BF16 (shared across M)
+    .param .u64 param_alpha,      // [M, n] FP32
+    .param .u64 param_beta,       // [M, n] FP32
+    .param .u32 param_n
+)
+{
+    .reg .b32  %r<16>;
+    .reg .b64  %rd<24>;
+    .reg .f32  %f<24>;
+    .reg .b16  %h<4>;
+    .reg .pred %p<4>;
+
+    // head_idx h within seq = blockIdx.x * blockDim.x + threadIdx.x
+    mov.u32         %r0, %tid.x;
+    mov.u32         %r1, %ctaid.x;
+    mov.u32         %r2, %ntid.x;
+    mad.lo.u32      %r3, %r1, %r2, %r0;
+
+    ld.param.u32    %r4, [param_n];
+    setp.ge.u32     %p0, %r3, %r4;
+    @%p0 bra        done;
+
+    // seq_idx m = blockIdx.y
+    mov.u32         %r5, %ctaid.y;
+
+    ld.param.u64    %rd0, [param_a_logits];
+    ld.param.u64    %rd1, [param_b_logits];
+    ld.param.u64    %rd2, [param_dt_bias];
+    ld.param.u64    %rd3, [param_a_log];
+    ld.param.u64    %rd4, [param_alpha];
+    ld.param.u64    %rd5, [param_beta];
+
+    // Per-seq offset: m * n * 2 (BF16) for a/b logits + alpha/beta f32 = m * n * 4
+    mul.lo.u32      %r6, %r5, %r4;            // m * n
+    mul.wide.u32    %rd14, %r6, 2;            // m * n * 2 bytes (BF16)
+    mul.wide.u32    %rd15, %r6, 4;            // m * n * 4 bytes (FP32)
+
+    // BF16 input element offset within seq: h * 2
+    mul.wide.u32    %rd6, %r3, 2;
+    // FP32 output element offset within seq: h * 4
+    mul.wide.u32    %rd7, %r3, 4;
+
+    // Final pointers (per-seq base + within-seq offset)
+    add.u64         %rd8,  %rd0, %rd14;
+    add.u64         %rd8,  %rd8, %rd6;        // a_logits[m*n + h]
+    add.u64         %rd9,  %rd1, %rd14;
+    add.u64         %rd9,  %rd9, %rd6;        // b_logits[m*n + h]
+    add.u64         %rd10, %rd2, %rd6;        // dt_bias[h] (no M offset)
+    add.u64         %rd11, %rd3, %rd6;        // a_log[h]   (no M offset)
+
+    ld.global.b16   %h0, [%rd8];
+    cvt.f32.bf16    %f0, %h0;                 // a_logits[m, h]
+    ld.global.b16   %h0, [%rd9];
+    cvt.f32.bf16    %f1, %h0;                 // b_logits[m, h]
+    ld.global.b16   %h0, [%rd10];
+    cvt.f32.bf16    %f2, %h0;                 // dt_bias[h]
+    ld.global.b16   %h0, [%rd11];
+    cvt.f32.bf16    %f3, %h0;                 // a_log[h]
+
+    // dt = softplus(a_logits + dt_bias) saturated linearly above 20
+    add.f32         %f4, %f0, %f2;
+    setp.gt.f32     %p1, %f4, 0f41A00000;
+    @%p1 bra        dt_linear;
+    mul.f32         %f5, %f4, LOG2E_F32;
+    ex2.approx.f32  %f6, %f5;
+    add.f32         %f7, %f6, ONE_F32;
+    lg2.approx.f32  %f8, %f7;
+    mul.f32         %f4, %f8, LN2_F32;
+dt_linear:
+
+    // A_pos = exp(a_log)
+    mul.f32         %f9, %f3, LOG2E_F32;
+    ex2.approx.f32  %f10, %f9;
+
+    // alpha = exp(-A_pos * dt)
+    mul.f32         %f11, %f10, %f4;
+    mul.f32         %f12, %f11, MINUS_LOG2E_F32;
+    ex2.approx.f32  %f13, %f12;
+
+    // beta = sigmoid(b_logits)
+    mul.f32         %f14, %f1, MINUS_LOG2E_F32;
+    ex2.approx.f32  %f15, %f14;
+    add.f32         %f16, %f15, ONE_F32;
+    rcp.approx.f32  %f17, %f16;
+
+    // Store at output[m*n + h]
+    add.u64         %rd12, %rd4, %rd15;
+    add.u64         %rd12, %rd12, %rd7;
+    add.u64         %rd13, %rd5, %rd15;
+    add.u64         %rd13, %rd13, %rd7;
+    st.global.f32   [%rd12], %f13;
+    st.global.f32   [%rd13], %f17;
+
+done:
+    ret;
+}

@@ -1,0 +1,171 @@
+// mamba2_selective_scan_prefill.ptx
+//
+// Mamba2 selective scan prefill (sequential reference, seq_q > 1).
+// Iterates over seq_q tokens within a single kernel, keeping state in a
+// per-thread register across iterations.
+//
+// Per (batch, head, state element t): thread t holds h[t] in a register,
+// does a scalar update per token, contributes to y[t_idx] via warp+block
+// reduction.
+//
+// Layouts:
+//   x, delta, y: [B, seq_q, H] FP32
+//   A_log, B, C: [B, seq_q, H, D_state=128] FP32  (per-token selective)
+//     (Non-selective A_log variant would broadcast — here we take full selective.)
+//   h: [B, H, D_state] FP32 (initial state; updated in place)
+//
+// Grid: (num_heads, batch). Block: (128, 1, 1).
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+#include "reduction.ptxh"
+
+#define D_STATE 128
+#define BLOCK_DIM 128
+#define NUM_WARPS 4
+
+.shared .align 4 .b8 smem_m2p_warp_sum[16];
+.shared .align 4 .b8 smem_m2p_y[4];
+
+.visible .entry mamba2_selective_scan_prefill(
+    .param .u64 param_x,          // [B, Sq, H]
+    .param .u64 param_delta,      // [B, Sq, H]
+    .param .u64 param_A_log,      // [B, Sq, H, D_state]
+    .param .u64 param_B,          // [B, Sq, H, D_state]
+    .param .u64 param_C,          // [B, Sq, H, D_state]
+    .param .u64 param_h,          // [B, H, D_state] in-place
+    .param .u64 param_y,          // [B, Sq, H]
+    .param .u32 param_num_heads,
+    .param .u32 param_seq_q
+)
+{
+    .reg .b32 %r<32>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<16>;
+    .reg .pred %p<8>;
+
+    mov.u32     %r0, %tid.x;          // 0..127 state element index
+    mov.u32     %r1, %ctaid.x;        // head
+    mov.u32     %r2, %ctaid.y;        // batch
+
+    ld.param.u64 %rd0, [param_x];
+    ld.param.u64 %rd1, [param_delta];
+    ld.param.u64 %rd2, [param_A_log];
+    ld.param.u64 %rd3, [param_B];
+    ld.param.u64 %rd4, [param_C];
+    ld.param.u64 %rd5, [param_h];
+    ld.param.u64 %rd6, [param_y];
+    ld.param.u32 %r3, [param_num_heads];
+    ld.param.u32 %r30, [param_seq_q];
+
+    shr.b32     %r4, %r0, 5;
+    and.b32     %r5, %r0, 31;
+
+    // bh = b*H + h
+    mul.lo.u32  %r6, %r2, %r3;
+    add.u32     %r6, %r6, %r1;
+
+    // h[bh, t] in a register — load once
+    mul.lo.u32  %r7, %r6, D_STATE;
+    add.u32     %r7, %r7, %r0;
+    mul.wide.u32 %rd9, %r7, 4;
+    add.u64     %rd10, %rd5, %rd9;
+    ld.global.f32 %f6, [%rd10];       // h[bh, t]
+
+    // seq_q loop
+    mov.u32     %r20, 0;              // t_idx
+seq_loop:
+    setp.ge.u32 %p1, %r20, %r30;
+    @%p1 bra    seq_done;
+
+    // (b*Sq + t_idx)*H + h
+    mul.lo.u32  %r21, %r2, %r30;
+    add.u32     %r21, %r21, %r20;
+    mul.lo.u32  %r21, %r21, %r3;
+    add.u32     %r21, %r21, %r1;
+
+    // x[b, t, h], delta[b, t, h]
+    mul.wide.u32 %rd7, %r21, 4;
+    add.u64     %rd8, %rd0, %rd7;
+    ld.global.f32 %f1, [%rd8];        // x
+    add.u64     %rd8, %rd1, %rd7;
+    ld.global.f32 %f2, [%rd8];        // delta
+
+    // A_log[b, t, h, t_elem], B[...], C[...]
+    mul.lo.u32  %r22, %r21, D_STATE;
+    add.u32     %r22, %r22, %r0;
+    mul.wide.u32 %rd9, %r22, 4;
+    add.u64     %rd10, %rd2, %rd9;
+    ld.global.f32 %f3, [%rd10];        // A_log[t]
+    add.u64     %rd10, %rd3, %rd9;
+    ld.global.f32 %f4, [%rd10];        // B[t]
+    add.u64     %rd10, %rd4, %rd9;
+    ld.global.f32 %f5, [%rd10];        // C[t]
+
+    // decay = exp(A_log * delta)
+    mul.f32     %f7, %f3, %f2;
+    mul.f32     %f7, %f7, LOG2E;
+    ex2.approx.ftz.f32 %f7, %f7;
+
+    // h[t] = h[t] * decay + B[t] * x * delta
+    mul.f32     %f8, %f4, %f1;
+    mul.f32     %f8, %f8, %f2;
+    fma.rn.f32  %f6, %f6, %f7, %f8;
+
+    // Partial y contribution: C[t] * h[t]
+    mul.f32     %f9, %f5, %f6;
+
+    // Warp reduce
+    shfl.sync.bfly.b32  %f10|%p2, %f9, 0x10, 0x1f, 0xffffffff;
+    add.f32     %f9, %f9, %f10;
+    shfl.sync.bfly.b32  %f10|%p2, %f9, 0x08, 0x1f, 0xffffffff;
+    add.f32     %f9, %f9, %f10;
+    shfl.sync.bfly.b32  %f10|%p2, %f9, 0x04, 0x1f, 0xffffffff;
+    add.f32     %f9, %f9, %f10;
+    shfl.sync.bfly.b32  %f10|%p2, %f9, 0x02, 0x1f, 0xffffffff;
+    add.f32     %f9, %f9, %f10;
+    shfl.sync.bfly.b32  %f10|%p2, %f9, 0x01, 0x1f, 0xffffffff;
+    add.f32     %f9, %f9, %f10;
+
+    // Cross-warp
+    setp.eq.u32 %p3, %r5, 0;
+    shl.b32     %r10, %r4, 2;
+    mov.u32     %r11, smem_m2p_warp_sum;
+    add.u32     %r11, %r11, %r10;
+    @%p3 st.shared.f32 [%r11], %f9;
+    bar.sync 0;
+
+    setp.lt.u32 %p4, %r0, NUM_WARPS;
+    mov.f32     %f11, 0f00000000;
+    @%p4 shl.b32 %r10, %r0, 2;
+    @%p4 mov.u32 %r11, smem_m2p_warp_sum;
+    @%p4 add.u32 %r11, %r11, %r10;
+    @%p4 ld.shared.f32 %f11, [%r11];
+    shfl.sync.bfly.b32  %f12|%p2, %f11, 0x02, 0x1f, 0xffffffff;
+    add.f32     %f11, %f11, %f12;
+    shfl.sync.bfly.b32  %f12|%p2, %f11, 0x01, 0x1f, 0xffffffff;
+    add.f32     %f11, %f11, %f12;
+
+    // Thread 0 writes y[b, t, h]
+    setp.eq.u32 %p5, %r0, 0;
+    @%p5 add.u64 %rd8, %rd6, %rd7;
+    @%p5 st.global.f32 [%rd8], %f11;
+
+    bar.sync 0;
+    add.u32     %r20, %r20, 1;
+    bra         seq_loop;
+
+seq_done:
+    // Write back final h[bh, t]
+    mul.lo.u32  %r7, %r6, D_STATE;
+    add.u32     %r7, %r7, %r0;
+    mul.wide.u32 %rd9, %r7, 4;
+    add.u64     %rd10, %rd5, %rd9;
+    st.global.f32 [%rd10], %f6;
+
+    ret;
+}

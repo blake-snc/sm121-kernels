@@ -1,0 +1,20 @@
+# fa_bf16_v3_d256 variant manifest.
+#
+# Maps each generated variant to its file stem, kernel entry name, and the cpp -D
+# flag set that selects its feature blocks in fa_bf16_v3_d256.ptx.in.
+#
+# Format (whitespace separated):
+#   <file_stem>  <entry_name>  <flags...>
+#     file_stem  = output file name without .ptx (matches the hand-written file)
+#     entry_name = -DSPARK_ENTRY=<entry_name> (the .visible .entry symbol)
+#     flags      = zero or more SPARK_* macros to -D, or "-" for none
+#
+# Feature axes (independent): SPARK_GQA, SPARK_CAUSAL, SPARK_POS_DEV.
+# (SPARK_POS_DEV only has an effect together with SPARK_CAUSAL.)
+
+fa_bf16_v3_d256                     flash_attn_bf16_v3_d256                     -
+fa_bf16_v3_d256_gqa                 flash_attn_bf16_v3_d256_gqa                 SPARK_GQA
+fa_bf16_v3_d256_causal             flash_attn_bf16_v3_d256_causal             SPARK_CAUSAL
+fa_bf16_v3_d256_gqa_causal         flash_attn_bf16_v3_d256_gqa_causal         SPARK_GQA SPARK_CAUSAL
+fa_bf16_v3_d256_gqa_causal_pos_dev flash_attn_bf16_v3_d256_gqa_causal_pos_dev SPARK_GQA SPARK_CAUSAL SPARK_POS_DEV
+fa_bf16_fp8kv_v3_d256_gqa_causal_pos_dev flash_attn_bf16_fp8kv_v3_d256_gqa_causal_pos_dev SPARK_GQA SPARK_CAUSAL SPARK_POS_DEV SPARK_FP8KV

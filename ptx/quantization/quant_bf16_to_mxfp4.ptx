@@ -1,0 +1,162 @@
+// quant_bf16_to_mxfp4.ptx
+//
+// Microscaling FP4 E2M1 quantization (OCP MX standard): 32-element blocks
+// with UE8M0 (exponent-only) scales. Used by gpt-oss-120b and similar MXFP4
+// quantized MoE models.
+//
+// FP4 E2M1 layout: 1 sign bit, 2 exponent bits, 1 mantissa bit. Max normal = 6.0.
+// Two FP4 values pack into one byte (low nibble = first element, high nibble
+// = second element).
+//
+// Operation (per 32-element block):
+//   abs_max    = max(|x[block]|)
+//   max_exp    = extract_fp32_exp(abs_max)     // biased exponent
+//   scale_exp  = max(max_exp - 2, 1)            // FP4 emax = 2 (max normal = 6 < 2^3)
+//   inv_scale  = 2^(127 - scale_exp)
+//   out[2i..2i+2] = pack_fp4(round_to_e2m1(x[2i..2i+2] * inv_scale))
+//   scales[block] = scale_exp                   // UE8M0 byte
+//
+// Layout:
+//   x: [num_rows, hidden] bf16 (hidden multiple of 32)
+//   out: [num_rows, hidden/2] u8 (packed FP4 pairs)
+//   scales: [num_rows, hidden/32] u8 (UE8M0)
+//
+// Grid: (num_rows, num_blocks, 1). Block: (8, 1, 1) — lane handles 4 elements,
+// stored as 2 packed FP4 bytes.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "reduction.ptxh"
+#include "convert.ptxh"
+
+// FP4 E2M1 max normal = 6.0 = 1.1(bin) * 2^2. So emax = 2.
+// Biased UE8M0 scale_byte = fp32_biased_exp - 2.
+#define FP4_EMAX_SUB 2
+
+.visible .entry quant_bf16_to_mxfp4(
+    .param .u64 param_x,
+    .param .u64 param_out,       // [num_rows, hidden/2] u8 (packed FP4)
+    .param .u64 param_scales,    // [num_rows, hidden/32] u8 (UE8M0)
+    .param .u32 param_hidden
+)
+{
+    .reg .b32 %r<28>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<12>;
+    .reg .b16 %h<8>;
+    .reg .pred %p<4>;
+
+    mov.u32         %r0, BLOCK_ID_X;
+    mov.u32         %r1, BLOCK_ID_Y;
+    mov.u32         %r2, THREAD_ID;
+
+    ld.param.u64    %rd0, [param_x];
+    ld.param.u64    %rd1, [param_out];
+    ld.param.u64    %rd2, [param_scales];
+    ld.param.u32    %r3, [param_hidden];
+
+    mul.lo.u32      %r4, %r0, %r3;
+    shl.b32         %r5, %r1, 5;
+    add.u32         %r4, %r4, %r5;
+    mul.wide.u32    %rd3, %r4, 2;
+    add.u64         %rd4, %rd0, %rd3;
+
+    // out byte offset: (row * hidden + block*32) / 2 (each byte = 2 FP4)
+    shr.u32         %r7, %r4, 1;
+    mul.wide.u32    %rd5, %r7, 1;
+    add.u64         %rd6, %rd1, %rd5;
+
+    shl.b32         %r6, %r2, 2;               // lane * 4
+
+    mul.wide.u32    %rd7, %r6, 2;
+    add.u64         %rd8, %rd4, %rd7;
+    ld.global.v2.b32 {%r10, %r11}, [%rd8];
+    mov.b32         {%h0, %h1}, %r10;
+    mov.b32         {%h2, %h3}, %r11;
+    CVT_BF16_F32(%f0, %h0)
+    CVT_BF16_F32(%f1, %h1)
+    CVT_BF16_F32(%f2, %h2)
+    CVT_BF16_F32(%f3, %h3)
+
+    // Local abs_max
+    abs.f32         %f4, %f0;
+    abs.f32         %f5, %f1;
+    abs.f32         %f6, %f2;
+    abs.f32         %f7, %f3;
+    max.f32         %f8, %f4, %f5;
+    max.f32         %f9, %f6, %f7;
+    max.f32         %f8, %f8, %f9;
+
+    // 8-lane butterfly max (log2(8)=3 rounds)
+    .reg .b32 _sh;
+    shfl.sync.bfly.b32 _sh, %f8, 4, 31, 0xFFFFFFFF;
+    mov.b32         %f9, _sh;
+    max.f32         %f8, %f8, %f9;
+    shfl.sync.bfly.b32 _sh, %f8, 2, 31, 0xFFFFFFFF;
+    mov.b32         %f9, _sh;
+    max.f32         %f8, %f8, %f9;
+    shfl.sync.bfly.b32 _sh, %f8, 1, 31, 0xFFFFFFFF;
+    mov.b32         %f9, _sh;
+    max.f32         %f8, %f8, %f9;
+
+    // Extract biased exponent and derive UE8M0 byte
+    mov.b32         %r20, %f8;
+    shr.b32         %r20, %r20, 23;
+    and.b32         %r20, %r20, 0xFF;
+    setp.eq.u32     %p0, %r20, 0;
+    sub.u32         %r21, %r20, FP4_EMAX_SUB;
+    @%p0 mov.u32    %r21, 127;
+    max.u32         %r21, %r21, 1;
+    min.u32         %r21, %r21, 254;
+
+    // inv_scale FP32 = 2^(127 - scale_byte)
+    mov.u32         %r22, 254;
+    sub.u32         %r22, %r22, %r21;
+    shl.b32         %r22, %r22, 23;
+    mov.b32         %f10, %r22;
+
+    // Lane 0 writes scale byte
+    setp.eq.u32     %p1, %r2, 0;
+    @%p1 bra        write_scale;
+    bra             quantize;
+
+write_scale:
+    shr.u32         %r23, %r3, 5;              // num_blocks
+    mul.lo.u32      %r24, %r0, %r23;
+    add.u32         %r24, %r24, %r1;
+    cvt.u16.u32     %h4, %r21;
+    mul.wide.u32    %rd9, %r24, 1;
+    add.u64         %rd10, %rd2, %rd9;
+    st.global.b8    [%rd10], %h4;
+
+quantize:
+    mul.f32         %f4, %f0, %f10;
+    mul.f32         %f5, %f1, %f10;
+    mul.f32         %f6, %f2, %f10;
+    mul.f32         %f7, %f3, %f10;
+
+    // Pack 4 values into 2 FP4 pair-bytes via cvt.rn.satfinite.e2m1x2.f32
+    .reg .b8 _n0, _n1;
+    CVT_F32X2_E2M1X2(_n0, %f5, %f4)            // low nibble = f4, high = f5
+    CVT_F32X2_E2M1X2(_n1, %f7, %f6)            // low = f6, high = f7
+
+    // Combine both bytes into a b16 and store
+    cvt.u16.u8      %h5, _n0;
+    cvt.u16.u8      %h6, _n1;
+    mov.b32         %r14, 0;
+    mov.b16         %h7, 0;
+    // Pack: byte0 = _n0 (lane contribution 0,1); byte1 = _n1 (lane contribution 2,3)
+    shl.b16         %h6, %h6, 8;
+    or.b16          %h5, %h5, %h6;
+
+    // Store byte-pair. Each lane's 4 FP4 = 2 bytes. Offset = lane * 2 bytes.
+    shl.b32         %r15, %r2, 1;              // lane * 2
+    mul.wide.u32    %rd11, %r15, 1;
+    add.u64         %rd12, %rd6, %rd11;
+    st.global.b16   [%rd12], %h5;
+
+    ret;
+}

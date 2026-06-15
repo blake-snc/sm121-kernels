@@ -1,0 +1,551 @@
+// gemm_nvfp4_mma.ptx
+//
+// NVFP4 block-scaled GEMM using MMA: C[M,N] = A[M,K] x B[K,N]
+// A: [M, K/2] row-major, e2m1 nibble-packed along K (K elements = K/2 bytes per row)
+// B: [K/2, N] row-major, e2m1 K-packed (each byte = 2 consecutive K-elements for 1 N-col)
+// C: [M, N] row-major, BF16 output
+// scale_a: [ceil(M/16) * ceil(K/64)] UE8M0 (one per MMA A-fragment)
+// scale_b: [ceil(K/64) * ceil(N/8)] UE8M0 (one per MMA B-fragment)
+//
+// Uses mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32
+// K=32 in the MMA means 32 FP4 ELEMENTS (one per 8-bit register container).
+// After ldmatrix, FP4 data sits in bits[3:0] of each byte; the MMA expects
+// bits[5:2], so all A/B registers must be shifted left by 2 (CUTLASS fp4_shift).
+//
+// Tile: 32x32 output, K-step: 32 elements (16 packed bytes), Block: 32 threads (1 warp).
+// 2 m-groups x 4 n-groups = 8 MMAs per K iteration.
+// 32 accumulator registers (f32).
+//
+// SMEM layout: 1 FP4 per byte (unpacked from nibble-packed global memory).
+//   smem_A: 32 M-rows x 32 bytes = 1024 bytes
+//   smem_B: 32 K-rows x 32 N-cols = 1024 bytes
+//   Total: 2048 bytes
+//
+// Requires M, N divisible by 32 and K divisible by 64.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+#include "mma.ptxh"
+
+.visible .entry gemm_nvfp4_mma(
+    .param .u64 param_A,        // A: [M, K/2] row-major, e2m1 nibble-packed
+    .param .u64 param_B,        // B: [K/2, N] row-major, e2m1 K-packed
+    .param .u64 param_C,        // C: [M, N] row-major, bf16 (output)
+    .param .u64 param_scale_a,  // [ceil(M/16)*ceil(K/64)] UE8M0
+    .param .u64 param_scale_b,  // [ceil(K/64)*ceil(N/8)] UE8M0
+    .param .u32 param_M,
+    .param .u32 param_N,
+    .param .u32 param_K         // K in elements (must be multiple of 64)
+)
+{
+    .reg .b32  %r<94>;
+    .reg .b64  %rd<25>;
+    .reg .f32  %f<33>;          // f0..f31 accumulators, f32..f47 temporaries
+    .reg .b16  %h<3>;
+    .reg .pred %p<8>;
+
+    // Shared memory: A tile (1024 bytes) + B tile (1024 bytes), 1 FP4 per byte
+    .shared .align 128 .b8 smem[2048];
+
+    // Thread identification (1 warp = 32 threads)
+    mov.u32         %r40, %tid.x;           // lane [0..31]
+
+    // Block position
+    mov.u32         %r41, %ctaid.x;         // block_x (N dimension)
+    mov.u32         %r42, %ctaid.y;         // block_y (M dimension)
+
+    // Load params
+    ld.param.u64    %rd0, [param_A];
+    ld.param.u64    %rd1, [param_B];
+    ld.param.u64    %rd2, [param_C];
+    ld.param.u64    %rd20, [param_scale_a];
+    ld.param.u64    %rd21, [param_scale_b];
+    ld.param.u32    %r43, [param_M];
+    ld.param.u32    %r44, [param_N];
+    ld.param.u32    %r45, [param_K];
+
+    // M/N offsets for this CTA
+    shl.b32         %r46, %r42, 5;          // m_off = by * 32
+    shl.b32         %r47, %r41, 5;          // n_off = bx * 32
+
+    // K/2 (packed bytes per A row)
+    shr.b32         %r70, %r45, 1;          // K_half = K/2
+
+    // K_scale_blocks = K/64 (number of scale blocks along K)
+    shr.b32         %r71, %r45, 6;
+
+    // Initialize 32 accumulators to 0
+    mov.f32 %f0, 0.0;  mov.f32 %f1, 0.0;  mov.f32 %f2, 0.0;  mov.f32 %f3, 0.0;
+    mov.f32 %f4, 0.0;  mov.f32 %f5, 0.0;  mov.f32 %f6, 0.0;  mov.f32 %f7, 0.0;
+    mov.f32 %f8, 0.0;  mov.f32 %f9, 0.0;  mov.f32 %f10, 0.0; mov.f32 %f11, 0.0;
+    mov.f32 %f12, 0.0; mov.f32 %f13, 0.0; mov.f32 %f14, 0.0; mov.f32 %f15, 0.0;
+    mov.f32 %f16, 0.0; mov.f32 %f17, 0.0; mov.f32 %f18, 0.0; mov.f32 %f19, 0.0;
+    mov.f32 %f20, 0.0; mov.f32 %f21, 0.0; mov.f32 %f22, 0.0; mov.f32 %f23, 0.0;
+    mov.f32 %f24, 0.0; mov.f32 %f25, 0.0; mov.f32 %f26, 0.0; mov.f32 %f27, 0.0;
+    mov.f32 %f28, 0.0; mov.f32 %f29, 0.0; mov.f32 %f30, 0.0; mov.f32 %f31, 0.0;
+
+    // Precompute smem base
+    mov.u32         %r48, smem;
+
+    // Precompute ldmatrix addresses for A (row stride 32 bytes in unpacked SMEM)
+    setp.lt.u32     %p0, %r40, 16;
+    @%p0 mul.lo.u32 %r49, %r40, 32;
+    @!%p0 sub.u32   %r49, %r40, 16;
+    @!%p0 mad.lo.u32 %r49, %r49, 32, 16;
+    add.u32         %r50, %r48, %r49;       // ldm_a_m0
+    add.u32         %r51, %r50, 512;        // ldm_a_m1 = ldm_a_m0 + 16*32
+
+    // Precompute B fragment load addresses (identical to FP8)
+    shr.b32         %r54, %r40, 2;          // groupID = lane/4
+    and.b32         %r55, %r40, 3;          // tidInGroup = lane%4
+
+    mul.lo.u32      %r52, %r55, 128;        // tidInGroup * 128
+    add.u32         %r52, %r52, %r54;       // + groupID
+    add.u32         %r52, %r48, %r52;
+    add.u32         %r52, %r52, 1024;       // b0_base_ng0 (smem_B)
+    add.u32         %r53, %r52, 512;        // b1_base_ng0
+
+    // Precompute store addresses (same as FP8/BF16 kernel)
+    add.u32         %r56, %r46, %r54;       // base_row_d0 = m_off + groupID
+    add.u32         %r57, %r56, 8;          // base_row_d2
+    shl.b32         %r58, %r55, 1;          // tidInGroup * 2
+    add.u32         %r58, %r47, %r58;       // base_col_d0 = n_off + tidInGroup*2
+    add.u32         %r59, %r58, 1;          // base_col_d1
+
+    // Precompute scale addresses
+    // scale_a: [m_groups, k_scale_blocks], row-major
+    shl.b32         %r72, %r42, 1;          // m_group_0 = by * 2
+    mul.lo.u32      %r73, %r72, %r71;       // m_group_0 * k_scale_blocks
+    add.u32         %r74, %r72, 1;          // m_group_1
+    mul.lo.u32      %r75, %r74, %r71;       // m_group_1 * k_scale_blocks
+    cvt.u64.u32     %rd22, %r73;
+    add.u64         %rd22, %rd20, %rd22;    // &scale_a[m_group_0, 0]
+    cvt.u64.u32     %rd23, %r75;
+    add.u64         %rd23, %rd20, %rd23;    // &scale_a[m_group_1, 0]
+
+    // scale_b: [k_scale_blocks, n_groups], row-major
+    shr.b32         %r76, %r44, 3;          // n_total_groups = N/8
+    shl.b32         %r77, %r41, 2;          // n_group_base = bx * 4
+
+    // Precompute B loading constants
+    shr.b32         %r87, %r40, 1;          // packed_row_offset = lane/2
+    and.b32         %r88, %r40, 1;          // lane % 2
+    shl.b32         %r88, %r88, 4;          // col_half = (lane%2) * 16
+
+    // ==================== K LOOP ====================
+    // k_packed_byte: byte offset into packed A/B data. Advances by 16 per K-step.
+    // Each K-step processes 32 FP4 elements (= 16 packed bytes).
+    mov.u32         %r60, 0;                // k_packed_byte = 0
+
+k_loop:
+    setp.ge.u32     %p1, %r60, %r70;       // k_packed_byte >= K_half ?
+    @%p1 bra        k_done;
+
+    // === Load & unpack A tile: 32 rows x 16 packed bytes -> 32 rows x 32 SMEM bytes ===
+    // Thread lane loads row (m_off + lane), 16 packed bytes from A
+    add.u32         %r61, %r46, %r40;       // row = m_off + lane
+    mul.lo.u32      %r62, %r61, %r70;       // row * K_half
+    add.u32         %r62, %r62, %r60;       // row * K_half + k_packed_byte
+    cvt.u64.u32     %rd3, %r62;
+    add.u64         %rd4, %rd0, %rd3;       // &A[row][k_packed_byte]
+
+    // SMEM A address for this thread's row
+    mul.lo.u32      %r63, %r40, 32;
+    add.u32         %r63, %r48, %r63;       // smem_A + lane * 32
+
+    // Predicated load: zero if row >= M (defense-in-depth)
+    setp.lt.u32     %p2, %r61, %r43;
+    @%p2 ld.global.v4.b32 {%r64, %r65, %r66, %r67}, [%rd4];
+    @!%p2 mov.b32   %r64, 0;
+    @!%p2 mov.b32   %r65, 0;
+    @!%p2 mov.b32   %r66, 0;
+    @!%p2 mov.b32   %r67, 0;
+
+    // Unpack %r64 (packed bytes 0-3 → SMEM elements 0-7)
+    and.b32         %r6, %r64, 0x0F0F0F0F;
+    shr.b32         %r7, %r64, 4;
+    and.b32         %r7, %r7, 0x0F0F0F0F;
+    prmt.b32        %r8, %r6, %r7, 0x5140;
+    prmt.b32        %r9, %r6, %r7, 0x7362;
+    st.shared.v2.b32 [%r63], {%r8, %r9};
+
+    // Unpack %r65 (packed bytes 4-7 → SMEM elements 8-15)
+    and.b32         %r6, %r65, 0x0F0F0F0F;
+    shr.b32         %r7, %r65, 4;
+    and.b32         %r7, %r7, 0x0F0F0F0F;
+    prmt.b32        %r8, %r6, %r7, 0x5140;
+    prmt.b32        %r9, %r6, %r7, 0x7362;
+    st.shared.v2.b32 [%r63 + 8], {%r8, %r9};
+
+    // Unpack %r66 (packed bytes 8-11 → SMEM elements 16-23)
+    and.b32         %r6, %r66, 0x0F0F0F0F;
+    shr.b32         %r7, %r66, 4;
+    and.b32         %r7, %r7, 0x0F0F0F0F;
+    prmt.b32        %r8, %r6, %r7, 0x5140;
+    prmt.b32        %r9, %r6, %r7, 0x7362;
+    st.shared.v2.b32 [%r63 + 16], {%r8, %r9};
+
+    // Unpack %r67 (packed bytes 12-15 → SMEM elements 24-31)
+    and.b32         %r6, %r67, 0x0F0F0F0F;
+    shr.b32         %r7, %r67, 4;
+    and.b32         %r7, %r7, 0x0F0F0F0F;
+    prmt.b32        %r8, %r6, %r7, 0x5140;
+    prmt.b32        %r9, %r6, %r7, 0x7362;
+    st.shared.v2.b32 [%r63 + 24], {%r8, %r9};
+
+    // === Load & unpack B tile: 16 packed rows -> 32 SMEM K-rows, 32 N-cols ===
+    // Thread lane: packed_row = lane/2, col_half = (lane%2)*16
+    // B address: B + (k_packed_byte + packed_row) * N + n_off + col_half
+    add.u32         %r89, %r60, %r87;       // b_packed_row = k_packed_byte + packed_row_offset
+    mul.lo.u32      %r90, %r89, %r44;       // b_packed_row * N
+    add.u32         %r90, %r90, %r47;       // + n_off
+    add.u32         %r90, %r90, %r88;       // + col_half
+    cvt.u64.u32     %rd5, %r90;
+    add.u64         %rd6, %rd1, %rd5;       // &B[b_packed_row][n_off + col_half]
+
+    // SMEM B addresses for even and odd K-rows
+    // even_row = 2 * packed_row_offset, odd_row = even_row + 1
+    shl.b32         %r91, %r87, 6;          // even_row * 32 = packed_row_offset * 64
+    add.u32         %r91, %r48, %r91;
+    add.u32         %r91, %r91, 1024;
+    add.u32         %r91, %r91, %r88;       // smem_B_even = smem + 1024 + even_row*32 + col_half
+    add.u32         %r92, %r91, 32;         // smem_B_odd = smem_B_even + 32 (next row)
+
+    // Predicated load: zero if k_packed_row OOB (defense-in-depth)
+    setp.lt.u32     %p3, %r89, %r70;
+    @%p3 ld.global.v4.b32 {%r64, %r65, %r66, %r67}, [%rd6];
+    @!%p3 mov.b32   %r64, 0;
+    @!%p3 mov.b32   %r65, 0;
+    @!%p3 mov.b32   %r66, 0;
+    @!%p3 mov.b32   %r67, 0;
+
+    // Unpack %r64: lo → even row cols [col_half..col_half+3], hi → odd row
+    and.b32         %r6, %r64, 0x0F0F0F0F;
+    shr.b32         %r7, %r64, 4;
+    and.b32         %r7, %r7, 0x0F0F0F0F;
+    st.shared.b32   [%r91], %r6;
+    st.shared.b32   [%r92], %r7;
+
+    // Unpack %r65
+    and.b32         %r6, %r65, 0x0F0F0F0F;
+    shr.b32         %r7, %r65, 4;
+    and.b32         %r7, %r7, 0x0F0F0F0F;
+    st.shared.b32   [%r91 + 4], %r6;
+    st.shared.b32   [%r92 + 4], %r7;
+
+    // Unpack %r66
+    and.b32         %r6, %r66, 0x0F0F0F0F;
+    shr.b32         %r7, %r66, 4;
+    and.b32         %r7, %r7, 0x0F0F0F0F;
+    st.shared.b32   [%r91 + 8], %r6;
+    st.shared.b32   [%r92 + 8], %r7;
+
+    // Unpack %r67
+    and.b32         %r6, %r67, 0x0F0F0F0F;
+    shr.b32         %r7, %r67, 4;
+    and.b32         %r7, %r7, 0x0F0F0F0F;
+    st.shared.b32   [%r91 + 12], %r6;
+    st.shared.b32   [%r92 + 12], %r7;
+
+    bar.sync 0;
+
+    // === Load scale factors for this K-step ===
+    // Scale block index = k_packed_byte / 32 (each scale covers 64 elements = 32 packed bytes)
+    shr.b32         %r78, %r60, 5;          // scale_block_idx = k_packed_byte >> 5
+
+    // sfa for mg=0: scale_a[m_group_0, scale_block_idx]
+    cvt.u64.u32     %rd7, %r78;
+    add.u64         %rd8, %rd22, %rd7;
+    ld.global.u8    %r80, [%rd8];           // sfa_mg0
+
+    // sfa for mg=1: scale_a[m_group_1, scale_block_idx]
+    add.u64         %rd9, %rd23, %rd7;
+    ld.global.u8    %r81, [%rd9];           // sfa_mg1
+
+    // sfb for ng=0..3: scale_b[scale_block_idx, n_group_base + 0..3]
+    mul.lo.u32      %r82, %r78, %r76;       // scale_block_idx * n_total_groups
+    add.u32         %r82, %r82, %r77;       // + n_group_base
+    cvt.u64.u32     %rd10, %r82;
+    add.u64         %rd11, %rd21, %rd10;
+    ld.global.u8    %r83, [%rd11];          // sfb_ng0
+    ld.global.u8    %r84, [%rd11 + 1];     // sfb_ng1
+    ld.global.u8    %r85, [%rd11 + 2];     // sfb_ng2
+    ld.global.u8    %r86, [%rd11 + 3];     // sfb_ng3
+
+    // === m-group 0, load A + FP4 shift ===
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r0, %r1, %r2, %r3}, [%r50];
+    shl.b32         %r0, %r0, 2;
+    shl.b32         %r1, %r1, 2;
+    shl.b32         %r2, %r2, 2;
+    shl.b32         %r3, %r3, 2;
+
+    // === m-group 0, n-group 0: B cols 0-7 ===
+    LOAD_FP8_B_FRAG(%r4, %r52, %r6, %r7, %r8, %r9)
+    add.u32         %r79, %r53, 0;
+    LOAD_FP8_B_FRAG(%r5, %r79, %r6, %r7, %r8, %r9)
+    shl.b32         %r4, %r4, 2;
+    shl.b32         %r5, %r5, 2;
+    MMA_NVFP4_M16N8K32(%f0,  %f1,  %f2,  %f3,  %r0, %r1, %r2, %r3, %r4, %r5, %r80, %r83)
+
+    // === m-group 0, n-group 1: B cols 8-15 ===
+    add.u32         %r79, %r52, 8;
+    LOAD_FP8_B_FRAG(%r4, %r79, %r6, %r7, %r8, %r9)
+    add.u32         %r79, %r53, 8;
+    LOAD_FP8_B_FRAG(%r5, %r79, %r6, %r7, %r8, %r9)
+    shl.b32         %r4, %r4, 2;
+    shl.b32         %r5, %r5, 2;
+    MMA_NVFP4_M16N8K32(%f4,  %f5,  %f6,  %f7,  %r0, %r1, %r2, %r3, %r4, %r5, %r80, %r84)
+
+    // === m-group 0, n-group 2: B cols 16-23 ===
+    add.u32         %r79, %r52, 16;
+    LOAD_FP8_B_FRAG(%r4, %r79, %r6, %r7, %r8, %r9)
+    add.u32         %r79, %r53, 16;
+    LOAD_FP8_B_FRAG(%r5, %r79, %r6, %r7, %r8, %r9)
+    shl.b32         %r4, %r4, 2;
+    shl.b32         %r5, %r5, 2;
+    MMA_NVFP4_M16N8K32(%f8,  %f9,  %f10, %f11, %r0, %r1, %r2, %r3, %r4, %r5, %r80, %r85)
+
+    // === m-group 0, n-group 3: B cols 24-31 ===
+    add.u32         %r79, %r52, 24;
+    LOAD_FP8_B_FRAG(%r4, %r79, %r6, %r7, %r8, %r9)
+    add.u32         %r79, %r53, 24;
+    LOAD_FP8_B_FRAG(%r5, %r79, %r6, %r7, %r8, %r9)
+    shl.b32         %r4, %r4, 2;
+    shl.b32         %r5, %r5, 2;
+    MMA_NVFP4_M16N8K32(%f12, %f13, %f14, %f15, %r0, %r1, %r2, %r3, %r4, %r5, %r80, %r86)
+
+    // === m-group 1, load A + FP4 shift ===
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r0, %r1, %r2, %r3}, [%r51];
+    shl.b32         %r0, %r0, 2;
+    shl.b32         %r1, %r1, 2;
+    shl.b32         %r2, %r2, 2;
+    shl.b32         %r3, %r3, 2;
+
+    // === m-group 1, n-group 0 ===
+    LOAD_FP8_B_FRAG(%r4, %r52, %r6, %r7, %r8, %r9)
+    add.u32         %r79, %r53, 0;
+    LOAD_FP8_B_FRAG(%r5, %r79, %r6, %r7, %r8, %r9)
+    shl.b32         %r4, %r4, 2;
+    shl.b32         %r5, %r5, 2;
+    MMA_NVFP4_M16N8K32(%f16, %f17, %f18, %f19, %r0, %r1, %r2, %r3, %r4, %r5, %r81, %r83)
+
+    // === m-group 1, n-group 1 ===
+    add.u32         %r79, %r52, 8;
+    LOAD_FP8_B_FRAG(%r4, %r79, %r6, %r7, %r8, %r9)
+    add.u32         %r79, %r53, 8;
+    LOAD_FP8_B_FRAG(%r5, %r79, %r6, %r7, %r8, %r9)
+    shl.b32         %r4, %r4, 2;
+    shl.b32         %r5, %r5, 2;
+    MMA_NVFP4_M16N8K32(%f20, %f21, %f22, %f23, %r0, %r1, %r2, %r3, %r4, %r5, %r81, %r84)
+
+    // === m-group 1, n-group 2 ===
+    add.u32         %r79, %r52, 16;
+    LOAD_FP8_B_FRAG(%r4, %r79, %r6, %r7, %r8, %r9)
+    add.u32         %r79, %r53, 16;
+    LOAD_FP8_B_FRAG(%r5, %r79, %r6, %r7, %r8, %r9)
+    shl.b32         %r4, %r4, 2;
+    shl.b32         %r5, %r5, 2;
+    MMA_NVFP4_M16N8K32(%f24, %f25, %f26, %f27, %r0, %r1, %r2, %r3, %r4, %r5, %r81, %r85)
+
+    // === m-group 1, n-group 3 ===
+    add.u32         %r79, %r52, 24;
+    LOAD_FP8_B_FRAG(%r4, %r79, %r6, %r7, %r8, %r9)
+    add.u32         %r79, %r53, 24;
+    LOAD_FP8_B_FRAG(%r5, %r79, %r6, %r7, %r8, %r9)
+    shl.b32         %r4, %r4, 2;
+    shl.b32         %r5, %r5, 2;
+    MMA_NVFP4_M16N8K32(%f28, %f29, %f30, %f31, %r0, %r1, %r2, %r3, %r4, %r5, %r81, %r86)
+
+    bar.sync 0;
+
+    // Advance k_packed_byte by 16 (= 32 elements)
+    add.u32         %r60, %r60, 16;
+    bra             k_loop;
+
+k_done:
+    // ==================== STORE RESULTS (BF16) ====================
+    // Bounds check: skip stores if this CTA's tile is OOB (defense-in-depth)
+    setp.ge.u32     %p4, %r46, %r43;
+    setp.ge.u32     %p5, %r47, %r44;
+    or.pred         %p6, %p4, %p5;
+    @%p6 ret;
+
+    // Output layout for m16n8 MMA:
+    //   d0 = C[row_a, col_a],   d1 = C[row_a, col_b]
+    //   d2 = C[row_b, col_a],   d3 = C[row_b, col_b]
+    // where row_a = groupID, row_b = groupID+8, col_a = tidInGroup*2, col_b = col_a+1
+
+    // --- mg=0, ng=0: f0..f3 --- (vectorized: 2 x st.global.b32)
+    mul.lo.u32      %r61, %r56, %r44;
+    add.u32         %r62, %r61, %r58;
+    mul.wide.u32    %rd3, %r62, 2;
+    add.u64         %rd4, %rd2, %rd3;
+    CVT_F32_BF16(%h0, %f0)
+    CVT_F32_BF16(%h1, %f1)
+    mov.b32         %r10, {%h0, %h1};
+    st.global.b32   [%rd4], %r10;
+
+    mul.lo.u32      %r61, %r57, %r44;
+    add.u32         %r62, %r61, %r58;
+    mul.wide.u32    %rd3, %r62, 2;
+    add.u64         %rd4, %rd2, %rd3;
+    CVT_F32_BF16(%h0, %f2)
+    CVT_F32_BF16(%h1, %f3)
+    mov.b32         %r10, {%h0, %h1};
+    st.global.b32   [%rd4], %r10;
+
+    // --- mg=0, ng=1: f4..f7 ---
+    add.u32         %r63, %r58, 8;
+
+    mul.lo.u32      %r61, %r56, %r44;
+    add.u32         %r62, %r61, %r63;
+    mul.wide.u32    %rd3, %r62, 2;
+    add.u64         %rd4, %rd2, %rd3;
+    CVT_F32_BF16(%h0, %f4)
+    CVT_F32_BF16(%h1, %f5)
+    mov.b32         %r10, {%h0, %h1};
+    st.global.b32   [%rd4], %r10;
+
+    mul.lo.u32      %r61, %r57, %r44;
+    add.u32         %r62, %r61, %r63;
+    mul.wide.u32    %rd3, %r62, 2;
+    add.u64         %rd4, %rd2, %rd3;
+    CVT_F32_BF16(%h0, %f6)
+    CVT_F32_BF16(%h1, %f7)
+    mov.b32         %r10, {%h0, %h1};
+    st.global.b32   [%rd4], %r10;
+
+    // --- mg=0, ng=2: f8..f11 ---
+    add.u32         %r63, %r58, 16;
+
+    mul.lo.u32      %r61, %r56, %r44;
+    add.u32         %r62, %r61, %r63;
+    mul.wide.u32    %rd3, %r62, 2;
+    add.u64         %rd4, %rd2, %rd3;
+    CVT_F32_BF16(%h0, %f8)
+    CVT_F32_BF16(%h1, %f9)
+    mov.b32         %r10, {%h0, %h1};
+    st.global.b32   [%rd4], %r10;
+
+    mul.lo.u32      %r61, %r57, %r44;
+    add.u32         %r62, %r61, %r63;
+    mul.wide.u32    %rd3, %r62, 2;
+    add.u64         %rd4, %rd2, %rd3;
+    CVT_F32_BF16(%h0, %f10)
+    CVT_F32_BF16(%h1, %f11)
+    mov.b32         %r10, {%h0, %h1};
+    st.global.b32   [%rd4], %r10;
+
+    // --- mg=0, ng=3: f12..f15 ---
+    add.u32         %r63, %r58, 24;
+
+    mul.lo.u32      %r61, %r56, %r44;
+    add.u32         %r62, %r61, %r63;
+    mul.wide.u32    %rd3, %r62, 2;
+    add.u64         %rd4, %rd2, %rd3;
+    CVT_F32_BF16(%h0, %f12)
+    CVT_F32_BF16(%h1, %f13)
+    mov.b32         %r10, {%h0, %h1};
+    st.global.b32   [%rd4], %r10;
+
+    mul.lo.u32      %r61, %r57, %r44;
+    add.u32         %r62, %r61, %r63;
+    mul.wide.u32    %rd3, %r62, 2;
+    add.u64         %rd4, %rd2, %rd3;
+    CVT_F32_BF16(%h0, %f14)
+    CVT_F32_BF16(%h1, %f15)
+    mov.b32         %r10, {%h0, %h1};
+    st.global.b32   [%rd4], %r10;
+
+    // --- mg=1: add 16 to base rows ---
+    add.u32         %r56, %r56, 16;
+    add.u32         %r57, %r57, 16;
+
+    // --- mg=1, ng=0: f16..f19 ---
+    mul.lo.u32      %r61, %r56, %r44;
+    add.u32         %r62, %r61, %r58;
+    mul.wide.u32    %rd3, %r62, 2;
+    add.u64         %rd4, %rd2, %rd3;
+    CVT_F32_BF16(%h0, %f16)
+    CVT_F32_BF16(%h1, %f17)
+    mov.b32         %r10, {%h0, %h1};
+    st.global.b32   [%rd4], %r10;
+
+    mul.lo.u32      %r61, %r57, %r44;
+    add.u32         %r62, %r61, %r58;
+    mul.wide.u32    %rd3, %r62, 2;
+    add.u64         %rd4, %rd2, %rd3;
+    CVT_F32_BF16(%h0, %f18)
+    CVT_F32_BF16(%h1, %f19)
+    mov.b32         %r10, {%h0, %h1};
+    st.global.b32   [%rd4], %r10;
+
+    // --- mg=1, ng=1: f20..f23 ---
+    add.u32         %r63, %r58, 8;
+
+    mul.lo.u32      %r61, %r56, %r44;
+    add.u32         %r62, %r61, %r63;
+    mul.wide.u32    %rd3, %r62, 2;
+    add.u64         %rd4, %rd2, %rd3;
+    CVT_F32_BF16(%h0, %f20)
+    CVT_F32_BF16(%h1, %f21)
+    mov.b32         %r10, {%h0, %h1};
+    st.global.b32   [%rd4], %r10;
+
+    mul.lo.u32      %r61, %r57, %r44;
+    add.u32         %r62, %r61, %r63;
+    mul.wide.u32    %rd3, %r62, 2;
+    add.u64         %rd4, %rd2, %rd3;
+    CVT_F32_BF16(%h0, %f22)
+    CVT_F32_BF16(%h1, %f23)
+    mov.b32         %r10, {%h0, %h1};
+    st.global.b32   [%rd4], %r10;
+
+    // --- mg=1, ng=2: f24..f27 ---
+    add.u32         %r63, %r58, 16;
+
+    mul.lo.u32      %r61, %r56, %r44;
+    add.u32         %r62, %r61, %r63;
+    mul.wide.u32    %rd3, %r62, 2;
+    add.u64         %rd4, %rd2, %rd3;
+    CVT_F32_BF16(%h0, %f24)
+    CVT_F32_BF16(%h1, %f25)
+    mov.b32         %r10, {%h0, %h1};
+    st.global.b32   [%rd4], %r10;
+
+    mul.lo.u32      %r61, %r57, %r44;
+    add.u32         %r62, %r61, %r63;
+    mul.wide.u32    %rd3, %r62, 2;
+    add.u64         %rd4, %rd2, %rd3;
+    CVT_F32_BF16(%h0, %f26)
+    CVT_F32_BF16(%h1, %f27)
+    mov.b32         %r10, {%h0, %h1};
+    st.global.b32   [%rd4], %r10;
+
+    // --- mg=1, ng=3: f28..f31 ---
+    add.u32         %r63, %r58, 24;
+
+    mul.lo.u32      %r61, %r56, %r44;
+    add.u32         %r62, %r61, %r63;
+    mul.wide.u32    %rd3, %r62, 2;
+    add.u64         %rd4, %rd2, %rd3;
+    CVT_F32_BF16(%h0, %f28)
+    CVT_F32_BF16(%h1, %f29)
+    mov.b32         %r10, {%h0, %h1};
+    st.global.b32   [%rd4], %r10;
+
+    mul.lo.u32      %r61, %r57, %r44;
+    add.u32         %r62, %r61, %r63;
+    mul.wide.u32    %rd3, %r62, 2;
+    add.u64         %rd4, %rd2, %rd3;
+    CVT_F32_BF16(%h0, %f30)
+    CVT_F32_BF16(%h1, %f31)
+    mov.b32         %r10, {%h0, %h1};
+    st.global.b32   [%rd4], %r10;
+
+    ret;
+}

@@ -1,0 +1,306 @@
+// topk_sampling.ptx
+//
+// Top-k sampling kernel for autoregressive decoding (k=1 argmax/greedy).
+// Finds the token with the highest temperature-scaled logit per batch element.
+//
+// Grid: (batch_size, 1, 1) -- one block per batch element.
+// Block: (256, 1, 1) -- 256 threads per block (8 warps).
+//
+// Algorithm:
+//   1. Each thread processes a strided chunk of the vocabulary.
+//      For each element: load BF16 logit, convert to F32, divide by temperature.
+//      Track the local maximum value and its vocabulary index.
+//   2. Warp-level butterfly reduction: propagate (max_value, max_index) across
+//      32 lanes, keeping the index of the larger value at each step.
+//   3. Block-level reduction via shared memory: 8 warp winners written to smem,
+//      then warp 0 reduces to find the global argmax.
+//   4. Thread 0 writes the winning index and the scaled logit value (as BF16).
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "reduction.ptxh"
+#include "convert.ptxh"
+
+// Shared memory for block-level reduction:
+//   8 warps * 8 bytes = 64 bytes ({f32 value, u32 index} per warp)
+//   Aligned to 128 bytes per project convention.
+.shared .align 128 .b8 smem_topk[128];
+
+.visible .entry topk_sampling(
+    .param .u64 param_logits,       // [batch_size, vocab_size] input BF16 logits
+    .param .u64 param_indices,      // [batch_size, k] output u32 indices (top-k token IDs)
+    .param .u64 param_values,       // [batch_size, k] output BF16 values
+    .param .u32 param_vocab_size,   // vocabulary size
+    .param .u32 param_k,            // number of top candidates (k=1 for greedy)
+    .param .f32 param_temperature   // temperature for scaling logits
+)
+{
+    .reg .b32 %r<32>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<16>;
+    .reg .b16 %h<4>;
+    .reg .pred %p<8>;
+
+    // ---- Load parameters ----
+    ld.param.u64    %rd0, [param_logits];
+    ld.param.u64    %rd1, [param_indices];
+    ld.param.u64    %rd2, [param_values];
+    ld.param.u32    %r0, [param_vocab_size];
+    ld.param.f32    %f0, [param_temperature];
+
+    // Batch index = block ID
+    mov.u32         %r1, BLOCK_ID_X;
+
+    // Thread ID
+    mov.u32         %r2, THREAD_ID;
+
+    // Number of threads per block
+    mov.u32         %r3, %ntid.x;
+
+    // Compute base address for this batch element's logits:
+    //   logits_base = param_logits + batch_idx * vocab_size * 2  (2 bytes per BF16)
+    mul.lo.u32      %r4, %r1, %r0;             // batch_idx * vocab_size (elements)
+    mul.wide.u32    %rd3, %r4, 2;              // byte offset
+    add.u64         %rd4, %rd0, %rd3;          // &logits[batch, 0]
+
+    // Compute reciprocal of temperature for multiplication instead of division.
+    // temperature is guaranteed > 0 by caller.
+    rcp.approx.f32  %f1, %f0;                 // inv_temp = 1.0 / temperature
+
+    // ================================================================
+    // Stage 1: Thread-local argmax over strided chunk of vocabulary
+    // ================================================================
+    // Each thread scans elements at stride = blockDim.x (256).
+    // Thread tid processes indices: tid, tid+256, tid+512, ...
+
+    // Initialize local max to -infinity, index to 0
+    mov.f32         %f2, 0fFF800000;           // local_max = -inf (IEEE 754)
+    mov.u32         %r5, 0;                    // local_idx = 0
+    mov.u32         %r6, %r2;                  // i = tid (loop counter)
+
+local_max_loop:
+    setp.ge.u32     %p0, %r6, %r0;            // i >= vocab_size?
+    @%p0 bra        local_max_done;
+
+    // Load logits[batch, i] as BF16, convert to F32
+    mul.wide.u32    %rd5, %r6, 2;             // byte offset within row
+    add.u64         %rd6, %rd4, %rd5;         // &logits[batch, i]
+    ld.global.b16   %h0, [%rd6];
+    CVT_BF16_F32(%f3, %h0)
+
+    // Scale by inverse temperature: scaled = logit * inv_temp
+    mul.f32         %f3, %f3, %f1;
+
+    // Update local max: if scaled > local_max, take it
+    setp.gt.f32     %p1, %f3, %f2;
+    @%p1 mov.f32    %f2, %f3;                 // local_max = scaled
+    @%p1 mov.u32    %r5, %r6;                 // local_idx = i
+
+    // i += blockDim.x
+    add.u32         %r6, %r6, %r3;
+    bra             local_max_loop;
+
+local_max_done:
+
+    // ================================================================
+    // Stage 2: Warp-level butterfly reduction for (max_value, max_index)
+    // ================================================================
+    // Butterfly pattern: exchange with lanes at distance 16, 8, 4, 2, 1.
+    // At each step, keep the value/index pair with the larger value.
+    // On ties, keep the smaller index for determinism.
+
+    // --- offset = 16 ---
+    shfl.sync.bfly.b32 %f4, %f2, 16, 31, FULL_MASK;
+    shfl.sync.bfly.b32 %r7, %r5, 16, 31, FULL_MASK;
+    setp.gt.f32     %p2, %f4, %f2;
+    setp.eq.f32     %p3, %f4, %f2;
+    setp.lt.u32     %p4, %r7, %r5;
+    and.pred         %p4, %p3, %p4;            // tie-break: other index < my index
+    or.pred          %p2, %p2, %p4;            // take other if strictly greater OR tie with smaller idx
+    @%p2 mov.f32    %f2, %f4;
+    @%p2 mov.u32    %r5, %r7;
+
+    // --- offset = 8 ---
+    shfl.sync.bfly.b32 %f4, %f2, 8, 31, FULL_MASK;
+    shfl.sync.bfly.b32 %r7, %r5, 8, 31, FULL_MASK;
+    setp.gt.f32     %p2, %f4, %f2;
+    setp.eq.f32     %p3, %f4, %f2;
+    setp.lt.u32     %p4, %r7, %r5;
+    and.pred         %p4, %p3, %p4;
+    or.pred          %p2, %p2, %p4;
+    @%p2 mov.f32    %f2, %f4;
+    @%p2 mov.u32    %r5, %r7;
+
+    // --- offset = 4 ---
+    shfl.sync.bfly.b32 %f4, %f2, 4, 31, FULL_MASK;
+    shfl.sync.bfly.b32 %r7, %r5, 4, 31, FULL_MASK;
+    setp.gt.f32     %p2, %f4, %f2;
+    setp.eq.f32     %p3, %f4, %f2;
+    setp.lt.u32     %p4, %r7, %r5;
+    and.pred         %p4, %p3, %p4;
+    or.pred          %p2, %p2, %p4;
+    @%p2 mov.f32    %f2, %f4;
+    @%p2 mov.u32    %r5, %r7;
+
+    // --- offset = 2 ---
+    shfl.sync.bfly.b32 %f4, %f2, 2, 31, FULL_MASK;
+    shfl.sync.bfly.b32 %r7, %r5, 2, 31, FULL_MASK;
+    setp.gt.f32     %p2, %f4, %f2;
+    setp.eq.f32     %p3, %f4, %f2;
+    setp.lt.u32     %p4, %r7, %r5;
+    and.pred         %p4, %p3, %p4;
+    or.pred          %p2, %p2, %p4;
+    @%p2 mov.f32    %f2, %f4;
+    @%p2 mov.u32    %r5, %r7;
+
+    // --- offset = 1 ---
+    shfl.sync.bfly.b32 %f4, %f2, 1, 31, FULL_MASK;
+    shfl.sync.bfly.b32 %r7, %r5, 1, 31, FULL_MASK;
+    setp.gt.f32     %p2, %f4, %f2;
+    setp.eq.f32     %p3, %f4, %f2;
+    setp.lt.u32     %p4, %r7, %r5;
+    and.pred         %p4, %p3, %p4;
+    or.pred          %p2, %p2, %p4;
+    @%p2 mov.f32    %f2, %f4;
+    @%p2 mov.u32    %r5, %r7;
+
+    // After warp reduction, all lanes have the same (max_value, max_index).
+    // Only lane 0 of each warp writes to shared memory.
+
+    // ================================================================
+    // Stage 3: Block-level reduction via shared memory
+    // ================================================================
+    // smem layout: [warp_id * 8 + 0] = f32 value, [warp_id * 8 + 4] = u32 index
+
+    WARP_ID(%r8, %r2)
+    LANE_ID(%r9, %r2)
+
+    // Lane 0 of each warp writes its result to smem
+    setp.eq.u32     %p5, %r9, 0;
+    @%p5 bra        write_warp_result;
+    bra             after_warp_write;
+
+write_warp_result:
+    // Address: smem_topk + warp_id * 8
+    mul.wide.u32    %rd7, %r8, 8;
+    mov.u64         %rd8, smem_topk;
+    add.u64         %rd9, %rd8, %rd7;
+    st.shared.f32   [%rd9], %f2;               // store value
+    st.shared.u32   [%rd9+4], %r5;             // store index
+
+after_warp_write:
+    bar.sync        0;
+
+    // Only warp 0 performs the final reduction over 8 warp results.
+    setp.eq.u32     %p6, %r8, 0;
+    @%p6 bra        final_reduce;
+    bra             kernel_done;
+
+final_reduce:
+    // Number of warps = blockDim.x / 32
+    shr.u32         %r10, %r3, 5;             // num_warps
+
+    // Each lane in warp 0 loads one warp's result (if lane < num_warps).
+    setp.lt.u32     %p7, %r9, %r10;
+    @%p7 bra        load_warp_result;
+
+    // Inactive lanes get -inf value and index 0
+    mov.f32         %f2, 0fFF800000;
+    mov.u32         %r5, 0;
+    bra             do_block_reduce;
+
+load_warp_result:
+    mul.wide.u32    %rd7, %r9, 8;
+    mov.u64         %rd8, smem_topk;
+    add.u64         %rd9, %rd8, %rd7;
+    ld.shared.f32   %f2, [%rd9];               // value
+    ld.shared.u32   %r5, [%rd9+4];             // index
+
+do_block_reduce:
+    // Warp-level butterfly reduction on the 8 candidates (within warp 0).
+    // Same pattern as Stage 2 but only first 8 lanes have real data.
+
+    // --- offset = 16 ---
+    shfl.sync.bfly.b32 %f4, %f2, 16, 31, FULL_MASK;
+    shfl.sync.bfly.b32 %r7, %r5, 16, 31, FULL_MASK;
+    setp.gt.f32     %p2, %f4, %f2;
+    setp.eq.f32     %p3, %f4, %f2;
+    setp.lt.u32     %p4, %r7, %r5;
+    and.pred         %p4, %p3, %p4;
+    or.pred          %p2, %p2, %p4;
+    @%p2 mov.f32    %f2, %f4;
+    @%p2 mov.u32    %r5, %r7;
+
+    // --- offset = 8 ---
+    shfl.sync.bfly.b32 %f4, %f2, 8, 31, FULL_MASK;
+    shfl.sync.bfly.b32 %r7, %r5, 8, 31, FULL_MASK;
+    setp.gt.f32     %p2, %f4, %f2;
+    setp.eq.f32     %p3, %f4, %f2;
+    setp.lt.u32     %p4, %r7, %r5;
+    and.pred         %p4, %p3, %p4;
+    or.pred          %p2, %p2, %p4;
+    @%p2 mov.f32    %f2, %f4;
+    @%p2 mov.u32    %r5, %r7;
+
+    // --- offset = 4 ---
+    shfl.sync.bfly.b32 %f4, %f2, 4, 31, FULL_MASK;
+    shfl.sync.bfly.b32 %r7, %r5, 4, 31, FULL_MASK;
+    setp.gt.f32     %p2, %f4, %f2;
+    setp.eq.f32     %p3, %f4, %f2;
+    setp.lt.u32     %p4, %r7, %r5;
+    and.pred         %p4, %p3, %p4;
+    or.pred          %p2, %p2, %p4;
+    @%p2 mov.f32    %f2, %f4;
+    @%p2 mov.u32    %r5, %r7;
+
+    // --- offset = 2 ---
+    shfl.sync.bfly.b32 %f4, %f2, 2, 31, FULL_MASK;
+    shfl.sync.bfly.b32 %r7, %r5, 2, 31, FULL_MASK;
+    setp.gt.f32     %p2, %f4, %f2;
+    setp.eq.f32     %p3, %f4, %f2;
+    setp.lt.u32     %p4, %r7, %r5;
+    and.pred         %p4, %p3, %p4;
+    or.pred          %p2, %p2, %p4;
+    @%p2 mov.f32    %f2, %f4;
+    @%p2 mov.u32    %r5, %r7;
+
+    // --- offset = 1 ---
+    shfl.sync.bfly.b32 %f4, %f2, 1, 31, FULL_MASK;
+    shfl.sync.bfly.b32 %r7, %r5, 1, 31, FULL_MASK;
+    setp.gt.f32     %p2, %f4, %f2;
+    setp.eq.f32     %p3, %f4, %f2;
+    setp.lt.u32     %p4, %r7, %r5;
+    and.pred         %p4, %p3, %p4;
+    or.pred          %p2, %p2, %p4;
+    @%p2 mov.f32    %f2, %f4;
+    @%p2 mov.u32    %r5, %r7;
+
+    // ================================================================
+    // Stage 4: Thread 0 writes output
+    // ================================================================
+    // Lane 0 of warp 0 has the global argmax (value in %f2, index in %r5).
+
+    setp.eq.u32     %p5, %r9, 0;
+    @%p5 bra        write_output;
+    bra             kernel_done;
+
+write_output:
+    // Output index: param_indices[batch_idx] = winning token index (u32)
+    //   Address: param_indices + batch_idx * 4
+    mul.wide.u32    %rd10, %r1, 4;
+    add.u64         %rd11, %rd1, %rd10;
+    st.global.u32   [%rd11], %r5;
+
+    // Output value: param_values[batch_idx] = scaled logit as BF16
+    //   Address: param_values + batch_idx * 2
+    CVT_F32_BF16(%h1, %f2)
+    mul.wide.u32    %rd12, %r1, 2;
+    add.u64         %rd13, %rd2, %rd12;
+    st.global.b16   [%rd13], %h1;
+
+kernel_done:
+    ret;
+}

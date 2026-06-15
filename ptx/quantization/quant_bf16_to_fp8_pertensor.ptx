@@ -1,0 +1,98 @@
+// quant_bf16_to_fp8_pertensor.ptx
+//
+// Quantize a BF16 tensor to FP8 e4m3 with a single per-tensor scale.
+//
+//   q[i] = round(x[i] / scale)  saturating to e4m3 range
+// where `scale` is precomputed by the caller (typically `max_abs(x) / 448.0`
+// where 448.0 is e4m3's max representable magnitude).
+//
+// Caller side: dequant is `x_hat[i] = scale * f32(q[i])` — see gemv_w8a16_split_k.
+//
+// Layouts:
+//   x:     [n] BF16
+//   q:     [n] FP8 e4m3 (one byte per element)
+//   scale: f32 scalar PARAMETER (not a buffer; computed on the host)
+//
+// Grid: ceil(n / (256 * 2)), block 256.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+.visible .entry quant_bf16_to_fp8_pertensor(
+    .param .u64 param_x,        // [n] BF16
+    .param .u64 param_q,        // [n] FP8 e4m3
+    .param .u32 param_n,
+    .param .f32 param_scale     // dequant scale; quant uses 1/scale
+)
+{
+    .reg .b32  %r<10>;
+    .reg .b64  %rd<8>;
+    .reg .f32  %f<8>;
+    .reg .b16  %h<6>;
+    .reg .pred %p<2>;
+
+    mov.u32         %r0, %tid.x;
+    mov.u32         %r1, %ctaid.x;
+    mov.u32         %r2, %ntid.x;
+    mad.lo.u32      %r3, %r1, %r2, %r0;          // global thread id
+    shl.b32         %r3, %r3, 1;                  // 2 elements/thread
+
+    ld.param.u64    %rd0, [param_x];
+    ld.param.u64    %rd1, [param_q];
+    ld.param.u32    %r4, [param_n];
+    ld.param.f32    %f0, [param_scale];
+
+    // inv_scale = 1.0 / scale  (use rcp.approx for speed; sufficient for quant)
+    rcp.approx.f32  %f1, %f0;
+
+    setp.ge.u32     %p0, %r3, %r4;
+    @%p0 bra        done;
+
+    // Element 0: load x[i], scale, convert to e4m3 (use the pair instruction
+    // since single-lane e4m3.f32 doesn't exist on SM12x).
+    mul.wide.u32    %rd2, %r3, 2;
+    add.u64         %rd3, %rd0, %rd2;
+    ld.global.b16   %h0, [%rd3];
+    cvt.f32.bf16    %f2, %h0;
+    mul.f32         %f2, %f2, %f1;
+
+    // Element 1 (with bounds check).
+    add.u32         %r5, %r3, 1;
+    setp.ge.u32     %p1, %r5, %r4;
+    @%p1 bra        single_elem;
+
+    mul.wide.u32    %rd4, %r5, 2;
+    add.u64         %rd5, %rd0, %rd4;
+    ld.global.b16   %h1, [%rd5];
+    cvt.f32.bf16    %f3, %h1;
+    mul.f32         %f3, %f3, %f1;
+
+    // Pair convert (hi, lo) → 16-bit (2 packed e4m3)
+    cvt.rn.satfinite.e4m3x2.f32 %h2, %f3, %f2;
+
+    // Store 2 bytes
+    cvt.u64.u32     %rd6, %r3;
+    add.u64         %rd7, %rd1, %rd6;
+    st.global.b16   [%rd7], %h2;
+    bra             done;
+
+single_elem:
+    // Last element with no pair partner: convert and store low byte only.
+    // Pack with x[i+1] = 0 (both halves same; we only keep the low byte).
+    cvt.rn.satfinite.e4m3x2.f32 %h2, %f2, %f2;
+    cvt.u64.u32     %rd6, %r3;
+    add.u64         %rd7, %rd1, %rd6;
+    // st.global.b8 isn't a thing; use mov + st.global.u8
+    .reg .b8 %byte;
+    mov.b16         %h3, %h2;
+    cvt.u32.u16     %r6, %h3;
+    cvt.u8.u32      %byte, %r6;
+    st.global.u8    [%rd7], %byte;
+
+done:
+    ret;
+}

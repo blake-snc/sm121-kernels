@@ -1,0 +1,242 @@
+// rmsnorm_bf16_fp8out_pertoken.ptx
+//
+// RMSNorm with FP8 E4M3 output using DYNAMIC per-token scale (vs the
+// static per-tensor inv_scale in `rmsnorm_bf16_fp8out.ptx`).
+//
+//   rms        = sqrt(mean(x^2) + eps)
+//   tmp[i]     = (x[i] / rms) * weight[i]         (FP32)
+//   max_abs    = max(|tmp[i]|) over the row
+//   row_scale  = max_abs / 448.0                  (so tmp / row_scale ∈ ±448)
+//   out[i]     = round_to_e4m3(tmp[i] / row_scale)
+//   scales[row] = row_scale  (FP32; consumer applies at GEMM/attention dequant)
+//
+// Matches DeepSeek V3's per-token FP8 activation quantization pattern
+// (one scale per token, computed on the fly — no calibration needed).
+//
+// Layout:
+//   x          : [num_rows, hidden] bf16
+//   weight     : [hidden] bf16
+//   out        : [num_rows, hidden] fp8_e4m3 (u8)
+//   scales     : [num_rows] f32
+//
+// Grid: (num_rows, 1, 1). Block: (256, 1, 1). Each thread handles hidden/256 elements.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "reduction.ptxh"
+#include "convert.ptxh"
+
+// Static SMEM layout (per CTA):
+//   [0 .. 128)      : reduction scratch (32 warps max → 128 bytes)
+//   [128 .. 32896)  : normalized FP32 staging (supports hidden up to 8192)
+// Total: 32896 bytes (well below SM121a 99 KB limit).
+.shared .align 128 .b8 smem_reduce_pt[32896];
+
+.visible .entry rmsnorm_bf16_fp8out_pertoken(
+    .param .u64 param_x,          // [num_rows, hidden] bf16
+    .param .u64 param_out,        // [num_rows, hidden] fp8_e4m3 (u8)
+    .param .u64 param_weight,     // [hidden] bf16
+    .param .u64 param_scales,     // [num_rows] f32 (output)
+    .param .u32 param_hidden,
+    .param .f32 param_eps
+)
+{
+    .reg .b32 %r<40>;
+    .reg .b64 %rd<20>;
+    .reg .f32 %f<28>;
+    .reg .b16 %h<16>;
+    .reg .pred %p<8>;
+
+    mov.u32      %r0, %ctaid.x;                 // row
+    mov.u32      %r1, %tid.x;                   // lane 0..255
+
+    ld.param.u64 %rd0, [param_x];
+    ld.param.u64 %rd1, [param_out];
+    ld.param.u64 %rd14, [param_weight];
+    ld.param.u64 %rd15, [param_scales];
+    ld.param.u32 %r2, [param_hidden];
+    ld.param.f32 %f0, [param_eps];
+
+    // Row-major bases
+    mul.lo.u32   %r3, %r0, %r2;
+    mul.wide.u32 %rd3, %r3, 2;
+    mul.wide.u32 %rd18, %r3, 1;
+    add.u64      %rd4, %rd0, %rd3;              // &x[row, 0]
+    add.u64      %rd6, %rd1, %rd18;             // &out[row, 0]
+
+    shr.b32      %r5, %r1, 5;                    // warp_id (0..7)
+
+    // -----------------------------------------------------------------
+    // Pass 1: partial sum of x^2 (each thread handles hidden/256 elems in strides of 256)
+    // -----------------------------------------------------------------
+    mov.f32      %f10, 0.0;
+    mov.u32      %r6, %r1;                       // element idx starts at lane
+sumsq_loop:
+    setp.ge.u32  %p0, %r6, %r2;
+    @%p0 bra     sumsq_done;
+    shl.b32      %r7, %r6, 1;                    // byte offset
+    cvt.u64.u32  %rd5, %r7;
+    add.u64      %rd7, %rd4, %rd5;
+    ld.global.b16 %h0, [%rd7];
+    CVT_BF16_F32(%f11, %h0)
+    fma.rn.f32   %f10, %f11, %f11, %f10;
+    add.u32      %r6, %r6, 256;
+    bra          sumsq_loop;
+sumsq_done:
+
+    // Warp reduce via butterfly
+    shfl.sync.bfly.b32 %f12|%p1, %f10, 0x10, 0x1f, 0xffffffff; add.f32 %f10, %f10, %f12;
+    shfl.sync.bfly.b32 %f12|%p1, %f10, 0x08, 0x1f, 0xffffffff; add.f32 %f10, %f10, %f12;
+    shfl.sync.bfly.b32 %f12|%p1, %f10, 0x04, 0x1f, 0xffffffff; add.f32 %f10, %f10, %f12;
+    shfl.sync.bfly.b32 %f12|%p1, %f10, 0x02, 0x1f, 0xffffffff; add.f32 %f10, %f10, %f12;
+    shfl.sync.bfly.b32 %f12|%p1, %f10, 0x01, 0x1f, 0xffffffff; add.f32 %f10, %f10, %f12;
+
+    // Warp-0 thread of each warp writes partial to SMEM
+    and.b32      %r8, %r1, 31;
+    setp.eq.u32  %p2, %r8, 0;
+    mov.u32      %r9, smem_reduce_pt;
+    shl.b32      %r10, %r5, 2;
+    add.u32      %r9, %r9, %r10;
+    @%p2 st.shared.f32 [%r9], %f10;
+    bar.sync 0;
+
+    // Warp 0 reduces across 8 warps
+    setp.lt.u32  %p3, %r1, 8;
+    mov.f32      %f13, 0.0;
+    @%p3 shl.b32 %r11, %r1, 2;
+    @%p3 mov.u32 %r12, smem_reduce_pt;
+    @%p3 add.u32 %r12, %r12, %r11;
+    @%p3 ld.shared.f32 %f13, [%r12];
+    shfl.sync.bfly.b32 %f12|%p1, %f13, 0x04, 0x1f, 0xffffffff; add.f32 %f13, %f13, %f12;
+    shfl.sync.bfly.b32 %f12|%p1, %f13, 0x02, 0x1f, 0xffffffff; add.f32 %f13, %f13, %f12;
+    shfl.sync.bfly.b32 %f12|%p1, %f13, 0x01, 0x1f, 0xffffffff; add.f32 %f13, %f13, %f12;
+    setp.eq.u32  %p2, %r1, 0;
+    mov.u32      %r9, smem_reduce_pt;
+    @%p2 st.shared.f32 [%r9], %f13;
+    bar.sync 0;
+    ld.shared.f32 %f13, [smem_reduce_pt];
+
+    // RMS = sqrt(sum/hidden + eps); rcp_rms = 1/RMS
+    cvt.rn.f32.u32 %f14, %r2;
+    div.approx.f32 %f13, %f13, %f14;            // mean sq
+    add.f32      %f13, %f13, %f0;                // + eps
+    rsqrt.approx.f32 %f15, %f13;                 // 1/rms
+
+    // -----------------------------------------------------------------
+    // Pass 2: compute normalized = (x * rcp_rms) * weight, find max|.|
+    // Store FP32 normalized to SMEM for pass 3 (quantize).
+    // SMEM budget: hidden * 4 bytes. For hidden ≤ 8192 that's ≤ 32 KB.
+    // This kernel caps at hidden ≤ 8192 (reasonable model sizes).
+    // -----------------------------------------------------------------
+    // Use SMEM region [128..hidden*4+128] for normalized FP32 values.
+    mov.f32      %f16, 0.0;                      // local max|normalized|
+    mov.u32      %r6, %r1;
+    mov.u32      %r13, smem_reduce_pt;
+    add.u32      %r13, %r13, 128;                // after reduction scratch
+
+norm_loop:
+    setp.ge.u32  %p0, %r6, %r2;
+    @%p0 bra     norm_done;
+    // Load x
+    shl.b32      %r7, %r6, 1;
+    cvt.u64.u32  %rd5, %r7;
+    add.u64      %rd7, %rd4, %rd5;
+    ld.global.b16 %h0, [%rd7];
+    CVT_BF16_F32(%f11, %h0)
+    // Load weight
+    add.u64      %rd7, %rd14, %rd5;
+    ld.global.b16 %h1, [%rd7];
+    CVT_BF16_F32(%f17, %h1)
+    // Normalize
+    mul.f32      %f18, %f11, %f15;               // x * rcp_rms
+    mul.f32      %f18, %f18, %f17;               // * weight → normalized
+    // Write FP32 to SMEM at offset elem_idx*4
+    shl.b32      %r14, %r6, 2;
+    add.u32      %r15, %r13, %r14;
+    st.shared.f32 [%r15], %f18;
+    // Track local max |.|
+    abs.f32      %f19, %f18;
+    max.f32      %f16, %f16, %f19;
+    add.u32      %r6, %r6, 256;
+    bra          norm_loop;
+norm_done:
+
+    // Warp reduce max
+    shfl.sync.bfly.b32 %f12|%p1, %f16, 0x10, 0x1f, 0xffffffff; max.f32 %f16, %f16, %f12;
+    shfl.sync.bfly.b32 %f12|%p1, %f16, 0x08, 0x1f, 0xffffffff; max.f32 %f16, %f16, %f12;
+    shfl.sync.bfly.b32 %f12|%p1, %f16, 0x04, 0x1f, 0xffffffff; max.f32 %f16, %f16, %f12;
+    shfl.sync.bfly.b32 %f12|%p1, %f16, 0x02, 0x1f, 0xffffffff; max.f32 %f16, %f16, %f12;
+    shfl.sync.bfly.b32 %f12|%p1, %f16, 0x01, 0x1f, 0xffffffff; max.f32 %f16, %f16, %f12;
+
+    @%p2 st.shared.f32 [%r9], %f16;             // warp 0 thread 0 writes row's partial max
+    // warp 1..7 write via warp-id-indexed slot (reusing scratch)
+    and.b32      %r8, %r1, 31;
+    setp.eq.u32  %p2, %r8, 0;
+    shl.b32      %r10, %r5, 2;
+    mov.u32      %r9, smem_reduce_pt;
+    add.u32      %r9, %r9, %r10;
+    @%p2 st.shared.f32 [%r9], %f16;
+    bar.sync 0;
+
+    setp.lt.u32  %p3, %r1, 8;
+    mov.f32      %f20, 0.0;
+    @%p3 shl.b32 %r11, %r1, 2;
+    @%p3 mov.u32 %r12, smem_reduce_pt;
+    @%p3 add.u32 %r12, %r12, %r11;
+    @%p3 ld.shared.f32 %f20, [%r12];
+    shfl.sync.bfly.b32 %f12|%p1, %f20, 0x04, 0x1f, 0xffffffff; max.f32 %f20, %f20, %f12;
+    shfl.sync.bfly.b32 %f12|%p1, %f20, 0x02, 0x1f, 0xffffffff; max.f32 %f20, %f20, %f12;
+    shfl.sync.bfly.b32 %f12|%p1, %f20, 0x01, 0x1f, 0xffffffff; max.f32 %f20, %f20, %f12;
+    setp.eq.u32  %p2, %r1, 0;
+    mov.u32      %r9, smem_reduce_pt;
+    @%p2 st.shared.f32 [%r9], %f20;
+    bar.sync 0;
+    ld.shared.f32 %f20, [smem_reduce_pt];         // row_max
+
+    // row_scale = row_max / 448.  If row_max == 0, set scale = 1 to avoid 0-divide.
+    mov.f32      %f21, 0f43E00000;                // 448.0
+    div.approx.f32 %f22, %f20, %f21;              // scale
+    setp.eq.f32  %p4, %f20, 0f00000000;
+    mov.f32      %f23, 0f3F800000;                // 1.0
+    @%p4 mov.f32 %f22, %f23;
+    rcp.approx.f32 %f24, %f22;                    // 1 / scale
+
+    // Thread 0 writes scale to global
+    setp.eq.u32  %p2, %r1, 0;
+    mul.wide.u32 %rd10, %r0, 4;
+    add.u64      %rd11, %rd15, %rd10;
+    @%p2 st.global.f32 [%rd11], %f22;
+
+    // -----------------------------------------------------------------
+    // Pass 3: read normalized FP32 from SMEM, multiply by inv_scale, quantize to E4M3.
+    // -----------------------------------------------------------------
+    mov.u32      %r6, %r1;
+quant_loop:
+    setp.ge.u32  %p0, %r6, %r2;
+    @%p0 bra     quant_done;
+    and.b32      %r16, %r6, 1;
+    setp.ne.u32  %p5, %r16, 0;
+    @%p5 bra     quant_next;                     // only even threads handle 2-elem pair
+
+    shl.b32      %r14, %r6, 2;
+    add.u32      %r15, %r13, %r14;
+    ld.shared.f32 %f25, [%r15];
+    ld.shared.f32 %f26, [%r15+4];
+    mul.f32      %f25, %f25, %f24;
+    mul.f32      %f26, %f26, %f24;
+    CVT_F32X2_E4M3X2(%h0, %f26, %f25)            // pack 2 FP8 into u16
+    // Write 2 bytes
+    add.u64      %rd7, %rd6, %rd5;               // Reuse stale — recompute:
+    mul.wide.u32 %rd5, %r6, 1;
+    add.u64      %rd7, %rd6, %rd5;
+    st.global.b16 [%rd7], %h0;
+
+quant_next:
+    add.u32      %r6, %r6, 256;
+    bra          quant_loop;
+quant_done:
+    ret;
+}

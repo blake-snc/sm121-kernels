@@ -1,0 +1,154 @@
+// moe_device_permute.ptx
+//
+// Pack activations grouped by *target device* (not by expert). For the common
+// case where experts are assigned contiguously per device (experts_per_node
+// consecutive experts → one device), `moe_permute` alone already produces a
+// device-grouped buffer. This kernel handles the GENERAL case: an arbitrary
+// `expert_to_device[num_experts]` table lets heterogeneous setups (e.g. a
+// dynamic expert-placement scheme, or non-uniform experts_per_node) build
+// the alltoall send buffer directly.
+//
+//   for each entry i in [0, total_entries = tokens*top_k):
+//     e   = expert_ids[i]
+//     d   = expert_to_device[e]
+//     pos = atomicAdd(device_cursor[d], 1)
+//     dst = device_offsets[d] + pos
+//     permuted_activations[dst, :] = activations[i / top_k, :]
+//     inverse_index[dst] = i
+//
+// Matches `moe_unpermute` for the post-alltoall-return inverse step.
+//
+// Layout:
+//   activations       : [num_tokens, hidden] bf16
+//   expert_ids        : [total_entries] u32
+//   expert_to_device  : [num_experts] u32
+//   device_offsets    : [num_devices+1] u32 (prefix sum of device_counts)
+//   device_cursor     : [num_devices] u32   (scratch, zero-initialized by caller)
+//   permuted_acts     : [total_entries, hidden] bf16 (output)
+//   inverse_index     : [total_entries] u32 (output)
+//
+// Grid: (total_entries, 1, 1). Block: (256, 1, 1). CTA per entry; threads
+// cooperate on the row copy (b32 = 2 bf16 per thread step).
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+
+.visible .entry moe_device_permute(
+    .param .u64 param_activations,
+    .param .u64 param_expert_ids,
+    .param .u64 param_expert_to_device,
+    .param .u64 param_device_offsets,
+    .param .u64 param_device_cursor,
+    .param .u64 param_permuted,
+    .param .u64 param_inverse,
+    .param .u32 param_top_k,
+    .param .u32 param_hidden
+)
+{
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<18>;
+    .reg .pred %p<4>;
+    .shared .align 4 .b8 smem_bcast[16];
+
+    mov.u32         %r0, BLOCK_ID_X;           // entry_id
+    mov.u32         %r1, THREAD_ID;
+
+    ld.param.u64    %rd0, [param_activations];
+    ld.param.u64    %rd1, [param_expert_ids];
+    ld.param.u64    %rd2, [param_expert_to_device];
+    ld.param.u64    %rd3, [param_device_offsets];
+    ld.param.u64    %rd4, [param_device_cursor];
+    ld.param.u64    %rd5, [param_permuted];
+    ld.param.u64    %rd6, [param_inverse];
+    ld.param.u32    %r2, [param_top_k];
+    ld.param.u32    %r3, [param_hidden];
+
+    setp.ne.u32     %p0, %r1, 0;
+    @%p0 bra        wait_bcast;
+
+    // expert = expert_ids[entry_id]
+    mul.wide.u32    %rd7, %r0, 4;
+    add.u64         %rd8, %rd1, %rd7;
+    ld.global.u32   %r10, [%rd8];              // expert_id
+
+    // device = expert_to_device[expert]
+    mul.wide.u32    %rd9, %r10, 4;
+    add.u64         %rd10, %rd2, %rd9;
+    ld.global.u32   %r11, [%rd10];             // device
+
+    // pos = atomicAdd(device_cursor[device], 1)
+    mul.wide.u32    %rd11, %r11, 4;
+    add.u64         %rd12, %rd4, %rd11;
+    atom.global.add.u32 %r12, [%rd12], 1;      // pos (old cursor value)
+
+    // base = device_offsets[device]
+    add.u64         %rd13, %rd3, %rd11;
+    ld.global.u32   %r13, [%rd13];             // base
+    add.u32         %r14, %r13, %r12;          // dst = base + pos
+
+    // Broadcast dst via SMEM
+    mov.u64         %rd14, smem_bcast;
+    st.shared.u32   [%rd14], %r14;
+
+    // inverse_index[dst] = entry_id
+    mul.wide.u32    %rd15, %r14, 4;
+    add.u64         %rd16, %rd6, %rd15;
+    st.global.u32   [%rd16], %r0;
+
+wait_bcast:
+    bar.sync        0;
+    mov.u64         %rd14, smem_bcast;
+    ld.shared.u32   %r14, [%rd14];
+
+    // Source row: entry_id / top_k
+    div.u32         %r15, %r0, %r2;
+    mul.lo.u32      %r16, %r15, %r3;
+    mul.wide.u32    %rd7, %r16, 2;
+    add.u64         %rd0, %rd0, %rd7;
+
+    // Dest row: dst * hidden
+    mul.lo.u32      %r17, %r14, %r3;
+    mul.wide.u32    %rd11, %r17, 2;
+    add.u64         %rd5, %rd5, %rd11;
+
+    // Cooperative b32 copy (2 bf16 per step)
+    mov.u32         %r18, %ntid.x;
+    shl.b32         %r19, %r18, 1;             // stride (bf16 elements)
+    shl.b32         %r20, %r1, 1;              // i = tid * 2
+
+copy_loop:
+    setp.ge.u32     %p1, %r20, %r3;
+    @%p1 bra        copy_tail;
+
+    mul.wide.u32    %rd9, %r20, 2;
+    .reg .b64 _srcp, _dstp;
+    add.u64         _srcp, %rd0, %rd9;
+    add.u64         _dstp, %rd5, %rd9;
+    .reg .b32 _v;
+    ld.global.b32   _v, [_srcp];
+    st.global.b32   [_dstp], _v;
+
+    add.u32         %r20, %r20, %r19;
+    bra             copy_loop;
+
+copy_tail:
+    // Handle odd trailing element if hidden is odd
+    setp.lt.u32     %p1, %r20, %r3;
+    @!%p1 bra       done;
+    sub.u32         %r21, %r20, 1;
+    setp.lt.u32     %p1, %r21, %r3;
+    @!%p1 bra       done;
+    mul.wide.u32    %rd9, %r21, 2;
+    .reg .b64 _srcp2, _dstp2;
+    add.u64         _srcp2, %rd0, %rd9;
+    add.u64         _dstp2, %rd5, %rd9;
+    .reg .b16 _h;
+    ld.global.b16   _h, [_srcp2];
+    st.global.b16   [_dstp2], _h;
+
+done:
+    ret;
+}

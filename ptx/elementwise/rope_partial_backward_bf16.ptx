@@ -1,0 +1,111 @@
+// rope_partial_backward_bf16.ptx
+//
+// Backward for `rope_partial_bf16_pos_dev` (the split-half partial RoPE used
+// by 9B GDN-hybrid / Qwen3-Next: only the first `rotary_dim` of each head is
+// rotated, the rest is passthrough).
+//
+// Forward:
+//   y0 = x0 * cos - x1 * sin   (at offset i within rotary slice)
+//   y1 = x0 * sin + x1 * cos   (at offset i + rotary_dim/2)
+//   passthrough for offsets [rotary_dim..head_dim]
+//
+// Backward (rotation by negated angle):
+//   dx0 = dy0 * cos + dy1 * sin
+//   dx1 = -dy0 * sin + dy1 * cos
+//   passthrough: dx = dy for offsets [rotary_dim..head_dim]
+//
+// Layouts (in-place: overwrites dy with dx):
+//   buf:     [heads, head_dim] BF16 — upstream dy on input, dx on output
+//   pos_ptr: u32* device pointer to current position
+//
+// Grid:  (heads, 1, 1)
+// Block: (rotary_dim / 2, 1, 1) — one thread per rotation pair
+//
+// Passthrough range dx = dy is intentionally a no-op in this kernel since
+// the forward also leaves those positions unchanged — the existing buffer
+// already contains dy there.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+.visible .entry rope_partial_backward_bf16(
+    .param .u64 param_buf,
+    .param .u64 param_pos_ptr,
+    .param .f32 param_theta,
+    .param .u32 param_head_dim,
+    .param .u32 param_rotary_dim
+)
+{
+    .reg .b32  %r<16>;
+    .reg .b64  %rd<8>;
+    .reg .f32  %f<16>;
+    .reg .b16  %h<4>;
+    .reg .pred %p<2>;
+
+    mov.u32         %r0, %tid.x;            // i
+    mov.u32         %r1, %ctaid.x;          // head h
+    ld.param.u32    %r2, [param_head_dim];
+    ld.param.u32    %r3, [param_rotary_dim];
+
+    // half = rotary_dim / 2
+    shr.u32         %r4, %r3, 1;
+    setp.ge.u32     %p0, %r0, %r4;
+    @%p0 bra        done;
+
+    ld.param.u64    %rd0, [param_buf];
+    ld.param.u64    %rd1, [param_pos_ptr];
+    ld.param.f32    %f0, [param_theta];
+
+    // Position from device pointer
+    ld.global.u32   %r5, [%rd1];
+    cvt.rn.f32.u32  %f1, %r5;
+
+    // inv_freq[i] = theta^(-2i / rotary_dim)
+    lg2.approx.f32  %f2, %f0;
+    cvt.rn.f32.u32  %f3, %r0;
+    mul.f32         %f4, %f3, %f2;
+    cvt.rn.f32.u32  %f5, %r3;
+    div.approx.f32  %f6, %f4, %f5;
+    add.f32         %f6, %f6, %f6;
+    neg.f32         %f6, %f6;
+    ex2.approx.f32  %f7, %f6;
+    mul.f32         %f8, %f1, %f7;          // angle
+
+    cos.approx.ftz.f32  %f9,  %f8;          // cos
+    sin.approx.ftz.f32  %f10, %f8;          // sin
+
+    // Address computation — same indexing as the forward
+    mul.lo.u32      %r6, %r1, %r2;          // h * head_dim
+    add.u32         %r7, %r6, %r0;          // h*head_dim + i
+    add.u32         %r8, %r7, %r4;          // h*head_dim + i + half
+
+    mul.wide.u32    %rd2, %r7, 2;
+    add.u64         %rd3, %rd0, %rd2;       // &buf[h, i]
+    mul.wide.u32    %rd4, %r8, 2;
+    add.u64         %rd5, %rd0, %rd4;       // &buf[h, i + half]
+
+    // Load dy0, dy1
+    ld.global.b16   %h0, [%rd3];
+    cvt.f32.bf16    %f11, %h0;              // dy0
+    ld.global.b16   %h1, [%rd5];
+    cvt.f32.bf16    %f12, %h1;              // dy1
+
+    // dx0 = dy0 * cos + dy1 * sin
+    mul.f32         %f13, %f11, %f9;        // dy0 * cos
+    fma.rn.f32      %f13, %f12, %f10, %f13; // + dy1 * sin
+
+    // dx1 = -dy0 * sin + dy1 * cos
+    neg.f32         %f15, %f10;             // -sin
+    mul.f32         %f14, %f11, %f15;       // -dy0 * sin
+    fma.rn.f32      %f14, %f12, %f9, %f14;  // + dy1 * cos
+
+    // Store dx0, dx1
+    cvt.rn.bf16.f32 %h2, %f13;
+    st.global.b16   [%rd3], %h2;
+    cvt.rn.bf16.f32 %h3, %f14;
+    st.global.b16   [%rd5], %h3;
+
+done:
+    ret;
+}

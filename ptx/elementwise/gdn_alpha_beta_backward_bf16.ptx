@@ -1,0 +1,186 @@
+// gdn_alpha_beta_backward_bf16.ptx
+//
+// Backward for gdn_alpha_beta_bf16 (the per-head decay-scalar computation in
+// the GDN forward).
+//
+// Forward:
+//   x        = a_logits + dt_bias
+//   dt       = softplus(x)             (linear above x > 20)
+//   A_pos    = exp(a_log)
+//   alpha    = exp(-A_pos * dt)
+//   beta     = sigmoid(b_logits)
+//
+// Backward (given upstream dalpha, dbeta FP32):
+//   db_logits = dbeta * beta * (1 - beta)
+//   dx        = -A_pos * dalpha * alpha * sigmoid(x)     (sigmoid = 1 if x>20)
+//   da_logits = dx
+//   ddt_bias  = dx
+//   dA_log    = -dt * dalpha * alpha * A_pos
+//
+// One element per (V) head; total N elements (N ≤ 1024, typically 32).
+// All four input gradients are accumulated atomically by the caller across
+// timesteps (for prefill training); this kernel produces per-step gradients.
+//
+// Inputs:
+//   a_logits, b_logits, dt_bias, a_log : [N] BF16 (original forward inputs)
+//   dalpha, dbeta                      : [N] FP32 (upstream gradients)
+// Outputs:
+//   da_logits, db_logits, ddt_bias, dA_log : [N] BF16
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#define LOG2E_F32       0f3FB8AA3B
+#define MINUS_LOG2E_F32 0fBFB8AA3B
+#define ONE_F32         0f3F800000
+#define LN2_F32         0f3F317218
+
+.visible .entry gdn_alpha_beta_backward_bf16(
+    .param .u64 param_a_logits,
+    .param .u64 param_b_logits,
+    .param .u64 param_dt_bias,
+    .param .u64 param_a_log,
+    .param .u64 param_dalpha,
+    .param .u64 param_dbeta,
+    .param .u64 param_da_logits,
+    .param .u64 param_db_logits,
+    .param .u64 param_ddt_bias,
+    .param .u64 param_dA_log,
+    .param .u32 param_n
+)
+{
+    .reg .b32  %r<8>;
+    .reg .b64  %rd<24>;
+    .reg .f32  %f<32>;
+    .reg .b16  %h<8>;
+    .reg .pred %p<4>;
+
+    mov.u32         %r0, %tid.x;
+    ld.param.u32    %r1, [param_n];
+    setp.ge.u32     %p0, %r0, %r1;
+    @%p0 bra        done;
+
+    mul.wide.u32    %rd0, %r0, 2;             // BF16 byte offset
+    mul.wide.u32    %rd1, %r0, 4;             // FP32 byte offset
+
+    // Load BF16 inputs
+    ld.param.u64    %rd2, [param_a_logits];
+    add.u64         %rd2, %rd2, %rd0;
+    ld.global.b16   %h0, [%rd2];
+    cvt.f32.bf16    %f0, %h0;                 // a_logits
+
+    ld.param.u64    %rd3, [param_b_logits];
+    add.u64         %rd3, %rd3, %rd0;
+    ld.global.b16   %h1, [%rd3];
+    cvt.f32.bf16    %f1, %h1;                 // b_logits
+
+    ld.param.u64    %rd4, [param_dt_bias];
+    add.u64         %rd4, %rd4, %rd0;
+    ld.global.b16   %h2, [%rd4];
+    cvt.f32.bf16    %f2, %h2;                 // dt_bias
+
+    ld.param.u64    %rd5, [param_a_log];
+    add.u64         %rd5, %rd5, %rd0;
+    ld.global.b16   %h3, [%rd5];
+    cvt.f32.bf16    %f3, %h3;                 // a_log
+
+    // Load FP32 upstream grads
+    ld.param.u64    %rd6, [param_dalpha];
+    add.u64         %rd6, %rd6, %rd1;
+    ld.global.f32   %f4, [%rd6];              // dalpha
+
+    ld.param.u64    %rd7, [param_dbeta];
+    add.u64         %rd7, %rd7, %rd1;
+    ld.global.f32   %f5, [%rd7];              // dbeta
+
+    // ========================================================================
+    // Recompute forward intermediates: x, dt, A_pos, alpha, beta, sigmoid(x)
+    // ========================================================================
+    // x = a_logits + dt_bias
+    add.f32         %f6, %f0, %f2;             // x
+
+    // dt = softplus(x), linear above 20
+    setp.gt.f32     %p1, %f6, 0f41A00000;
+    mov.f32         %f7, %f6;                  // dt (default linear)
+    @%p1 bra        dt_done;
+    mul.f32         %f8, %f6, LOG2E_F32;
+    ex2.approx.f32  %f9, %f8;                  // e^x
+    add.f32         %f10, %f9, ONE_F32;        // 1 + e^x
+    lg2.approx.f32  %f11, %f10;                // log2(1+e^x)
+    mul.f32         %f7, %f11, LN2_F32;        // softplus
+dt_done:
+
+    // sigmoid(x) (= ∂softplus/∂x); = 1 when saturated
+    mov.f32         %f12, ONE_F32;             // default for saturated
+    @%p1 bra        sig_done;
+    neg.f32         %f13, %f6;                 // -x
+    mul.f32         %f13, %f13, LOG2E_F32;
+    ex2.approx.f32  %f13, %f13;                // e^(-x)
+    add.f32         %f13, %f13, ONE_F32;
+    rcp.approx.f32  %f12, %f13;                // sigmoid(x)
+sig_done:
+
+    // A_pos = exp(a_log)
+    mul.f32         %f14, %f3, LOG2E_F32;
+    ex2.approx.f32  %f15, %f14;                // A_pos
+
+    // alpha = exp(-A_pos * dt)
+    mul.f32         %f16, %f15, %f7;           // A_pos * dt
+    neg.f32         %f17, %f16;                // -A_pos * dt
+    mul.f32         %f18, %f17, LOG2E_F32;
+    ex2.approx.f32  %f19, %f18;                // alpha
+
+    // beta = sigmoid(b_logits)
+    neg.f32         %f20, %f1;                 // -b_logits
+    mul.f32         %f20, %f20, LOG2E_F32;
+    ex2.approx.f32  %f20, %f20;
+    add.f32         %f20, %f20, ONE_F32;
+    rcp.approx.f32  %f21, %f20;                // beta
+
+    // ========================================================================
+    // Backward
+    // ========================================================================
+    // db_logits = dbeta * beta * (1 - beta)
+    sub.f32         %f22, ONE_F32, %f21;       // 1 - beta
+    mul.f32         %f23, %f21, %f22;          // beta * (1 - beta)
+    mul.f32         %f24, %f5, %f23;           // dbeta * ...
+
+    // common = -A_pos * dalpha * alpha
+    neg.f32         %f25, %f15;                // -A_pos
+    mul.f32         %f26, %f25, %f4;           // -A_pos * dalpha
+    mul.f32         %f27, %f26, %f19;          // * alpha = common (without sigmoid yet)
+
+    // dx = common * sigmoid(x)
+    mul.f32         %f28, %f27, %f12;          // dx
+
+    // dA_log = -dt * dalpha * alpha * A_pos
+    //        = (common * dt) but common = -A_pos * dalpha * alpha
+    //        Note: -dt * dalpha * alpha * A_pos = common * dt
+    mul.f32         %f29, %f27, %f7;           // common * dt = dA_log
+
+    // ========================================================================
+    // Stores (BF16)
+    // ========================================================================
+    ld.param.u64    %rd8, [param_da_logits];
+    add.u64         %rd8, %rd8, %rd0;
+    cvt.rn.bf16.f32 %h4, %f28;
+    st.global.b16   [%rd8], %h4;
+
+    ld.param.u64    %rd9, [param_ddt_bias];
+    add.u64         %rd9, %rd9, %rd0;
+    st.global.b16   [%rd9], %h4;               // ddt_bias = da_logits
+
+    ld.param.u64    %rd10, [param_dA_log];
+    add.u64         %rd10, %rd10, %rd0;
+    cvt.rn.bf16.f32 %h5, %f29;
+    st.global.b16   [%rd10], %h5;
+
+    ld.param.u64    %rd11, [param_db_logits];
+    add.u64         %rd11, %rd11, %rd0;
+    cvt.rn.bf16.f32 %h6, %f24;
+    st.global.b16   [%rd11], %h6;
+
+done:
+    ret;
+}

@@ -1,0 +1,72 @@
+// moe_apply_per_expert_scale_bf16.ptx
+//
+// Gemma-4 MoE router post-step: multiply each top-k routing weight by the
+// corresponding expert's learned per-expert scale.
+//
+//   top_k_w[t, j] *= per_expert_scale[ top_k_idx[t, j] ]
+//
+// Layout:
+//   top_k_w:   [num_tokens, top_k] bf16 (in/out)
+//   top_k_idx: [num_tokens, top_k] u32  (in)
+//   per_expert_scale: [num_experts] bf16 (in)
+//
+// One thread per (token, j) pair. Grid: (ceil(num_tokens*top_k / 256), 1, 1).
+// For decode (num_tokens=1, top_k=8) this is a single 8-thread launch.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+.visible .entry moe_apply_per_expert_scale_bf16(
+    .param .u64 param_top_k_w,        // [N, K] bf16 (in/out)
+    .param .u64 param_top_k_idx,      // [N, K] u32 (in)
+    .param .u64 param_per_expert_scale, // [E] bf16 (in)
+    .param .u32 param_n_entries       // = num_tokens * top_k
+)
+{
+    .reg .b32  %r<10>;
+    .reg .b64  %rd<12>;
+    .reg .f32  %f<6>;
+    .reg .b16  %h<6>;
+    .reg .pred %p<2>;
+
+    mov.u32         %r0, BLOCK_ID_X;
+    mov.u32         %r1, %ntid.x;
+    mov.u32         %r2, THREAD_ID;
+    mad.lo.u32      %r3, %r0, %r1, %r2;     // gid = entry index in [0, N*K)
+
+    ld.param.u64    %rd0, [param_top_k_w];
+    ld.param.u64    %rd1, [param_top_k_idx];
+    ld.param.u64    %rd2, [param_per_expert_scale];
+    ld.param.u32    %r4, [param_n_entries];
+
+    setp.ge.u32     %p0, %r3, %r4;
+    @%p0 bra        done;
+
+    // expert id = top_k_idx[gid]
+    mul.wide.u32    %rd3, %r3, 4;
+    add.u64         %rd4, %rd1, %rd3;
+    ld.global.u32   %r5, [%rd4];            // e
+
+    // scale = per_expert_scale[e]
+    mul.wide.u32    %rd5, %r5, 2;
+    add.u64         %rd6, %rd2, %rd5;
+    ld.global.b16   %h0, [%rd6];
+    CVT_BF16_F32(%f0, %h0)                  // scale_f32
+
+    // w = top_k_w[gid]
+    mul.wide.u32    %rd7, %r3, 2;
+    add.u64         %rd8, %rd0, %rd7;
+    ld.global.b16   %h1, [%rd8];
+    CVT_BF16_F32(%f1, %h1)                  // w_f32
+
+    mul.f32         %f2, %f1, %f0;          // w * scale
+    CVT_F32_BF16(%h2, %f2)
+    st.global.b16   [%rd8], %h2;
+
+done:
+    ret;
+}

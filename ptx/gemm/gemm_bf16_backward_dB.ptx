@@ -1,0 +1,115 @@
+// gemm_bf16_backward_dB.ptx
+//
+// Computes dB[K, N] = A^T[K, M] @ dC[M, N] for the backward of C = A @ B.
+//
+// Layout (all row-major):
+//   A:  [M, K] BF16 (input — same A from forward)
+//   dC: [M, N] BF16 (input)
+//   dB: [K, N] BF16 (output)
+//
+// Mathematically:
+//   dB[k, n] = sum_m(A[m, k] * dC[m, n])
+//
+// Scalar correctness-first impl. One thread per (k, n) output element.
+// Inner loop over M. f32 accumulation, BF16 store.
+//
+// Grid:  (ceil(K/BK), ceil(N/BN), 1)
+// Block: (BK * BN, 1, 1)
+//
+// MVP: BK = 8, BN = 32 → 256 threads/block.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+#define BK 8
+#define BN 32
+
+.visible .entry gemm_bf16_backward_dB(
+    .param .u64 param_A,
+    .param .u64 param_dC,
+    .param .u64 param_dB,
+    .param .u32 param_M,
+    .param .u32 param_N,
+    .param .u32 param_K
+)
+{
+    .reg .b32  %r<24>;
+    .reg .b64  %rd<16>;
+    .reg .f32  %f<8>;
+    .reg .b16  %h<4>;
+    .reg .pred %p<4>;
+
+    mov.u32         %r0, %ctaid.x;
+    mov.u32         %r1, %ctaid.y;
+    mov.u32         %r2, %tid.x;
+
+    div.u32         %r3, %r2, BN;           // local_k
+    rem.u32         %r4, %r2, BN;           // local_n
+
+    mul.lo.u32      %r5, %r0, BK;
+    add.u32         %r5, %r5, %r3;          // k
+    mul.lo.u32      %r6, %r1, BN;
+    add.u32         %r6, %r6, %r4;          // n
+
+    ld.param.u32    %r7, [param_M];
+    ld.param.u32    %r8, [param_N];
+    ld.param.u32    %r9, [param_K];
+
+    setp.ge.u32     %p0, %r5, %r9;
+    @%p0 bra        done;
+    setp.ge.u32     %p1, %r6, %r8;
+    @%p1 bra        done;
+
+    ld.param.u64    %rd0, [param_A];
+    ld.param.u64    %rd1, [param_dC];
+    ld.param.u64    %rd2, [param_dB];
+
+    // A is [M, K] row-major. A[m, k] is at A + (m*K + k)*2
+    // dC is [M, N] row-major. dC[m, n] at dC + (m*N + n)*2
+    // For each m, load A[m, k] and dC[m, n], multiply.
+
+    mov.f32         %f0, 0.0;
+    mov.u32         %r12, 0;                // m
+
+m_loop:
+    setp.ge.u32     %p2, %r12, %r7;
+    @%p2 bra        m_done;
+
+    // A[m, k] offset: (m * K + k) * 2
+    mul.lo.u32      %r13, %r12, %r9;
+    add.u32         %r13, %r13, %r5;
+    mul.wide.u32    %rd3, %r13, 2;
+    add.u64         %rd4, %rd0, %rd3;
+
+    // dC[m, n] offset: (m * N + n) * 2
+    mul.lo.u32      %r14, %r12, %r8;
+    add.u32         %r14, %r14, %r6;
+    mul.wide.u32    %rd5, %r14, 2;
+    add.u64         %rd6, %rd1, %rd5;
+
+    ld.global.b16   %h0, [%rd4];
+    CVT_BF16_F32(%f1, %h0)                  // A[m, k]
+    ld.global.b16   %h1, [%rd6];
+    CVT_BF16_F32(%f2, %h1)                  // dC[m, n]
+
+    fma.rn.f32      %f0, %f1, %f2, %f0;
+
+    add.u32         %r12, %r12, 1;
+    bra             m_loop;
+
+m_done:
+    // dB[k, n] offset: (k * N + n) * 2
+    mul.lo.u32      %r15, %r5, %r8;
+    add.u32         %r15, %r15, %r6;
+    mul.wide.u32    %rd7, %r15, 2;
+    add.u64         %rd8, %rd2, %rd7;
+    CVT_F32_BF16(%h2, %f0)
+    st.global.b16   [%rd8], %h2;
+
+done:
+    ret;
+}

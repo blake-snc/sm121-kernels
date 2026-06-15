@@ -1,0 +1,120 @@
+// rope_proportional_bf16_pos_dev.ptx
+//
+// Proportional RoPE (Gemma-4 full-attention layers) — pair convention is
+// (i, i + head_dim/2) (NOT (i, i + rotary_dim/2) like rope_partial). Only
+// the first `rope_angles` indices receive a nonzero rotation; indices in
+// [rope_angles, head_dim/2) pass through with cos=1, sin=0 (identity).
+//
+// Math (matches transformers' _compute_proportional_rope_parameters +
+// apply_rotary_pos_emb):
+//   inv_freq[i] = theta^(-2i / head_dim)  for i in [0, rope_angles)
+//                  0                       for i in [rope_angles, head_dim/2)
+//   angle       = pos * inv_freq[i]
+//   c = cos(angle); s = sin(angle)
+//   x0 = buf[h, i]; x1 = buf[h, i + head_dim/2]
+//   buf[h, i]                = x0 * c - x1 * s
+//   buf[h, i + head_dim/2]   = x0 * s + x1 * c
+//
+// For Gemma-4-e4b: head_dim=512, partial_rotary_factor=0.25, theta=1e6
+//   → rope_angles = 0.25 * 512 / 2 = 64
+//   → dims [0..64) and [256..320) get rotated; rest pass through.
+//
+// Layouts:
+//   buf:         [heads, head_dim] BF16 (in-place)
+//   pos_ptr:     u32* device — current decode position
+//   theta:       f32 scalar (1000000.0 for Gemma-4 full attention)
+//   head_dim:    u32 (e.g., 512)
+//   rope_angles: u32 (number of nonzero inv_freq entries; e.g., 64)
+//
+// Grid:  (heads, 1, 1)
+// Block: (head_dim / 2, 1, 1)              — one thread per (h, i) pair.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+.visible .entry rope_proportional_bf16_pos_dev(
+    .param .u64 param_buf,
+    .param .u64 param_pos_ptr,
+    .param .f32 param_theta,
+    .param .u32 param_head_dim,
+    .param .u32 param_rope_angles
+)
+{
+    .reg .b32  %r<16>;
+    .reg .b64  %rd<8>;
+    .reg .f32  %f<16>;
+    .reg .b16  %h<4>;
+    .reg .pred %p<4>;
+
+    mov.u32         %r0, %tid.x;            // i (pair index, in 0..head_dim/2)
+    mov.u32         %r1, %ctaid.x;          // head index h
+    ld.param.u32    %r2, [param_head_dim];
+    ld.param.u32    %r3, [param_rope_angles];
+
+    // half = head_dim / 2
+    shr.u32         %r4, %r2, 1;
+    setp.ge.u32     %p0, %r0, %r4;
+    @%p0 bra        done;
+
+    ld.param.u64    %rd0, [param_buf];
+    ld.param.u64    %rd1, [param_pos_ptr];
+    ld.param.f32    %f0, [param_theta];
+
+    // Load position from device pointer
+    ld.global.u32   %r5, [%rd1];
+    cvt.rn.f32.u32  %f1, %r5;               // pos as f32
+
+    // For i >= rope_angles: identity (c=1, s=0). Otherwise compute the angle.
+    setp.ge.u32     %p1, %r0, %r3;          // p1 = (i >= rope_angles)
+    mov.f32         %f9, 0f3F800000;        // c = 1.0 (default, identity)
+    mov.f32         %f10, 0f00000000;       // s = 0.0 (default, identity)
+    @%p1 bra        load_xy;
+
+    // inv_freq[i] = theta^(-2i / head_dim) = ex2(-2 * i * log2(theta) / head_dim)
+    lg2.approx.f32  %f2, %f0;               // log2(theta)
+    cvt.rn.f32.u32  %f3, %r0;               // i as f32
+    mul.f32         %f4, %f3, %f2;          // i * log2(theta)
+    cvt.rn.f32.u32  %f5, %r2;               // head_dim as f32
+    div.approx.f32  %f6, %f4, %f5;          // (i * log2(theta)) / head_dim
+    add.f32         %f6, %f6, %f6;          // 2 * (i * log2(theta) / head_dim)
+    neg.f32         %f6, %f6;
+    ex2.approx.f32  %f7, %f6;               // inv_freq[i]
+    mul.f32         %f8, %f1, %f7;          // angle = pos * inv_freq[i]
+
+    cos.approx.ftz.f32  %f9, %f8;
+    sin.approx.ftz.f32  %f10, %f8;
+
+load_xy:
+    // Pointers: head_off = h * head_dim, x0 at i, x1 at i + half
+    mul.lo.u32      %r6, %r1, %r2;          // h * head_dim
+    add.u32         %r7, %r6, %r0;          // x0 index = h*head_dim + i
+    add.u32         %r8, %r7, %r4;          // x1 index = h*head_dim + i + half
+
+    mul.wide.u32    %rd2, %r7, 2;
+    add.u64         %rd3, %rd0, %rd2;       // &buf[h, i]
+    mul.wide.u32    %rd4, %r8, 2;
+    add.u64         %rd5, %rd0, %rd4;       // &buf[h, i + half]
+
+    ld.global.b16   %h0, [%rd3];
+    cvt.f32.bf16    %f11, %h0;              // x0
+    ld.global.b16   %h1, [%rd5];
+    cvt.f32.bf16    %f12, %h1;              // x1
+
+    // out0 = x0 * c - x1 * s
+    neg.f32         %f15, %f10;             // -s
+    mul.f32         %f13, %f11, %f9;        // x0 * c
+    fma.rn.f32      %f13, %f12, %f15, %f13; // x0*c - x1*s
+
+    // out1 = x0 * s + x1 * c
+    mul.f32         %f14, %f11, %f10;       // x0 * s
+    fma.rn.f32      %f14, %f12, %f9, %f14;  // x0*s + x1*c
+
+    cvt.rn.bf16.f32 %h2, %f13;
+    st.global.b16   [%rd3], %h2;
+    cvt.rn.bf16.f32 %h3, %f14;
+    st.global.b16   [%rd5], %h3;
+
+done:
+    ret;
+}

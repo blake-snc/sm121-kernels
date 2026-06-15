@@ -1,0 +1,105 @@
+// sum_kv_groups_bf16.ptx
+//
+// Sum-reduce dK/dV across Q-head groups (GQA backward contraction).
+//
+// x: [B, H_q,  S, d] BF16  (input — expanded gradient)
+// y: [B, H_kv, S, d] BF16  (output — caller MUST zero-init)
+//
+// where H_q = H_kv * group_size, and:
+//   y[b, h_kv, s, k] = sum over h_q in [h_kv*group_size, (h_kv+1)*group_size) of x[b, h_q, s, k]
+//
+// Per output element y[b, h_kv, s, k], compute the sum over its
+// group_size source elements. One thread per OUTPUT element.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+.visible .entry sum_kv_groups_bf16(
+    .param .u64 param_x,
+    .param .u64 param_y,
+    .param .u32 param_B,
+    .param .u32 param_H_kv,
+    .param .u32 param_H_q,
+    .param .u32 param_S,
+    .param .u32 param_D
+)
+{
+    .reg .b32  %r<24>;
+    .reg .b64  %rd<8>;
+    .reg .f32  %f<4>;
+    .reg .b16  %h<2>;
+    .reg .pred %p<2>;
+
+    mov.u32         %r0, %ctaid.x;
+    mov.u32         %r1, %ntid.x;
+    mov.u32         %r2, %tid.x;
+    mad.lo.u32      %r3, %r0, %r1, %r2;     // y index
+
+    ld.param.u32    %r4, [param_B];
+    ld.param.u32    %r5, [param_H_kv];
+    ld.param.u32    %r6, [param_H_q];
+    ld.param.u32    %r7, [param_S];
+    ld.param.u32    %r8, [param_D];
+
+    // Total y elements = B * H_kv * S * D
+    mul.lo.u32      %r9, %r4, %r5;
+    mul.lo.u32      %r9, %r9, %r7;
+    mul.lo.u32      %r9, %r9, %r8;
+
+    setp.ge.u32     %p0, %r3, %r9;
+    @%p0 bra        done;
+
+    // Decompose y idx → (b, h_kv, s, k)
+    rem.u32         %r10, %r3, %r8;         // k
+    div.u32         %r11, %r3, %r8;
+    rem.u32         %r12, %r11, %r7;        // s
+    div.u32         %r13, %r11, %r7;
+    rem.u32         %r14, %r13, %r5;        // h_kv
+    div.u32         %r15, %r13, %r5;        // b
+
+    // group_size, h_q_start, h_q_end
+    div.u32         %r16, %r6, %r5;          // group_size
+    mul.lo.u32      %r17, %r14, %r16;        // h_q_start
+    add.u32         %r18, %r17, %r16;        // h_q_end
+
+    ld.param.u64    %rd0, [param_x];
+
+    // Sum loop: for h_q in [h_q_start, h_q_end)
+    mov.f32         %f0, 0.0;
+    mov.u32         %r19, %r17;             // current h_q
+
+sum_loop:
+    setp.ge.u32     %p1, %r19, %r18;
+    @%p1 bra        sum_done;
+
+    // x idx = ((b * H_q + h_q) * S + s) * D + k
+    mul.lo.u32      %r20, %r15, %r6;
+    add.u32         %r20, %r20, %r19;
+    mul.lo.u32      %r20, %r20, %r7;
+    add.u32         %r20, %r20, %r12;
+    mul.lo.u32      %r20, %r20, %r8;
+    add.u32         %r20, %r20, %r10;
+
+    mul.wide.u32    %rd2, %r20, 2;
+    add.u64         %rd3, %rd0, %rd2;
+    ld.global.b16   %h0, [%rd3];
+    CVT_BF16_F32(%f1, %h0)
+    add.f32         %f0, %f0, %f1;
+
+    add.u32         %r19, %r19, 1;
+    bra             sum_loop;
+
+sum_done:
+    ld.param.u64    %rd1, [param_y];
+    mul.wide.u32    %rd4, %r3, 2;
+    add.u64         %rd5, %rd1, %rd4;
+    CVT_F32_BF16(%h1, %f0)
+    st.global.b16   [%rd5], %h1;
+
+done:
+    ret;
+}

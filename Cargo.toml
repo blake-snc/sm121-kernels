@@ -1,0 +1,21 @@
+[workspace]
+members = ["crates/sm121-kernels"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/bledden/sm121-kernels"
+description = "CUDA/PTX kernels for the NVIDIA DGX Spark (GB10, SM121)"
+keywords = ["cuda", "ptx", "kernels", "sm121", "dgx-spark"]
+categories = ["hardware-support", "science"]
+
+[workspace.dependencies]
+cudarc = { version = "0.15", default-features = false, features = ["driver", "dynamic-loading", "cuda-12080", "nccl"] }
+parking_lot = "0.12"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

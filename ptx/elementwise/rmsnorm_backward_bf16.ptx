@@ -1,0 +1,235 @@
+// rmsnorm_backward_bf16.ptx
+//
+// Backward pass for RMSNorm: y = x * rsqrt(mean(x^2) + eps) * weight
+//
+// Per-row, hidden_dim D:
+//   r        = rsqrt(mean(x^2) + eps)
+//   g        = dy * weight                            // [D]
+//   mean_gx  = mean(g * x)                            // scalar
+//   dx       = r * (g - x * r^2 * mean_gx)            // [D]
+//   dweight  = sum_over_rows(dy * x * r)              // [D]
+//
+// Layout:
+//   x:        [num_rows, hidden_dim] BF16
+//   weight:   [hidden_dim] BF16
+//   dy:       [num_rows, hidden_dim] BF16  (upstream gradient)
+//   dx:       [num_rows, hidden_dim] BF16  (output)
+//   dweight:  [hidden_dim] f32             (output, atomic accumulator;
+//                                           caller MUST initialize to 0)
+//
+// One CTA per row. Block size = 256 threads.
+// Two reductions in one pass (sum_sq AND sum_gx) — both are summed
+// across the row independently, so we accumulate them in parallel
+// f32 registers and reduce together.
+//
+// dweight uses atomicAdd to a global f32 buffer (caller converts to BF16
+// post-kernel; staying in f32 for accumulation avoids loss across rows).
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "reduction.ptxh"
+#include "convert.ptxh"
+
+// Shared memory for cross-warp reduction:
+//   smem[0..32]   = sum_sq partials (8 warps × 4B)
+//   smem[32..64]  = sum_gx partials (8 warps × 4B)
+//   smem[64..68]  = broadcast slot for r (rsqrt of mean_sq + eps)
+//   smem[68..72]  = broadcast slot for mean_gx
+.shared .align 128 .b8 smem_reduce[128];
+
+.visible .entry rmsnorm_backward_bf16(
+    .param .u64 param_x,        // [num_rows, hidden_dim] BF16
+    .param .u64 param_weight,   // [hidden_dim] BF16
+    .param .u64 param_dy,       // [num_rows, hidden_dim] BF16
+    .param .u64 param_dx,       // [num_rows, hidden_dim] BF16 (output)
+    .param .u64 param_dweight,  // [hidden_dim] f32 (atomic output)
+    .param .u32 param_hidden,
+    .param .f32 param_eps
+)
+{
+    .reg .b32  %r<32>;
+    .reg .b64  %rd<24>;
+    .reg .f32  %f<32>;
+    .reg .b16  %h<8>;
+    .reg .pred %p<8>;
+
+    mov.u32         %r0, BLOCK_ID_X;       // row idx
+    mov.u32         %r1, THREAD_ID;        // tid
+    mov.u32         %r4, %ntid.x;          // blockDim.x
+
+    ld.param.u64    %rd0, [param_x];
+    ld.param.u64    %rd1, [param_weight];
+    ld.param.u64    %rd2, [param_dy];
+    ld.param.u64    %rd3, [param_dx];
+    ld.param.u64    %rd4, [param_dweight];
+    ld.param.u32    %r2, [param_hidden];
+    ld.param.f32    %f0, [param_eps];
+
+    // Row offsets in bytes: row * hidden * 2
+    mul.lo.u32      %r3, %r0, %r2;
+    mul.wide.u32    %rd5, %r3, 2;
+    add.u64         %rd6,  %rd0, %rd5;     // &x[row, 0]
+    add.u64         %rd7,  %rd2, %rd5;     // &dy[row, 0]
+    add.u64         %rd8,  %rd3, %rd5;     // &dx[row, 0]
+
+    // ========= Stage 1: pass 1 — accumulate sum_sq AND sum_gx =========
+    // Scalar inner loop (correctness-first; vectorize later if perf needs).
+    // Each thread strides hidden by blockDim.x.
+    mov.f32         %f10, 0.0;             // sum_sq
+    mov.f32         %f11, 0.0;             // sum_gx (over the row)
+
+    mov.u32         %r5, %r1;              // i = tid
+
+acc_loop:
+    setp.ge.u32     %p0, %r5, %r2;
+    @%p0 bra        acc_done;
+
+    mul.wide.u32    %rd9, %r5, 2;
+    add.u64         %rd10, %rd6, %rd9;     // &x[row, i]
+    add.u64         %rd11, %rd1, %rd9;     // &weight[i]
+    add.u64         %rd12, %rd7, %rd9;     // &dy[row, i]
+
+    ld.global.b16   %h0, [%rd10];          // x_i
+    CVT_BF16_F32(%f12, %h0)
+    ld.global.b16   %h1, [%rd11];          // w_i
+    CVT_BF16_F32(%f13, %h1)
+    ld.global.b16   %h2, [%rd12];          // dy_i
+    CVT_BF16_F32(%f14, %h2)
+
+    // sum_sq += x_i^2
+    FMA_F32(%f10, %f12, %f12, %f10)
+
+    // g_i = dy_i * w_i ; sum_gx += g_i * x_i
+    mul.f32         %f15, %f14, %f13;      // g_i
+    FMA_F32(%f11, %f15, %f12, %f11)
+
+    add.u32         %r5, %r5, %r4;
+    bra             acc_loop;
+
+acc_done:
+    // ========= Stage 2: warp + cross-warp reduction (both sums) =========
+    .reg .b32 %_tmp32;
+    WARP_REDUCE_SUM_F32(%f10, %_tmp32)
+    WARP_REDUCE_SUM_F32(%f11, %_tmp32)
+
+    WARP_ID(%r6, %r1)
+    LANE_ID(%r7, %r1)
+
+    // Lane 0 of each warp writes its partial sum_sq + sum_gx to smem
+    setp.eq.u32     %p1, %r7, 0;
+    @!%p1 bra       w_skip;
+
+    mul.wide.u32    %rd13, %r6, 4;         // warp_id * 4
+    mov.u64         %rd14, smem_reduce;
+    add.u64         %rd15, %rd14, %rd13;
+    st.shared.f32   [%rd15], %f10;         // sum_sq
+    add.u64         %rd16, %rd15, 32;
+    st.shared.f32   [%rd16], %f11;         // sum_gx
+
+w_skip:
+    bar.sync        0;
+
+    // Warp 0 collects partials and reduces
+    shr.u32         %r8, %r4, 5;           // num_warps = blockDim.x / 32
+    setp.lt.u32     %p2, %r6, 1;
+    @!%p2 bra       skip_w0;
+
+    setp.lt.u32     %p3, %r7, %r8;
+    @%p3 bra        load_p;
+    mov.f32         %f10, 0.0;
+    mov.f32         %f11, 0.0;
+    bra             do_red;
+
+load_p:
+    mul.wide.u32    %rd13, %r7, 4;
+    mov.u64         %rd14, smem_reduce;
+    add.u64         %rd15, %rd14, %rd13;
+    ld.shared.f32   %f10, [%rd15];
+    add.u64         %rd16, %rd15, 32;
+    ld.shared.f32   %f11, [%rd16];
+
+do_red:
+    WARP_REDUCE_SUM_F32(%f10, %_tmp32)
+    WARP_REDUCE_SUM_F32(%f11, %_tmp32)
+
+    // Lane 0 of warp 0: compute r and mean_gx, broadcast via smem
+    setp.eq.u32     %p1, %r7, 0;
+    @!%p1 bra       skip_w0;
+
+    cvt.rn.f32.u32  %f16, %r2;             // D as f32
+    div.approx.f32  %f17, %f10, %f16;      // mean_sq = sum_sq / D
+    add.f32         %f17, %f17, %f0;       // + eps
+    RSQRT_F32(%f18, %f17)                  // r = rsqrt(mean_sq + eps)
+
+    div.approx.f32  %f19, %f11, %f16;      // mean_gx = sum_gx / D
+
+    // Broadcast slots: smem[64] = r, smem[68] = mean_gx
+    mov.u64         %rd14, smem_reduce;
+    add.u64         %rd15, %rd14, 64;
+    st.shared.f32   [%rd15], %f18;
+    add.u64         %rd15, %rd14, 68;
+    st.shared.f32   [%rd15], %f19;
+
+skip_w0:
+    bar.sync        0;
+
+    mov.u64         %rd14, smem_reduce;
+    add.u64         %rd15, %rd14, 64;
+    ld.shared.f32   %f18, [%rd15];         // r
+    add.u64         %rd15, %rd14, 68;
+    ld.shared.f32   %f19, [%rd15];         // mean_gx
+
+    // r_sq_mean_gx = r * r * mean_gx (constant for this row, used in dx formula)
+    mul.f32         %f20, %f18, %f18;      // r^2
+    mul.f32         %f20, %f20, %f19;      // r^2 * mean_gx
+
+    // ========= Stage 3: pass 2 — write dx and atomicAdd dweight =========
+    mov.u32         %r5, %r1;              // i = tid
+
+write_loop:
+    setp.ge.u32     %p0, %r5, %r2;
+    @%p0 bra        write_done;
+
+    mul.wide.u32    %rd9, %r5, 2;
+    add.u64         %rd10, %rd6, %rd9;     // &x[row, i]
+    add.u64         %rd11, %rd1, %rd9;     // &weight[i]
+    add.u64         %rd12, %rd7, %rd9;     // &dy[row, i]
+    add.u64         %rd17, %rd8, %rd9;     // &dx[row, i]
+
+    ld.global.b16   %h0, [%rd10];
+    CVT_BF16_F32(%f12, %h0)                // x_i
+    ld.global.b16   %h1, [%rd11];
+    CVT_BF16_F32(%f13, %h1)                // w_i
+    ld.global.b16   %h2, [%rd12];
+    CVT_BF16_F32(%f14, %h2)                // dy_i
+
+    // g_i = dy_i * w_i
+    mul.f32         %f15, %f14, %f13;
+    // dx_i = r * (g_i - x_i * r^2 * mean_gx) = r*g_i - r * x_i * r_sq_mean_gx
+    //      = r*g_i - x_i * (r * r_sq_mean_gx)
+    // Compute: (g_i) - (x_i * r_sq_mean_gx); then * r.
+    fma.rn.f32      %f21, %f12, %f20, 0.0; // x_i * r_sq_mean_gx (use FMA with 0 as cheap mul)
+    sub.f32         %f22, %f15, %f21;      // g_i - x_i*r^2*mean_gx
+    mul.f32         %f23, %f18, %f22;      // dx_i = r * (...)
+
+    CVT_F32_BF16(%h3, %f23)
+    st.global.b16   [%rd17], %h3;
+
+    // dweight contribution: dy_i * x_i * r
+    mul.f32         %f24, %f14, %f12;      // dy_i * x_i
+    mul.f32         %f24, %f24, %f18;      // * r
+
+    // atomicAdd to dweight[i]  (f32 buffer)
+    mul.wide.u32    %rd18, %r5, 4;
+    add.u64         %rd19, %rd4, %rd18;
+    atom.global.add.f32 %f25, [%rd19], %f24;
+
+    add.u32         %r5, %r5, %r4;
+    bra             write_loop;
+
+write_done:
+    ret;
+}

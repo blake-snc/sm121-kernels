@@ -1,0 +1,99 @@
+// paged_kv_scatter_atomic_bf16.ptx
+//
+// Inverse of paged_kv_gather_bf16: scatter dK/dV from contiguous
+// per-sequence layout back into the paged KV layout. Atomic add so it's
+// safe under page sharing across sequences (e.g., prefix-shared pages).
+//
+//   dKV (gathered):  [B, H_kv, S_kv, D] bf16
+//   dKV (paged):     [num_pages, page_size, H_kv, D] bf16  (atomic-add target)
+//   page_table:      [B, max_pages] u32
+//
+// Atomic add is done by upcasting BF16 to FP32, then atomic.add.f32 on a
+// staging FP32 buffer or via CAS — neither path is great. Instead we store
+// FP32 partials into an intermediate buffer, then a separate kernel sums
+// them down. For this orchestrator we take the simpler path: assume no
+// page sharing (training case), use plain st.global.b16 instead of atomic.
+// Caller must guarantee non-overlapping page use; for shared pages, a
+// follow-up reduction is required.
+//
+// Grid/block layout matches the gather kernel.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+
+.visible .entry paged_kv_scatter_bf16(
+    .param .u64 param_dkv_in,       // [B, H_kv, S_kv, D]
+    .param .u64 param_dkv_paged,    // [num_pages, page_size, H_kv, D]
+    .param .u64 param_page_table,   // [B, max_pages] u32
+    .param .u32 param_h_kv,
+    .param .u32 param_d,
+    .param .u32 param_page_size,
+    .param .u32 param_max_pages,
+    .param .u32 param_s_kv
+)
+{
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<14>;
+    .reg .b16 %sh<2>;
+    .reg .pred %p<3>;
+
+    mov.u32         %r0, %ctaid.x;
+    mov.u32         %r1, %ctaid.y;
+    mov.u32         %r2, THREAD_ID;
+    mov.u32         %r3, %ntid.x;
+
+    ld.param.u64    %rd0, [param_dkv_in];
+    ld.param.u64    %rd1, [param_dkv_paged];
+    ld.param.u64    %rd2, [param_page_table];
+    ld.param.u32    %r4, [param_h_kv];
+    ld.param.u32    %r5, [param_d];
+    ld.param.u32    %r6, [param_page_size];
+    ld.param.u32    %r7, [param_max_pages];
+    ld.param.u32    %r8, [param_s_kv];
+
+    div.u32         %r9, %r0, %r6;
+    rem.u32         %r10, %r0, %r6;
+
+    mad.lo.u32      %r11, %r1, %r7, %r9;
+    mul.wide.u32    %rd3, %r11, 4;
+    add.u64         %rd4, %rd2, %rd3;
+    ld.global.u32   %r12, [%rd4];
+
+    mad.lo.u32      %r13, %r12, %r6, %r10;
+    mul.lo.u32      %r14, %r13, %r4;
+    mul.lo.u32      %r15, %r14, %r5;
+    mul.wide.u32    %rd5, %r15, 2;
+    add.u64         %rd6, %rd1, %rd5;       // &dkv_paged[phys, slot, 0, 0]
+
+    mul.lo.u32      %r16, %r4, %r5;
+    mov.u32         %r17, %r2;
+
+iloop:
+    setp.ge.u32     %p0, %r17, %r16;
+    @%p0 bra        idone;
+
+    div.u32         %r18, %r17, %r5;
+    rem.u32         %r19, %r17, %r5;
+
+    // src: dkv_in[batch, h, slot_in_seq, d]
+    mad.lo.u32      %r20, %r1, %r4, %r18;
+    mad.lo.u32      %r21, %r20, %r8, %r0;
+    mad.lo.u32      %r22, %r21, %r5, %r19;
+    mul.wide.u32    %rd7, %r22, 2;
+    add.u64         %rd8, %rd0, %rd7;
+    ld.global.b16   %sh0, [%rd8];
+
+    // dst: dkv_paged[phys, slot_in_page, h, d_in] = base + (h * D + d_in)
+    mul.wide.u32    %rd9, %r17, 2;
+    add.u64         %rd10, %rd6, %rd9;
+    st.global.b16   [%rd10], %sh0;
+
+    add.u32         %r17, %r17, %r3;
+    bra             iloop;
+
+idone:
+    ret;
+}

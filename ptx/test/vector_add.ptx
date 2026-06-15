@@ -1,0 +1,59 @@
+// vector_add.ptx
+//
+// Simple vector addition: C[i] = A[i] + B[i]
+// Validates the full pipeline: PTX -> cpp -> ptxas -> cubin -> embed -> load -> launch
+//
+// Target: SM121 (DGX Spark GB10)
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+
+.visible .entry vector_add(
+    .param .u64 param_A,
+    .param .u64 param_B,
+    .param .u64 param_C,
+    .param .u32 param_N
+)
+{
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<8>;
+    .reg .f32 %f<4>;
+    .reg .pred %p<2>;
+
+    // Global thread index
+    mov.u32         %r0, BLOCK_ID_X;
+    mov.u32         %r1, %ntid.x;
+    mov.u32         %r2, THREAD_ID;
+    mad.lo.u32      %r3, %r0, %r1, %r2;
+
+    // Bounds check
+    ld.param.u32    %r4, [param_N];
+    setp.ge.u32     %p0, %r3, %r4;
+    @%p0 ret;
+
+    // Load params
+    ld.param.u64    %rd0, [param_A];
+    ld.param.u64    %rd1, [param_B];
+    ld.param.u64    %rd2, [param_C];
+
+    // Byte offset: idx * 4 (f32)
+    mul.wide.u32    %rd3, %r3, 4;
+
+    // Load A[idx] and B[idx]
+    add.u64         %rd4, %rd0, %rd3;
+    add.u64         %rd5, %rd1, %rd3;
+    ld.global.f32   %f0, [%rd4];
+    ld.global.f32   %f1, [%rd5];
+
+    // C[idx] = A[idx] + B[idx]
+    add.f32         %f2, %f0, %f1;
+
+    // Store
+    add.u64         %rd6, %rd2, %rd3;
+    st.global.f32   [%rd6], %f2;
+
+    ret;
+}

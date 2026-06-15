@@ -1,0 +1,97 @@
+// gelu_tanh_backward_bf16.ptx
+//
+// Backward pass for PyTorch GeLU-tanh approximation:
+//   y = x * 0.5 * (1 + tanh(K*(x + 0.044715*x^3)))    K = sqrt(2/pi)
+//   inner = K*(x + 0.044715*x^3)
+//   t = tanh(inner)
+//   dy/dx = 0.5*(1+t) + 0.5*x*(1-t^2)*K*(1+0.134145*x^2)
+//
+// Layout: x, dy, dx all same shape (N elements).
+//
+// Grid:  (ceil(N/256), 1, 1)
+// Block: (256, 1, 1)
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+.visible .entry gelu_tanh_backward_bf16(
+    .param .u64 param_x,
+    .param .u64 param_dy,
+    .param .u64 param_dx,
+    .param .u32 param_n
+)
+{
+    .reg .b32  %r<8>;
+    .reg .b64  %rd<8>;
+    .reg .f32  %f<24>;
+    .reg .b16  %h<4>;
+    .reg .pred %p<2>;
+
+    mov.u32         %r0, %ctaid.x;
+    mov.u32         %r1, %ntid.x;
+    mov.u32         %r2, %tid.x;
+    mad.lo.u32      %r3, %r0, %r1, %r2;
+
+    ld.param.u32    %r4, [param_n];
+    setp.ge.u32     %p0, %r3, %r4;
+    @%p0 bra        done;
+
+    ld.param.u64    %rd0, [param_x];
+    ld.param.u64    %rd1, [param_dy];
+    ld.param.u64    %rd2, [param_dx];
+
+    mul.wide.u32    %rd3, %r3, 2;
+    add.u64         %rd4, %rd0, %rd3;
+    add.u64         %rd5, %rd1, %rd3;
+    add.u64         %rd6, %rd2, %rd3;
+
+    ld.global.b16   %h0, [%rd4];
+    CVT_BF16_F32(%f0, %h0)                  // x
+    ld.global.b16   %h1, [%rd5];
+    CVT_BF16_F32(%f1, %h1)                  // dy
+
+    // x_sq = x*x, x_cube = x*x*x
+    mul.f32         %f2, %f0, %f0;          // x^2
+    mul.f32         %f3, %f2, %f0;          // x^3
+
+    // inner = K*(x + 0.044715*x^3),  K = sqrt(2/pi) ≈ 0.7978845608
+    mov.f32         %f4, 0F3F4C422A;        // 0.7978845608
+    mov.f32         %f5, 0F3D372713;        // 0.044715
+    fma.rn.f32      %f6, %f5, %f3, %f0;     // x + 0.044715*x^3
+    mul.f32         %f7, %f4, %f6;          // inner = K*(...)
+
+    // tanh(inner) via PTX intrinsic (tanh.approx.f32 exists on SM75+).
+    tanh.approx.f32 %f8, %f7;               // t
+
+    // term1 = 0.5*(1+t)
+    add.f32         %f9, %f8, 1.0;
+    mul.f32         %f10, %f9, 0.5;
+
+    // term2 = 0.5*x*(1-t^2)*K*(1 + 0.134145*x^2)
+    // 0.134145 = 3 * 0.044715
+    mov.f32         %f11, 0F3E095889;       // 0.134145
+    fma.rn.f32      %f12, %f11, %f2, 1.0;   // 1 + 0.134145*x^2
+    mul.f32         %f13, %f8, %f8;         // t^2
+    sub.f32         %f14, %f13, 1.0;
+    neg.f32         %f14, %f14;             // 1 - t^2
+    mul.f32         %f15, %f4, %f14;        // K*(1-t^2)
+    mul.f32         %f15, %f15, %f12;       // *(1 + 0.134145*x^2)
+    mul.f32         %f15, %f15, %f0;        // *x
+    mul.f32         %f15, %f15, 0.5;        // *0.5
+
+    // dgelu = term1 + term2
+    add.f32         %f16, %f10, %f15;
+
+    // dx = dy * dgelu
+    mul.f32         %f17, %f1, %f16;
+
+    CVT_F32_BF16(%h2, %f17)
+    st.global.b16   [%rd6], %h2;
+
+done:
+    ret;
+}

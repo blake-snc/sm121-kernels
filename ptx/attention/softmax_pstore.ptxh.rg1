@@ -1,0 +1,273 @@
+// softmax_pstore.ptxh.rg1 — rg1 online softmax + P store to SMEM_P
+// Softmax state: %f196..%f199 (row_max0, row_max1, row_sum0, row_sum1)
+// O accumulators: %f128..%f191
+// P store targets: %r160 (row0), %r161 (row1)
+// S accumulators: %f64..%f127
+
+    // --- rg1 softmax: find row max, rescale O_rg1, compute P = exp(S - max) ---
+    // row0 max: d0,d1 values (even regs from each ng)
+    mov.f32         %f201, %f64;
+    max.f32 %f201, %f201, %f65;  max.f32 %f201, %f201, %f68;  max.f32 %f201, %f201, %f69;
+    max.f32 %f201, %f201, %f72;  max.f32 %f201, %f201, %f73;  max.f32 %f201, %f201, %f76;
+    max.f32 %f201, %f201, %f77;  max.f32 %f201, %f201, %f80;  max.f32 %f201, %f201, %f81;
+    max.f32 %f201, %f201, %f84;  max.f32 %f201, %f201, %f85;  max.f32 %f201, %f201, %f88;
+    max.f32 %f201, %f201, %f89;  max.f32 %f201, %f201, %f92;  max.f32 %f201, %f201, %f93;
+    max.f32 %f201, %f201, %f96;  max.f32 %f201, %f201, %f97;  max.f32 %f201, %f201, %f100;
+    max.f32 %f201, %f201, %f101; max.f32 %f201, %f201, %f104; max.f32 %f201, %f201, %f105;
+    max.f32 %f201, %f201, %f108; max.f32 %f201, %f201, %f109; max.f32 %f201, %f201, %f112;
+    max.f32 %f201, %f201, %f113; max.f32 %f201, %f201, %f116; max.f32 %f201, %f201, %f117;
+    max.f32 %f201, %f201, %f120; max.f32 %f201, %f201, %f121; max.f32 %f201, %f201, %f124;
+    max.f32 %f201, %f201, %f125;
+
+    // row1 max: d2,d3 values
+    mov.f32         %f202, %f66;
+    max.f32 %f202, %f202, %f67;  max.f32 %f202, %f202, %f70;  max.f32 %f202, %f202, %f71;
+    max.f32 %f202, %f202, %f74;  max.f32 %f202, %f202, %f75;  max.f32 %f202, %f202, %f78;
+    max.f32 %f202, %f202, %f79;  max.f32 %f202, %f202, %f82;  max.f32 %f202, %f202, %f83;
+    max.f32 %f202, %f202, %f86;  max.f32 %f202, %f202, %f87;  max.f32 %f202, %f202, %f90;
+    max.f32 %f202, %f202, %f91;  max.f32 %f202, %f202, %f94;  max.f32 %f202, %f202, %f95;
+    max.f32 %f202, %f202, %f98;  max.f32 %f202, %f202, %f99;  max.f32 %f202, %f202, %f102;
+    max.f32 %f202, %f202, %f103; max.f32 %f202, %f202, %f106; max.f32 %f202, %f202, %f107;
+    max.f32 %f202, %f202, %f110; max.f32 %f202, %f202, %f111; max.f32 %f202, %f202, %f114;
+    max.f32 %f202, %f202, %f115; max.f32 %f202, %f202, %f118; max.f32 %f202, %f202, %f119;
+    max.f32 %f202, %f202, %f122; max.f32 %f202, %f202, %f123; max.f32 %f202, %f202, %f126;
+    max.f32 %f202, %f202, %f127;
+
+    GROUP4_REDUCE_MAX_F32(%f201, %f203)
+    GROUP4_REDUCE_MAX_F32(%f202, %f203)
+
+
+    // Combine with running max (both scaled)
+    max.f32         %f205, %f196, %f201;
+    max.f32         %f206, %f197, %f202;
+
+    // NaN guard
+    mov.b32 %f203, 0xff800000; setp.eq.f32 %p10, %f205, %f203;
+    @%p10 mov.f32   %f205, 0f00000000;
+    mov.b32 %f203, 0xff800000; setp.eq.f32 %p10, %f206, %f203;
+    @%p10 mov.f32   %f206, 0f00000000;
+
+    // Correction factors
+    sub.f32 %f207, %f196, %f205; mul.f32 %f207, %f207, LOG2E; ex2.approx.f32 %f207, %f207;
+    sub.f32 %f208, %f197, %f206; mul.f32 %f208, %f208, LOG2E; ex2.approx.f32 %f208, %f208;
+
+    // Rescale O_rg1 by correction
+    mul.f32 %f128, %f128, %f207;  mul.f32 %f129, %f129, %f207;
+    mul.f32 %f130, %f130, %f208;  mul.f32 %f131, %f131, %f208;
+    mul.f32 %f132, %f132, %f207;  mul.f32 %f133, %f133, %f207;
+    mul.f32 %f134, %f134, %f208;  mul.f32 %f135, %f135, %f208;
+    mul.f32 %f136, %f136, %f207;  mul.f32 %f137, %f137, %f207;
+    mul.f32 %f138, %f138, %f208;  mul.f32 %f139, %f139, %f208;
+    mul.f32 %f140, %f140, %f207;  mul.f32 %f141, %f141, %f207;
+    mul.f32 %f142, %f142, %f208;  mul.f32 %f143, %f143, %f208;
+    mul.f32 %f144, %f144, %f207;  mul.f32 %f145, %f145, %f207;
+    mul.f32 %f146, %f146, %f208;  mul.f32 %f147, %f147, %f208;
+    mul.f32 %f148, %f148, %f207;  mul.f32 %f149, %f149, %f207;
+    mul.f32 %f150, %f150, %f208;  mul.f32 %f151, %f151, %f208;
+    mul.f32 %f152, %f152, %f207;  mul.f32 %f153, %f153, %f207;
+    mul.f32 %f154, %f154, %f208;  mul.f32 %f155, %f155, %f208;
+    mul.f32 %f156, %f156, %f207;  mul.f32 %f157, %f157, %f207;
+    mul.f32 %f158, %f158, %f208;  mul.f32 %f159, %f159, %f208;
+    mul.f32 %f160, %f160, %f207;  mul.f32 %f161, %f161, %f207;
+    mul.f32 %f162, %f162, %f208;  mul.f32 %f163, %f163, %f208;
+    mul.f32 %f164, %f164, %f207;  mul.f32 %f165, %f165, %f207;
+    mul.f32 %f166, %f166, %f208;  mul.f32 %f167, %f167, %f208;
+    mul.f32 %f168, %f168, %f207;  mul.f32 %f169, %f169, %f207;
+    mul.f32 %f170, %f170, %f208;  mul.f32 %f171, %f171, %f208;
+    mul.f32 %f172, %f172, %f207;  mul.f32 %f173, %f173, %f207;
+    mul.f32 %f174, %f174, %f208;  mul.f32 %f175, %f175, %f208;
+    mul.f32 %f176, %f176, %f207;  mul.f32 %f177, %f177, %f207;
+    mul.f32 %f178, %f178, %f208;  mul.f32 %f179, %f179, %f208;
+    mul.f32 %f180, %f180, %f207;  mul.f32 %f181, %f181, %f207;
+    mul.f32 %f182, %f182, %f208;  mul.f32 %f183, %f183, %f208;
+    mul.f32 %f184, %f184, %f207;  mul.f32 %f185, %f185, %f207;
+    mul.f32 %f186, %f186, %f208;  mul.f32 %f187, %f187, %f208;
+    mul.f32 %f188, %f188, %f207;  mul.f32 %f189, %f189, %f207;
+    mul.f32 %f190, %f190, %f208;  mul.f32 %f191, %f191, %f208;
+
+    // Rescale row_sum
+    mul.f32 %f198, %f198, %f207;
+    mul.f32 %f199, %f199, %f208;
+
+    // Update running max
+    mov.f32 %f196, %f205;
+    mov.f32 %f197, %f206;
+
+    // Compute P = exp(S - new_max), accumulate row_sum, store bf16 to SMEM_P
+    // P store: %r160 (rg1 row0), %r161 (rg1 row1), ng offset = ng*16
+    // ng0
+    sub.f32 %f64, %f64, %f205;  mul.f32 %f64, %f64, LOG2E;  ex2.approx.f32 %f64, %f64;
+    sub.f32 %f65, %f65, %f205;  mul.f32 %f65, %f65, LOG2E;  ex2.approx.f32 %f65, %f65;
+    sub.f32 %f66, %f66, %f206;  mul.f32 %f66, %f66, LOG2E;  ex2.approx.f32 %f66, %f66;
+    sub.f32 %f67, %f67, %f206;  mul.f32 %f67, %f67, LOG2E;  ex2.approx.f32 %f67, %f67;
+    add.f32 %f198, %f198, %f64;  add.f32 %f198, %f198, %f65;
+    add.f32 %f199, %f199, %f66;  add.f32 %f199, %f199, %f67;
+    cvt.rn.bf16.f32 %h0, %f64;  cvt.rn.bf16.f32 %h1, %f65;
+    mov.b32 %r100, {%h0, %h1};  st.shared.b32 [%r160], %r100;
+    cvt.rn.bf16.f32 %h0, %f66;  cvt.rn.bf16.f32 %h1, %f67;
+    mov.b32 %r100, {%h0, %h1};  st.shared.b32 [%r161], %r100;
+    // ng1
+    sub.f32 %f68, %f68, %f205;  mul.f32 %f68, %f68, LOG2E;  ex2.approx.f32 %f68, %f68;
+    sub.f32 %f69, %f69, %f205;  mul.f32 %f69, %f69, LOG2E;  ex2.approx.f32 %f69, %f69;
+    sub.f32 %f70, %f70, %f206;  mul.f32 %f70, %f70, LOG2E;  ex2.approx.f32 %f70, %f70;
+    sub.f32 %f71, %f71, %f206;  mul.f32 %f71, %f71, LOG2E;  ex2.approx.f32 %f71, %f71;
+    add.f32 %f198, %f198, %f68;  add.f32 %f198, %f198, %f69;
+    add.f32 %f199, %f199, %f70;  add.f32 %f199, %f199, %f71;
+    cvt.rn.bf16.f32 %h0, %f68;  cvt.rn.bf16.f32 %h1, %f69;
+    mov.b32 %r100, {%h0, %h1};  st.shared.b32 [%r160 + 16], %r100;
+    cvt.rn.bf16.f32 %h0, %f70;  cvt.rn.bf16.f32 %h1, %f71;
+    mov.b32 %r100, {%h0, %h1};  st.shared.b32 [%r161 + 16], %r100;
+    // ng2
+    sub.f32 %f72, %f72, %f205;  mul.f32 %f72, %f72, LOG2E;  ex2.approx.f32 %f72, %f72;
+    sub.f32 %f73, %f73, %f205;  mul.f32 %f73, %f73, LOG2E;  ex2.approx.f32 %f73, %f73;
+    sub.f32 %f74, %f74, %f206;  mul.f32 %f74, %f74, LOG2E;  ex2.approx.f32 %f74, %f74;
+    sub.f32 %f75, %f75, %f206;  mul.f32 %f75, %f75, LOG2E;  ex2.approx.f32 %f75, %f75;
+    add.f32 %f198, %f198, %f72;  add.f32 %f198, %f198, %f73;
+    add.f32 %f199, %f199, %f74;  add.f32 %f199, %f199, %f75;
+    cvt.rn.bf16.f32 %h0, %f72;  cvt.rn.bf16.f32 %h1, %f73;
+    mov.b32 %r100, {%h0, %h1};  st.shared.b32 [%r160 + 32], %r100;
+    cvt.rn.bf16.f32 %h0, %f74;  cvt.rn.bf16.f32 %h1, %f75;
+    mov.b32 %r100, {%h0, %h1};  st.shared.b32 [%r161 + 32], %r100;
+    // ng3
+    sub.f32 %f76, %f76, %f205;  mul.f32 %f76, %f76, LOG2E;  ex2.approx.f32 %f76, %f76;
+    sub.f32 %f77, %f77, %f205;  mul.f32 %f77, %f77, LOG2E;  ex2.approx.f32 %f77, %f77;
+    sub.f32 %f78, %f78, %f206;  mul.f32 %f78, %f78, LOG2E;  ex2.approx.f32 %f78, %f78;
+    sub.f32 %f79, %f79, %f206;  mul.f32 %f79, %f79, LOG2E;  ex2.approx.f32 %f79, %f79;
+    add.f32 %f198, %f198, %f76;  add.f32 %f198, %f198, %f77;
+    add.f32 %f199, %f199, %f78;  add.f32 %f199, %f199, %f79;
+    cvt.rn.bf16.f32 %h0, %f76;  cvt.rn.bf16.f32 %h1, %f77;
+    mov.b32 %r100, {%h0, %h1};  st.shared.b32 [%r160 + 48], %r100;
+    cvt.rn.bf16.f32 %h0, %f78;  cvt.rn.bf16.f32 %h1, %f79;
+    mov.b32 %r100, {%h0, %h1};  st.shared.b32 [%r161 + 48], %r100;
+    // ng4
+    sub.f32 %f80, %f80, %f205;  mul.f32 %f80, %f80, LOG2E;  ex2.approx.f32 %f80, %f80;
+    sub.f32 %f81, %f81, %f205;  mul.f32 %f81, %f81, LOG2E;  ex2.approx.f32 %f81, %f81;
+    sub.f32 %f82, %f82, %f206;  mul.f32 %f82, %f82, LOG2E;  ex2.approx.f32 %f82, %f82;
+    sub.f32 %f83, %f83, %f206;  mul.f32 %f83, %f83, LOG2E;  ex2.approx.f32 %f83, %f83;
+    add.f32 %f198, %f198, %f80;  add.f32 %f198, %f198, %f81;
+    add.f32 %f199, %f199, %f82;  add.f32 %f199, %f199, %f83;
+    cvt.rn.bf16.f32 %h0, %f80;  cvt.rn.bf16.f32 %h1, %f81;
+    mov.b32 %r100, {%h0, %h1};  st.shared.b32 [%r160 + 64], %r100;
+    cvt.rn.bf16.f32 %h0, %f82;  cvt.rn.bf16.f32 %h1, %f83;
+    mov.b32 %r100, {%h0, %h1};  st.shared.b32 [%r161 + 64], %r100;
+    // ng5
+    sub.f32 %f84, %f84, %f205;  mul.f32 %f84, %f84, LOG2E;  ex2.approx.f32 %f84, %f84;
+    sub.f32 %f85, %f85, %f205;  mul.f32 %f85, %f85, LOG2E;  ex2.approx.f32 %f85, %f85;
+    sub.f32 %f86, %f86, %f206;  mul.f32 %f86, %f86, LOG2E;  ex2.approx.f32 %f86, %f86;
+    sub.f32 %f87, %f87, %f206;  mul.f32 %f87, %f87, LOG2E;  ex2.approx.f32 %f87, %f87;
+    add.f32 %f198, %f198, %f84;  add.f32 %f198, %f198, %f85;
+    add.f32 %f199, %f199, %f86;  add.f32 %f199, %f199, %f87;
+    cvt.rn.bf16.f32 %h0, %f84;  cvt.rn.bf16.f32 %h1, %f85;
+    mov.b32 %r100, {%h0, %h1};  st.shared.b32 [%r160 + 80], %r100;
+    cvt.rn.bf16.f32 %h0, %f86;  cvt.rn.bf16.f32 %h1, %f87;
+    mov.b32 %r100, {%h0, %h1};  st.shared.b32 [%r161 + 80], %r100;
+    // ng6
+    sub.f32 %f88, %f88, %f205;  mul.f32 %f88, %f88, LOG2E;  ex2.approx.f32 %f88, %f88;
+    sub.f32 %f89, %f89, %f205;  mul.f32 %f89, %f89, LOG2E;  ex2.approx.f32 %f89, %f89;
+    sub.f32 %f90, %f90, %f206;  mul.f32 %f90, %f90, LOG2E;  ex2.approx.f32 %f90, %f90;
+    sub.f32 %f91, %f91, %f206;  mul.f32 %f91, %f91, LOG2E;  ex2.approx.f32 %f91, %f91;
+    add.f32 %f198, %f198, %f88;  add.f32 %f198, %f198, %f89;
+    add.f32 %f199, %f199, %f90;  add.f32 %f199, %f199, %f91;
+    cvt.rn.bf16.f32 %h0, %f88;  cvt.rn.bf16.f32 %h1, %f89;
+    mov.b32 %r100, {%h0, %h1};  st.shared.b32 [%r160 + 96], %r100;
+    cvt.rn.bf16.f32 %h0, %f90;  cvt.rn.bf16.f32 %h1, %f91;
+    mov.b32 %r100, {%h0, %h1};  st.shared.b32 [%r161 + 96], %r100;
+    // ng7
+    sub.f32 %f92, %f92, %f205;  mul.f32 %f92, %f92, LOG2E;  ex2.approx.f32 %f92, %f92;
+    sub.f32 %f93, %f93, %f205;  mul.f32 %f93, %f93, LOG2E;  ex2.approx.f32 %f93, %f93;
+    sub.f32 %f94, %f94, %f206;  mul.f32 %f94, %f94, LOG2E;  ex2.approx.f32 %f94, %f94;
+    sub.f32 %f95, %f95, %f206;  mul.f32 %f95, %f95, LOG2E;  ex2.approx.f32 %f95, %f95;
+    add.f32 %f198, %f198, %f92;  add.f32 %f198, %f198, %f93;
+    add.f32 %f199, %f199, %f94;  add.f32 %f199, %f199, %f95;
+    cvt.rn.bf16.f32 %h0, %f92;  cvt.rn.bf16.f32 %h1, %f93;
+    mov.b32 %r100, {%h0, %h1};  st.shared.b32 [%r160 + 112], %r100;
+    cvt.rn.bf16.f32 %h0, %f94;  cvt.rn.bf16.f32 %h1, %f95;
+    mov.b32 %r100, {%h0, %h1};  st.shared.b32 [%r161 + 112], %r100;
+    // ng8
+    sub.f32 %f96, %f96, %f205;  mul.f32 %f96, %f96, LOG2E;  ex2.approx.f32 %f96, %f96;
+    sub.f32 %f97, %f97, %f205;  mul.f32 %f97, %f97, LOG2E;  ex2.approx.f32 %f97, %f97;
+    sub.f32 %f98, %f98, %f206;  mul.f32 %f98, %f98, LOG2E;  ex2.approx.f32 %f98, %f98;
+    sub.f32 %f99, %f99, %f206;  mul.f32 %f99, %f99, LOG2E;  ex2.approx.f32 %f99, %f99;
+    add.f32 %f198, %f198, %f96;  add.f32 %f198, %f198, %f97;
+    add.f32 %f199, %f199, %f98;  add.f32 %f199, %f199, %f99;
+    cvt.rn.bf16.f32 %h0, %f96;  cvt.rn.bf16.f32 %h1, %f97;
+    mov.b32 %r100, {%h0, %h1};  st.shared.b32 [%r160 + 128], %r100;
+    cvt.rn.bf16.f32 %h0, %f98;  cvt.rn.bf16.f32 %h1, %f99;
+    mov.b32 %r100, {%h0, %h1};  st.shared.b32 [%r161 + 128], %r100;
+    // ng9
+    sub.f32 %f100, %f100, %f205;  mul.f32 %f100, %f100, LOG2E;  ex2.approx.f32 %f100, %f100;
+    sub.f32 %f101, %f101, %f205;  mul.f32 %f101, %f101, LOG2E;  ex2.approx.f32 %f101, %f101;
+    sub.f32 %f102, %f102, %f206;  mul.f32 %f102, %f102, LOG2E;  ex2.approx.f32 %f102, %f102;
+    sub.f32 %f103, %f103, %f206;  mul.f32 %f103, %f103, LOG2E;  ex2.approx.f32 %f103, %f103;
+    add.f32 %f198, %f198, %f100; add.f32 %f198, %f198, %f101;
+    add.f32 %f199, %f199, %f102; add.f32 %f199, %f199, %f103;
+    cvt.rn.bf16.f32 %h0, %f100; cvt.rn.bf16.f32 %h1, %f101;
+    mov.b32 %r100, {%h0, %h1};  st.shared.b32 [%r160 + 144], %r100;
+    cvt.rn.bf16.f32 %h0, %f102; cvt.rn.bf16.f32 %h1, %f103;
+    mov.b32 %r100, {%h0, %h1};  st.shared.b32 [%r161 + 144], %r100;
+    // ng10
+    sub.f32 %f104, %f104, %f205;  mul.f32 %f104, %f104, LOG2E;  ex2.approx.f32 %f104, %f104;
+    sub.f32 %f105, %f105, %f205;  mul.f32 %f105, %f105, LOG2E;  ex2.approx.f32 %f105, %f105;
+    sub.f32 %f106, %f106, %f206;  mul.f32 %f106, %f106, LOG2E;  ex2.approx.f32 %f106, %f106;
+    sub.f32 %f107, %f107, %f206;  mul.f32 %f107, %f107, LOG2E;  ex2.approx.f32 %f107, %f107;
+    add.f32 %f198, %f198, %f104; add.f32 %f198, %f198, %f105;
+    add.f32 %f199, %f199, %f106; add.f32 %f199, %f199, %f107;
+    cvt.rn.bf16.f32 %h0, %f104; cvt.rn.bf16.f32 %h1, %f105;
+    mov.b32 %r100, {%h0, %h1};  st.shared.b32 [%r160 + 160], %r100;
+    cvt.rn.bf16.f32 %h0, %f106; cvt.rn.bf16.f32 %h1, %f107;
+    mov.b32 %r100, {%h0, %h1};  st.shared.b32 [%r161 + 160], %r100;
+    // ng11
+    sub.f32 %f108, %f108, %f205;  mul.f32 %f108, %f108, LOG2E;  ex2.approx.f32 %f108, %f108;
+    sub.f32 %f109, %f109, %f205;  mul.f32 %f109, %f109, LOG2E;  ex2.approx.f32 %f109, %f109;
+    sub.f32 %f110, %f110, %f206;  mul.f32 %f110, %f110, LOG2E;  ex2.approx.f32 %f110, %f110;
+    sub.f32 %f111, %f111, %f206;  mul.f32 %f111, %f111, LOG2E;  ex2.approx.f32 %f111, %f111;
+    add.f32 %f198, %f198, %f108; add.f32 %f198, %f198, %f109;
+    add.f32 %f199, %f199, %f110; add.f32 %f199, %f199, %f111;
+    cvt.rn.bf16.f32 %h0, %f108; cvt.rn.bf16.f32 %h1, %f109;
+    mov.b32 %r100, {%h0, %h1};  st.shared.b32 [%r160 + 176], %r100;
+    cvt.rn.bf16.f32 %h0, %f110; cvt.rn.bf16.f32 %h1, %f111;
+    mov.b32 %r100, {%h0, %h1};  st.shared.b32 [%r161 + 176], %r100;
+    // ng12
+    sub.f32 %f112, %f112, %f205;  mul.f32 %f112, %f112, LOG2E;  ex2.approx.f32 %f112, %f112;
+    sub.f32 %f113, %f113, %f205;  mul.f32 %f113, %f113, LOG2E;  ex2.approx.f32 %f113, %f113;
+    sub.f32 %f114, %f114, %f206;  mul.f32 %f114, %f114, LOG2E;  ex2.approx.f32 %f114, %f114;
+    sub.f32 %f115, %f115, %f206;  mul.f32 %f115, %f115, LOG2E;  ex2.approx.f32 %f115, %f115;
+    add.f32 %f198, %f198, %f112; add.f32 %f198, %f198, %f113;
+    add.f32 %f199, %f199, %f114; add.f32 %f199, %f199, %f115;
+    cvt.rn.bf16.f32 %h0, %f112; cvt.rn.bf16.f32 %h1, %f113;
+    mov.b32 %r100, {%h0, %h1};  st.shared.b32 [%r160 + 192], %r100;
+    cvt.rn.bf16.f32 %h0, %f114; cvt.rn.bf16.f32 %h1, %f115;
+    mov.b32 %r100, {%h0, %h1};  st.shared.b32 [%r161 + 192], %r100;
+    // ng13
+    sub.f32 %f116, %f116, %f205;  mul.f32 %f116, %f116, LOG2E;  ex2.approx.f32 %f116, %f116;
+    sub.f32 %f117, %f117, %f205;  mul.f32 %f117, %f117, LOG2E;  ex2.approx.f32 %f117, %f117;
+    sub.f32 %f118, %f118, %f206;  mul.f32 %f118, %f118, LOG2E;  ex2.approx.f32 %f118, %f118;
+    sub.f32 %f119, %f119, %f206;  mul.f32 %f119, %f119, LOG2E;  ex2.approx.f32 %f119, %f119;
+    add.f32 %f198, %f198, %f116; add.f32 %f198, %f198, %f117;
+    add.f32 %f199, %f199, %f118; add.f32 %f199, %f199, %f119;
+    cvt.rn.bf16.f32 %h0, %f116; cvt.rn.bf16.f32 %h1, %f117;
+    mov.b32 %r100, {%h0, %h1};  st.shared.b32 [%r160 + 208], %r100;
+    cvt.rn.bf16.f32 %h0, %f118; cvt.rn.bf16.f32 %h1, %f119;
+    mov.b32 %r100, {%h0, %h1};  st.shared.b32 [%r161 + 208], %r100;
+    // ng14
+    sub.f32 %f120, %f120, %f205;  mul.f32 %f120, %f120, LOG2E;  ex2.approx.f32 %f120, %f120;
+    sub.f32 %f121, %f121, %f205;  mul.f32 %f121, %f121, LOG2E;  ex2.approx.f32 %f121, %f121;
+    sub.f32 %f122, %f122, %f206;  mul.f32 %f122, %f122, LOG2E;  ex2.approx.f32 %f122, %f122;
+    sub.f32 %f123, %f123, %f206;  mul.f32 %f123, %f123, LOG2E;  ex2.approx.f32 %f123, %f123;
+    add.f32 %f198, %f198, %f120; add.f32 %f198, %f198, %f121;
+    add.f32 %f199, %f199, %f122; add.f32 %f199, %f199, %f123;
+    cvt.rn.bf16.f32 %h0, %f120; cvt.rn.bf16.f32 %h1, %f121;
+    mov.b32 %r100, {%h0, %h1};  st.shared.b32 [%r160 + 224], %r100;
+    cvt.rn.bf16.f32 %h0, %f122; cvt.rn.bf16.f32 %h1, %f123;
+    mov.b32 %r100, {%h0, %h1};  st.shared.b32 [%r161 + 224], %r100;
+    // ng15
+    sub.f32 %f124, %f124, %f205;  mul.f32 %f124, %f124, LOG2E;  ex2.approx.f32 %f124, %f124;
+    sub.f32 %f125, %f125, %f205;  mul.f32 %f125, %f125, LOG2E;  ex2.approx.f32 %f125, %f125;
+    sub.f32 %f126, %f126, %f206;  mul.f32 %f126, %f126, LOG2E;  ex2.approx.f32 %f126, %f126;
+    sub.f32 %f127, %f127, %f206;  mul.f32 %f127, %f127, LOG2E;  ex2.approx.f32 %f127, %f127;
+    add.f32 %f198, %f198, %f124; add.f32 %f198, %f198, %f125;
+    add.f32 %f199, %f199, %f126; add.f32 %f199, %f199, %f127;
+    cvt.rn.bf16.f32 %h0, %f124; cvt.rn.bf16.f32 %h1, %f125;
+    mov.b32 %r100, {%h0, %h1};  st.shared.b32 [%r160 + 240], %r100;
+    cvt.rn.bf16.f32 %h0, %f126; cvt.rn.bf16.f32 %h1, %f127;
+    mov.b32 %r100, {%h0, %h1};  st.shared.b32 [%r161 + 240], %r100;

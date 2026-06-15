@@ -1,0 +1,201 @@
+// gemv_bf16_grouped_split_k.ptx
+//
+// Batched M=1 split-K GEMV for MoE decode: process num_active experts in one launch.
+//
+//   For each active_idx in [0, num_active):
+//     eid = active_eids[active_idx]
+//     out_f32[active_idx, :] += x @ B[eid, :, :]
+//
+// Layout:
+//   x:           [K] bf16 if x_stride == 0 (broadcast), else [num_active, x_stride] (per-expert)
+//   B:           [n_routed, K, N] bf16 (full stack, eid selects slice)
+//   active_eids: [num_active] u32 (compact list of active expert IDs)
+//   out_f32:     [num_active, N] f32 (caller-zeroed; atomic-accumulated across shards)
+//   x_stride:    elements between consecutive expert input rows. 0 → broadcast (gate/up),
+//                = K → per-expert (down).
+//
+// Block: 128 threads, 8 cols/thread → 1024 cols/block (same as gemv_bf16_split_k).
+// Grid: (ceil(N / 1024), num_k_shards, num_active)
+// SMEM: k_shard * 2 bytes for the X-shard tile (X is shared across experts but each
+//       block independently loads it — fine since X is in L2 after first block hits it).
+// Constraints: N must be a multiple of 8.
+// Caller MUST zero `out_f32[num_active * N]` before launch.
+//
+// Why batched: serial per-expert gemv launches at top_k=6 give 32 blocks each
+// (under-fills 48 SMs). Batching across experts gives 192 blocks (4/SM), beating
+// both serial gemv and the dense grouped-GEMM (which iterates all 64 experts
+// uniformly with 58 idle blocks).
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+.extern .shared .align 16 .b8 smem_xsh[];
+
+.visible .entry gemv_bf16_grouped_split_k(
+    .param .u64 param_x,             // [K] bf16
+    .param .u64 param_b,             // [n_routed, K, N] bf16 (full weight stack)
+    .param .u64 param_active_eids,   // [num_active] u32 (active expert IDs)
+    .param .u64 param_out_f32,       // [num_active, N] f32 (caller-zeroed accumulator)
+    .param .u32 param_n,
+    .param .u32 param_k,
+    .param .u32 param_k_shard,
+    .param .u32 param_x_stride       // 0 = broadcast x across experts, else per-expert stride in bf16 elems
+)
+{
+    .reg .b32 %r<40>;
+    .reg .b64 %rd<20>;
+    .reg .f32 %f<32>;
+    .reg .b16 %h<16>;
+    .reg .pred %p<8>;
+
+    mov.u32         %r0, %ctaid.x;             // col_block idx
+    mov.u32         %r1, %ctaid.y;             // shard idx
+    mov.u32         %r30, %ctaid.z;            // active_idx (which active expert)
+    mov.u32         %r2, %tid.x;               // tid in [0..127]
+    mov.u32         %r3, %ntid.x;              // 128
+
+    // col_start = col_block * 1024 + tid * 8
+    shl.b32         %r4, %r0, 10;
+    shl.b32         %r5, %r2, 3;
+    add.u32         %r6, %r4, %r5;
+
+    ld.param.u64    %rd0, [param_x];
+    ld.param.u64    %rd1, [param_b];
+    ld.param.u64    %rd10, [param_active_eids];
+    ld.param.u64    %rd2, [param_out_f32];
+    ld.param.u32    %r7, [param_n];
+    ld.param.u32    %r8, [param_k];
+    ld.param.u32    %r9, [param_k_shard];
+    ld.param.u32    %r35, [param_x_stride];
+
+    // ----- Read eid for this active_idx -----
+    mul.wide.u32    %rd11, %r30, 4;
+    add.u64         %rd12, %rd10, %rd11;
+    ld.global.u32   %r31, [%rd12];             // eid
+
+    // ----- B base for this expert: param_b + eid * K * N * 2 -----
+    mul.lo.u32      %r32, %r8, %r7;            // K * N
+    mul.lo.u32      %r33, %r32, %r31;          // eid * K * N (in bf16 elements)
+    mul.wide.u32    %rd13, %r33, 2;            // bytes
+    add.u64         %rd1, %rd1, %rd13;         // B_e base
+
+    // ----- X base: param_x + active_idx * x_stride * 2 (broadcast when stride==0) -----
+    mul.lo.u32      %r36, %r30, %r35;
+    mul.wide.u32    %rd15, %r36, 2;
+    add.u64         %rd0, %rd0, %rd15;         // X_e base
+
+    // ----- Output base for this active_idx: out + active_idx * N * 4 -----
+    mul.lo.u32      %r34, %r30, %r7;
+    mul.wide.u32    %rd14, %r34, 4;
+    add.u64         %rd2, %rd2, %rd14;
+
+    // K range for this shard: [k_start, min(k_start + k_shard, K))
+    mul.lo.u32      %r10, %r1, %r9;            // k_start
+    add.u32         %r11, %r10, %r9;           // tentative k_end
+    min.u32         %r11, %r11, %r8;           // clamp
+    sub.u32         %r13, %r11, %r10;          // shard_len
+
+    // ----- Cooperatively load X[k_start..k_end] into smem -----
+    mov.u32         %r12, smem_xsh;
+    mov.u32         %r14, %r2;                 // i = tid
+load_x:
+    setp.ge.u32     %p0, %r14, %r13;
+    @%p0 bra        load_done;
+    add.u32         %r15, %r14, %r10;          // global_k
+    mul.wide.u32    %rd3, %r15, 2;
+    add.u64         %rd4, %rd0, %rd3;
+    ld.global.b16   %h0, [%rd4];
+    shl.b32         %r16, %r14, 1;
+    add.u32         %r17, %r12, %r16;
+    st.shared.b16   [%r17], %h0;
+    add.u32         %r14, %r14, %r3;
+    bra             load_x;
+load_done:
+    bar.sync        0;
+
+    // ----- Bounds check on column group -----
+    setp.ge.u32     %p1, %r6, %r7;
+    @%p1 bra        ret;
+
+    // ----- 8 accumulators -----
+    mov.f32         %f0, 0.0;
+    mov.f32         %f1, 0.0;
+    mov.f32         %f2, 0.0;
+    mov.f32         %f3, 0.0;
+    mov.f32         %f4, 0.0;
+    mov.f32         %f5, 0.0;
+    mov.f32         %f6, 0.0;
+    mov.f32         %f7, 0.0;
+
+    // ----- K-shard loop -----
+    mov.u32         %r18, 0;                   // k_in_shard
+k_loop:
+    setp.ge.u32     %p2, %r18, %r13;
+    @%p2 bra        k_done;
+
+    // X[k_in_shard] from smem
+    shl.b32         %r19, %r18, 1;
+    add.u32         %r20, %r12, %r19;
+    ld.shared.b16   %h0, [%r20];
+    CVT_BF16_F32(%f8, %h0)
+
+    // B_e[k_global, col_start..col_start+8]
+    add.u32         %r21, %r18, %r10;          // k_global
+    mul.lo.u32      %r22, %r21, %r7;
+    add.u32         %r22, %r22, %r6;
+    mul.wide.u32    %rd5, %r22, 2;
+    add.u64         %rd6, %rd1, %rd5;
+
+    ld.global.b32   %r23, [%rd6 + 0];
+    ld.global.b32   %r24, [%rd6 + 4];
+    ld.global.b32   %r25, [%rd6 + 8];
+    ld.global.b32   %r26, [%rd6 + 12];
+
+    mov.b32         {%h0, %h1}, %r23;
+    mov.b32         {%h2, %h3}, %r24;
+    mov.b32         {%h4, %h5}, %r25;
+    mov.b32         {%h6, %h7}, %r26;
+
+    CVT_BF16_F32(%f9,  %h0)
+    CVT_BF16_F32(%f10, %h1)
+    CVT_BF16_F32(%f11, %h2)
+    CVT_BF16_F32(%f12, %h3)
+    CVT_BF16_F32(%f13, %h4)
+    CVT_BF16_F32(%f14, %h5)
+    CVT_BF16_F32(%f15, %h6)
+    CVT_BF16_F32(%f16, %h7)
+
+    fma.rn.f32      %f0, %f8, %f9,  %f0;
+    fma.rn.f32      %f1, %f8, %f10, %f1;
+    fma.rn.f32      %f2, %f8, %f11, %f2;
+    fma.rn.f32      %f3, %f8, %f12, %f3;
+    fma.rn.f32      %f4, %f8, %f13, %f4;
+    fma.rn.f32      %f5, %f8, %f14, %f5;
+    fma.rn.f32      %f6, %f8, %f15, %f6;
+    fma.rn.f32      %f7, %f8, %f16, %f7;
+
+    add.u32         %r18, %r18, 1;
+    bra             k_loop;
+
+k_done:
+    // ----- Atomic accumulate into per-expert output slot -----
+    mul.wide.u32    %rd7, %r6, 4;
+    add.u64         %rd8, %rd2, %rd7;
+
+    .reg .f32 %old;
+    atom.global.add.f32 %old, [%rd8 + 0],  %f0;
+    atom.global.add.f32 %old, [%rd8 + 4],  %f1;
+    atom.global.add.f32 %old, [%rd8 + 8],  %f2;
+    atom.global.add.f32 %old, [%rd8 + 12], %f3;
+    atom.global.add.f32 %old, [%rd8 + 16], %f4;
+    atom.global.add.f32 %old, [%rd8 + 20], %f5;
+    atom.global.add.f32 %old, [%rd8 + 24], %f6;
+    atom.global.add.f32 %old, [%rd8 + 28], %f7;
+
+ret:
+    ret;
+}

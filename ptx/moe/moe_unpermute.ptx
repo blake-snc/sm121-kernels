@@ -1,0 +1,124 @@
+// moe_unpermute.ptx
+//
+// Gather post-GEMM expert outputs back into token-space and apply routing
+// weights:
+//   out[token, :] = sum over k of weights[token, k] * permuted_out[dst_idx(token, k), :]
+//
+// Using inverse_index (built by moe_permute), each permuted row knows which
+// (token, k) it came from. We accumulate into out[token] via atomic FP adds.
+//
+// Layout:
+//   permuted_out: [total_entries, hidden] bf16
+//   inverse_index: [total_entries] u32 (permuted_pos -> source entry i)
+//   weights: [total_entries] bf16 (weights[i] is the routing weight for entry i)
+//   out: [num_tokens, hidden] bf16 (output, zeroed by caller)
+//
+// total_entries = num_tokens * top_k
+//
+// Grid: (total_entries, 1, 1). Block: (256, 1, 1).
+// Each CTA handles one permuted row, accumulates (weight * row) into the
+// source token's output via atomic FP32 add (then caller can cast back to BF16
+// if needed — but to stay BF16-simple, we use atom.global.add.f16 where
+// available, else FP32 atomic on an accumulator buffer).
+//
+// This implementation accumulates into a bf16 out buffer by first reading,
+// adding, and writing atomically via cas. For correctness when top_k > 1
+// and multiple entries map to the same token, we rely on the caller
+// serializing (or using a scratch fp32 buffer — provided as param_accum).
+//
+// Simpler approach used here: output buffer is FP32 [num_tokens, hidden],
+// caller converts to BF16 post-hoc if desired. Output is atomic FP32 adds.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+.visible .entry moe_unpermute(
+    .param .u64 param_permuted,      // [total_entries, hidden] bf16
+    .param .u64 param_inverse,       // [total_entries] u32
+    .param .u64 param_weights,       // [total_entries] bf16
+    .param .u64 param_out,           // [num_tokens, hidden] f32 (atomic accumulator)
+    .param .u32 param_top_k,
+    .param .u32 param_hidden
+)
+{
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<6>;
+    .reg .b16 %h<4>;
+    .reg .pred %p<4>;
+    .shared .align 4 .b8 smem_bcast[16];
+
+    mov.u32         %r0, BLOCK_ID_X;           // permuted row index
+    mov.u32         %r1, THREAD_ID;
+
+    ld.param.u64    %rd0, [param_permuted];
+    ld.param.u64    %rd1, [param_inverse];
+    ld.param.u64    %rd2, [param_weights];
+    ld.param.u64    %rd3, [param_out];
+    ld.param.u32    %r2, [param_top_k];
+    ld.param.u32    %r3, [param_hidden];
+
+    // Thread 0 loads inverse[row] → entry_id, then token = entry_id / top_k
+    // and weight[entry_id]; broadcasts token_id and weight via shared memory.
+    setp.ne.u32     %p0, %r1, 0;
+    @%p0 bra        wait_bcast;
+
+    mul.wide.u32    %rd4, %r0, 4;
+    add.u64         %rd5, %rd1, %rd4;
+    ld.global.u32   %r10, [%rd5];              // entry_id
+
+    div.u32         %r11, %r10, %r2;           // token_id
+
+    mul.wide.u32    %rd6, %r10, 2;
+    add.u64         %rd7, %rd2, %rd6;
+    ld.global.b16   %h0, [%rd7];               // weight (bf16)
+    CVT_BF16_F32(%f0, %h0)                     // weight as f32
+
+    mov.u64         %rd8, smem_bcast;
+    st.shared.u32   [%rd8], %r11;              // broadcast token_id
+    st.shared.f32   [%rd8 + 4], %f0;           // broadcast weight
+
+wait_bcast:
+    bar.sync        0;
+    mov.u64         %rd8, smem_bcast;
+    ld.shared.u32   %r11, [%rd8];
+    ld.shared.f32   %f0, [%rd8 + 4];           // weight
+
+    // Source ptr: &permuted[row * hidden]
+    mul.lo.u32      %r12, %r0, %r3;
+    mul.wide.u32    %rd9, %r12, 2;
+    add.u64         %rd0, %rd0, %rd9;
+
+    // Dest ptr: &out[token * hidden] (f32)
+    mul.lo.u32      %r13, %r11, %r3;
+    mul.wide.u32    %rd10, %r13, 4;
+    add.u64         %rd3, %rd3, %rd10;
+
+    mov.u32         %r14, %ntid.x;             // blockDim
+    mov.u32         %r15, %r1;                 // i = tid
+
+loop:
+    setp.ge.u32     %p1, %r15, %r3;
+    @%p1 bra        done;
+
+    // Load one bf16 value, cvt to f32, multiply by weight, atomic add
+    mul.wide.u32    %rd11, %r15, 2;
+    add.u64         %rd12, %rd0, %rd11;
+    ld.global.b16   %h1, [%rd12];
+    CVT_BF16_F32(%f1, %h1)
+    mul.f32         %f2, %f1, %f0;              // weight * value
+
+    mul.wide.u32    %rd13, %r15, 4;
+    add.u64         %rd14, %rd3, %rd13;
+    atom.global.add.f32 %f3, [%rd14], %f2;
+
+    add.u32         %r15, %r15, %r14;
+    bra             loop;
+
+done:
+    ret;
+}

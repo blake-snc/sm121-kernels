@@ -1,0 +1,94 @@
+// sigmoid_scalar_axpy_bf16.ptx
+//
+// In-place fused: out[i] := out[i] + sigmoid(*scalar) * src[i]
+// Where scalar is a single device-resident BF16 logit (no host roundtrip).
+//
+// Used by Qwen3-Next / GDN-hybrid MoE shared-expert combine: routed_sum gets the
+// shared expert added with its sigmoid gate, all on GPU — replaces a 2-dtoh
+// + host loop + htod sequence per layer.
+//
+// Layouts (BF16 stored as u16):
+//   out:    [n] BF16 in/out
+//   src:    [n] BF16
+//   scalar: [1] BF16
+//
+// Grid: ceil(n / 256), block 256.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#define MINUS_LOG2E_F32 0fBFB8AA3B
+#define ONE_F32         0f3F800000
+
+// One float of SMEM for broadcast of sigmoid(scalar).
+.shared .align 4 .b8 smem_gate[4];
+
+.visible .entry sigmoid_scalar_axpy_bf16(
+    .param .u64 param_out,        // [n] BF16 in/out
+    .param .u64 param_src,        // [n] BF16
+    .param .u64 param_scalar,     // [1] BF16 (device-resident logit)
+    .param .u32 param_n
+)
+{
+    .reg .b32  %r<8>;
+    .reg .b64  %rd<8>;
+    .reg .f32  %f<8>;
+    .reg .b16  %h<4>;
+    .reg .pred %p<4>;
+
+    mov.u32         %r0, %tid.x;
+    mov.u32         %r1, %ctaid.x;
+    mov.u32         %r2, %ntid.x;
+    mad.lo.u32      %r3, %r1, %r2, %r0;          // global thread id = column
+
+    ld.param.u64    %rd0, [param_out];
+    ld.param.u64    %rd1, [param_src];
+    ld.param.u64    %rd2, [param_scalar];
+    ld.param.u32    %r4, [param_n];
+
+    // Thread 0 of every block computes sigmoid(scalar) and broadcasts via SMEM.
+    // (Cheap to recompute per block; avoids needing a global broadcast kernel.)
+    setp.ne.u32     %p0, %r0, 0;
+    @%p0 bra        wait_gate;
+
+    ld.global.b16   %h0, [%rd2];
+    cvt.f32.bf16    %f0, %h0;
+    // sigmoid(s) = 1 / (1 + 2^(-s * log2(e)))
+    mul.f32         %f1, %f0, MINUS_LOG2E_F32;
+    ex2.approx.f32  %f2, %f1;
+    add.f32         %f3, %f2, ONE_F32;
+    rcp.approx.f32  %f4, %f3;
+    mov.u64         %rd3, smem_gate;
+    st.shared.f32   [%rd3], %f4;
+
+wait_gate:
+    bar.sync        0;
+
+    // Bounds check on column index
+    setp.ge.u32     %p1, %r3, %r4;
+    @%p1 bra        done;
+
+    // Load broadcast gate
+    mov.u64         %rd3, smem_gate;
+    ld.shared.f32   %f4, [%rd3];
+
+    // Load src[col] and out[col]
+    mul.wide.u32    %rd4, %r3, 2;
+    add.u64         %rd5, %rd1, %rd4;
+    add.u64         %rd6, %rd0, %rd4;
+
+    ld.global.b16   %h1, [%rd5];
+    cvt.f32.bf16    %f5, %h1;
+    ld.global.b16   %h2, [%rd6];
+    cvt.f32.bf16    %f6, %h2;
+
+    // out += gate * src
+    fma.rn.f32      %f6, %f4, %f5, %f6;
+
+    cvt.rn.bf16.f32 %h3, %f6;
+    st.global.b16   [%rd6], %h3;
+
+done:
+    ret;
+}

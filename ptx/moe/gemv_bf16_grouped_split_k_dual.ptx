@@ -1,0 +1,238 @@
+// gemv_bf16_grouped_split_k_dual.ptx
+//
+// DUAL batched M=1 split-K GEMV: processes gate AND up weight stacks in one
+// kernel launch. Output is two separate F32 buffers per active expert.
+//
+// For each active_idx in [0, num_active):
+//   eid = active_eids[active_idx]
+//   out_gate_f32[active_idx, :] += x @ B_gate[eid, :, :]
+//   out_up_f32[active_idx, :]   += x @ B_up[eid, :, :]
+//
+// Why: gate and up share the same x (broadcast across experts), same K,
+// same N, same expert IDs — they only differ in weight stacks. Loading
+// x_shard into SMEM once and doing 16 FMAs/K-iter (8 gate + 8 up) halves
+// SMEM-load traffic vs two separate launches and saves 2 launches/MoE-layer
+// (1 memset + 1 cast eliminated for one of the two outputs in the call site).
+//
+// Block: 128 threads, 8 cols/thread (1024 cols/block).
+// Grid: (ceil(N / 1024), num_k_shards, num_active).
+// SMEM: k_shard × 2 bytes for X-shard tile. Caller MUST zero both outputs.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+.extern .shared .align 16 .b8 smem_xsh[];
+
+.visible .entry gemv_bf16_grouped_split_k_dual(
+    .param .u64 param_x,                // [K] bf16 (broadcast across active experts)
+    .param .u64 param_b_gate,           // [n_routed, K, N] bf16 — gate weight stack
+    .param .u64 param_b_up,             // [n_routed, K, N] bf16 — up weight stack
+    .param .u64 param_active_eids,      // [num_active] u32
+    .param .u64 param_out_gate_f32,     // [num_active, N] f32 (caller-zeroed)
+    .param .u64 param_out_up_f32,       // [num_active, N] f32 (caller-zeroed)
+    .param .u32 param_n,
+    .param .u32 param_k,
+    .param .u32 param_k_shard
+)
+{
+    .reg .b32 %r<48>;
+    .reg .b64 %rd<24>;
+    .reg .f32 %f<48>;
+    .reg .b16 %h<24>;
+    .reg .pred %p<8>;
+
+    mov.u32         %r0, %ctaid.x;
+    mov.u32         %r1, %ctaid.y;
+    mov.u32         %r30, %ctaid.z;
+    mov.u32         %r2, %tid.x;
+    mov.u32         %r3, %ntid.x;
+
+    shl.b32         %r4, %r0, 10;
+    shl.b32         %r5, %r2, 3;
+    add.u32         %r6, %r4, %r5;          // col_start
+
+    ld.param.u64    %rd0, [param_x];
+    ld.param.u64    %rd1, [param_b_gate];
+    ld.param.u64    %rd16, [param_b_up];
+    ld.param.u64    %rd10, [param_active_eids];
+    ld.param.u64    %rd2, [param_out_gate_f32];
+    ld.param.u64    %rd17, [param_out_up_f32];
+    ld.param.u32    %r7, [param_n];
+    ld.param.u32    %r8, [param_k];
+    ld.param.u32    %r9, [param_k_shard];
+
+    // Read eid for this active_idx
+    mul.wide.u32    %rd11, %r30, 4;
+    add.u64         %rd12, %rd10, %rd11;
+    ld.global.u32   %r31, [%rd12];
+
+    // Per-expert weight bases for gate and up
+    mul.lo.u32      %r32, %r8, %r7;             // K * N elements
+    mul.lo.u32      %r33, %r32, %r31;           // eid * K * N
+    mul.wide.u32    %rd13, %r33, 2;             // bytes
+    add.u64         %rd1, %rd1, %rd13;          // gate_e base
+    add.u64         %rd16, %rd16, %rd13;        // up_e base
+
+    // Output bases per active_idx
+    mul.lo.u32      %r34, %r30, %r7;
+    mul.wide.u32    %rd14, %r34, 4;
+    add.u64         %rd2, %rd2, %rd14;          // out_gate_e
+    add.u64         %rd17, %rd17, %rd14;        // out_up_e
+
+    // K-shard range
+    mul.lo.u32      %r10, %r1, %r9;
+    add.u32         %r11, %r10, %r9;
+    min.u32         %r11, %r11, %r8;
+    sub.u32         %r13, %r11, %r10;
+
+    // ----- Load X-shard once into SMEM (shared between gate and up FMAs) -----
+    mov.u32         %r12, smem_xsh;
+    mov.u32         %r14, %r2;
+load_x:
+    setp.ge.u32     %p0, %r14, %r13;
+    @%p0 bra        load_done;
+    add.u32         %r15, %r14, %r10;
+    mul.wide.u32    %rd3, %r15, 2;
+    add.u64         %rd4, %rd0, %rd3;
+    ld.global.b16   %h0, [%rd4];
+    shl.b32         %r16, %r14, 1;
+    add.u32         %r17, %r12, %r16;
+    st.shared.b16   [%r17], %h0;
+    add.u32         %r14, %r14, %r3;
+    bra             load_x;
+load_done:
+    bar.sync        0;
+
+    setp.ge.u32     %p1, %r6, %r7;
+    @%p1 bra        ret;
+
+    // 16 accumulators: 8 for gate, 8 for up
+    mov.f32         %f0, 0.0;
+    mov.f32         %f1, 0.0;
+    mov.f32         %f2, 0.0;
+    mov.f32         %f3, 0.0;
+    mov.f32         %f4, 0.0;
+    mov.f32         %f5, 0.0;
+    mov.f32         %f6, 0.0;
+    mov.f32         %f7, 0.0;
+    mov.f32         %f17, 0.0;
+    mov.f32         %f18, 0.0;
+    mov.f32         %f19, 0.0;
+    mov.f32         %f20, 0.0;
+    mov.f32         %f21, 0.0;
+    mov.f32         %f22, 0.0;
+    mov.f32         %f23, 0.0;
+    mov.f32         %f24, 0.0;
+
+    mov.u32         %r18, 0;
+k_loop:
+    setp.ge.u32     %p2, %r18, %r13;
+    @%p2 bra        k_done;
+
+    // X[k_in_shard]
+    shl.b32         %r19, %r18, 1;
+    add.u32         %r20, %r12, %r19;
+    ld.shared.b16   %h0, [%r20];
+    CVT_BF16_F32(%f8, %h0)
+
+    // Gate weight: B_gate[k_global, col_start..col_start+8]
+    add.u32         %r21, %r18, %r10;
+    mul.lo.u32      %r22, %r21, %r7;
+    add.u32         %r22, %r22, %r6;
+    mul.wide.u32    %rd5, %r22, 2;
+    add.u64         %rd6, %rd1, %rd5;
+
+    ld.global.b32   %r23, [%rd6 + 0];
+    ld.global.b32   %r24, [%rd6 + 4];
+    ld.global.b32   %r25, [%rd6 + 8];
+    ld.global.b32   %r26, [%rd6 + 12];
+
+    mov.b32         {%h0, %h1}, %r23;
+    mov.b32         {%h2, %h3}, %r24;
+    mov.b32         {%h4, %h5}, %r25;
+    mov.b32         {%h6, %h7}, %r26;
+
+    CVT_BF16_F32(%f9,  %h0)
+    CVT_BF16_F32(%f10, %h1)
+    CVT_BF16_F32(%f11, %h2)
+    CVT_BF16_F32(%f12, %h3)
+    CVT_BF16_F32(%f13, %h4)
+    CVT_BF16_F32(%f14, %h5)
+    CVT_BF16_F32(%f15, %h6)
+    CVT_BF16_F32(%f16, %h7)
+
+    fma.rn.f32      %f0, %f8, %f9,  %f0;
+    fma.rn.f32      %f1, %f8, %f10, %f1;
+    fma.rn.f32      %f2, %f8, %f11, %f2;
+    fma.rn.f32      %f3, %f8, %f12, %f3;
+    fma.rn.f32      %f4, %f8, %f13, %f4;
+    fma.rn.f32      %f5, %f8, %f14, %f5;
+    fma.rn.f32      %f6, %f8, %f15, %f6;
+    fma.rn.f32      %f7, %f8, %f16, %f7;
+
+    // Up weight: B_up[k_global, col_start..col_start+8]
+    add.u64         %rd6, %rd16, %rd5;
+    ld.global.b32   %r23, [%rd6 + 0];
+    ld.global.b32   %r24, [%rd6 + 4];
+    ld.global.b32   %r25, [%rd6 + 8];
+    ld.global.b32   %r26, [%rd6 + 12];
+
+    mov.b32         {%h8, %h9}, %r23;
+    mov.b32         {%h10, %h11}, %r24;
+    mov.b32         {%h12, %h13}, %r25;
+    mov.b32         {%h14, %h15}, %r26;
+
+    CVT_BF16_F32(%f25, %h8)
+    CVT_BF16_F32(%f26, %h9)
+    CVT_BF16_F32(%f27, %h10)
+    CVT_BF16_F32(%f28, %h11)
+    CVT_BF16_F32(%f29, %h12)
+    CVT_BF16_F32(%f30, %h13)
+    CVT_BF16_F32(%f31, %h14)
+    CVT_BF16_F32(%f32, %h15)
+
+    fma.rn.f32      %f17, %f8, %f25, %f17;
+    fma.rn.f32      %f18, %f8, %f26, %f18;
+    fma.rn.f32      %f19, %f8, %f27, %f19;
+    fma.rn.f32      %f20, %f8, %f28, %f20;
+    fma.rn.f32      %f21, %f8, %f29, %f21;
+    fma.rn.f32      %f22, %f8, %f30, %f22;
+    fma.rn.f32      %f23, %f8, %f31, %f23;
+    fma.rn.f32      %f24, %f8, %f32, %f24;
+
+    add.u32         %r18, %r18, 1;
+    bra             k_loop;
+
+k_done:
+    // Store gate partial sums atomically
+    mul.wide.u32    %rd7, %r6, 4;
+    add.u64         %rd8, %rd2, %rd7;
+
+    .reg .f32 %old;
+    atom.global.add.f32 %old, [%rd8 + 0],  %f0;
+    atom.global.add.f32 %old, [%rd8 + 4],  %f1;
+    atom.global.add.f32 %old, [%rd8 + 8],  %f2;
+    atom.global.add.f32 %old, [%rd8 + 12], %f3;
+    atom.global.add.f32 %old, [%rd8 + 16], %f4;
+    atom.global.add.f32 %old, [%rd8 + 20], %f5;
+    atom.global.add.f32 %old, [%rd8 + 24], %f6;
+    atom.global.add.f32 %old, [%rd8 + 28], %f7;
+
+    // Store up partial sums atomically
+    add.u64         %rd8, %rd17, %rd7;
+    atom.global.add.f32 %old, [%rd8 + 0],  %f17;
+    atom.global.add.f32 %old, [%rd8 + 4],  %f18;
+    atom.global.add.f32 %old, [%rd8 + 8],  %f19;
+    atom.global.add.f32 %old, [%rd8 + 12], %f20;
+    atom.global.add.f32 %old, [%rd8 + 16], %f21;
+    atom.global.add.f32 %old, [%rd8 + 20], %f22;
+    atom.global.add.f32 %old, [%rd8 + 24], %f23;
+    atom.global.add.f32 %old, [%rd8 + 28], %f24;
+
+ret:
+    ret;
+}

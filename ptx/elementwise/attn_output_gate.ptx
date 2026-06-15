@@ -1,0 +1,81 @@
+// attn_output_gate.ptx
+//
+// Output gate for GDN-hybrid's "Gated Attention" hybrid layer (new as of Apr 14 2026).
+// 35B-A3B MoE replaces the pure GDN layers with a 3:1 mix where the
+// "attention" layers have an output gate applied elementwise:
+//
+//   out[b, t, d] = attn_out[b, t, d] * sigmoid(Wg · hidden_state[b, t])[d]
+//
+// Since Wg · hidden is already computed upstream as a standard dense projection
+// (captured as pre-activation `gate_logits`), this kernel just fuses the
+// sigmoid + multiply + write-back, avoiding the intermediate allocation.
+//
+// Layouts:
+//   attn_out:    [N_tokens, D] BF16
+//   gate_logits: [N_tokens, D] BF16 (pre-sigmoid projection output)
+//   out:         [N_tokens, D] BF16 (modified in place or separate)
+//
+// Grid: (N_tokens, 1, 1). Block: (128, 1, 1). Thread handles D/128 elements.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+.visible .entry attn_output_gate(
+    .param .u64 param_attn_out,
+    .param .u64 param_gate_logits,
+    .param .u64 param_out,
+    .param .u32 param_hidden_dim
+)
+{
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<8>;
+    .reg .f32 %f<8>;
+    .reg .b16 %h<4>;
+    .reg .pred %p<4>;
+
+    mov.u32     %r0, %tid.x;
+    mov.u32     %r1, %ctaid.x;         // token id
+    ld.param.u64 %rd0, [param_attn_out];
+    ld.param.u64 %rd1, [param_gate_logits];
+    ld.param.u64 %rd2, [param_out];
+    ld.param.u32 %r2, [param_hidden_dim];
+
+    // Base address: &attn_out[token, 0] = attn_out + token * D * 2
+    mul.lo.u32  %r3, %r1, %r2;
+    mul.wide.u32 %rd3, %r3, 2;
+    add.u64     %rd4, %rd0, %rd3;
+    add.u64     %rd5, %rd1, %rd3;
+    add.u64     %rd6, %rd2, %rd3;
+
+    // Each thread handles D/128 elements via stride-128 loop
+    mov.u32     %r4, %r0;                 // starting dim
+loop_dim:
+    setp.ge.u32 %p1, %r4, %r2;
+    @%p1 bra    done;
+    mul.wide.u32 %rd7, %r4, 2;
+    .reg .b64 _ad, _gd, _od;
+    add.u64     _ad, %rd4, %rd7;
+    add.u64     _gd, %rd5, %rd7;
+    add.u64     _od, %rd6, %rd7;
+    ld.global.b16 %h0, [_ad];
+    ld.global.b16 %h1, [_gd];
+    CVT_BF16_F32(%f0, %h0)
+    CVT_BF16_F32(%f1, %h1)
+    // sigmoid(x) = 1/(1+exp(-x))
+    neg.f32     %f2, %f1;
+    mul.f32     %f2, %f2, LOG2E;
+    ex2.approx.ftz.f32 %f2, %f2;
+    add.f32     %f2, %f2, 1.0;
+    rcp.approx.f32 %f2, %f2;
+    mul.f32     %f0, %f0, %f2;
+    cvt.rn.bf16.f32 %h0, %f0;
+    st.global.b16 [_od], %h0;
+    add.u32     %r4, %r4, 128;
+    bra         loop_dim;
+done:
+    ret;
+}

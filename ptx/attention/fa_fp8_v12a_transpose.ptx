@@ -1,0 +1,778 @@
+// fa_fp8_v12a_transpose.ptx
+//
+// Flash Attention FP8 V12a: V in standard GMEM layout [Skv, D], SMEM transpose V->V_T.
+//
+// After TMA loads V FP8[Bc=64, D=128] into SMEM_V (row-major stride 128),
+// the 128 MMA threads cooperatively transpose to V_T FP8[D=128, Bc=64] in SMEM_VT.
+// V_T[d*64 + k] = V[k, d], enabling single ld.shared.b32 for each B-fragment
+// (replacing 4xld.u8 + 3xbfi.b32 in V11).
+//
+// Transpose sync: bar.sync 0, 128 (MMA warps only) after transpose, before PV GEMM.
+// No extra mbarriers needed -- the mbar_v arrival (which signals V TMA done) ensures
+// V data is visible; bar.sync 0 ensures V_T write visibility.
+//
+// SMEM: ~60 KB (adds 2x8192 bytes for V_T double-buffering vs V11's ~45 KB).
+//
+// 5 warps (160 threads): warps 0-3 = MMA, warp 4 = DMA.
+// Br=64, Bc=64, D=128. Grid: (ceil(seq_q/64), num_heads, batch), Block: (160,1,1).
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+#include "mma.ptxh"
+#include "reduction.ptxh"
+
+#define BR 64
+#define BC 64
+#define D  128
+#define NUM_MMA_WARPS 4
+#define DMA_WARP_ID   4
+
+// SMEM layout (~60 KB total)
+#define SMEM_Q            0
+#define SMEM_K0           8192
+#define SMEM_K1           16384
+#define SMEM_V0           24576     // V raw stage 0 (from TMA, row-major stride 128)
+#define SMEM_V1           32768     // V raw stage 1
+#define SMEM_VT0          40960     // V_T stage 0 (transposed, row-major stride 64)
+#define SMEM_VT1          49152     // V_T stage 1
+#define SMEM_P            57344     // P FP8 (4096 bytes)
+#define SMEM_MBAR_Q       61440
+#define SMEM_MBAR_K0      61456
+#define SMEM_MBAR_K1      61472
+#define SMEM_MBAR_V0      61488
+#define SMEM_MBAR_V1      61504
+#define SMEM_MBAR_DONE0   61520
+#define SMEM_MBAR_DONE1   61536
+#define SMEM_TOTAL        61552
+
+#define P_ROW_STRIDE  64
+
+.extern .shared .align 128 .b8 smem[];
+
+// ================================================================
+// QK GEMM (identical to V11 FP8)
+// ================================================================
+#define QK_NG8_FP8(q0,q1,q2,q3, Klo, Khi) \
+    ld.shared.b32 %r100, [Klo];          ld.shared.b32 %r101, [Khi]; \
+    MMA_FP8_M16N8K32(%f64,%f65,%f66,%f67, q0,q1,q2,q3, %r100,%r101) \
+    ld.shared.b32 %r100, [Klo + 1024];   ld.shared.b32 %r101, [Khi + 1024]; \
+    MMA_FP8_M16N8K32(%f68,%f69,%f70,%f71, q0,q1,q2,q3, %r100,%r101) \
+    ld.shared.b32 %r100, [Klo + 2048];   ld.shared.b32 %r101, [Khi + 2048]; \
+    MMA_FP8_M16N8K32(%f72,%f73,%f74,%f75, q0,q1,q2,q3, %r100,%r101) \
+    ld.shared.b32 %r100, [Klo + 3072];   ld.shared.b32 %r101, [Khi + 3072]; \
+    MMA_FP8_M16N8K32(%f76,%f77,%f78,%f79, q0,q1,q2,q3, %r100,%r101) \
+    ld.shared.b32 %r100, [Klo + 4096];   ld.shared.b32 %r101, [Khi + 4096]; \
+    MMA_FP8_M16N8K32(%f80,%f81,%f82,%f83, q0,q1,q2,q3, %r100,%r101) \
+    ld.shared.b32 %r100, [Klo + 5120];   ld.shared.b32 %r101, [Khi + 5120]; \
+    MMA_FP8_M16N8K32(%f84,%f85,%f86,%f87, q0,q1,q2,q3, %r100,%r101) \
+    ld.shared.b32 %r100, [Klo + 6144];   ld.shared.b32 %r101, [Khi + 6144]; \
+    MMA_FP8_M16N8K32(%f88,%f89,%f90,%f91, q0,q1,q2,q3, %r100,%r101) \
+    ld.shared.b32 %r100, [Klo + 7168];   ld.shared.b32 %r101, [Khi + 7168]; \
+    MMA_FP8_M16N8K32(%f92,%f93,%f94,%f95, q0,q1,q2,q3, %r100,%r101)
+
+// ================================================================
+// PV GEMM using V_T SMEM (identical macro to V12c option)
+// ================================================================
+#define PV_NG16_VT(p0,p1,p2,p3, vtb, kp_off) \
+    ld.shared.b32 %r104, [vtb + kp_off];       ld.shared.b32 %r105, [vtb + kp_off + 16]; \
+    MMA_FP8_M16N8K32(%f0 ,%f1 ,%f2 ,%f3 , p0,p1,p2,p3, %r104,%r105) \
+    ld.shared.b32 %r104, [vtb + 512 + kp_off]; ld.shared.b32 %r105, [vtb + 512 + kp_off + 16]; \
+    MMA_FP8_M16N8K32(%f4 ,%f5 ,%f6 ,%f7 , p0,p1,p2,p3, %r104,%r105) \
+    ld.shared.b32 %r104, [vtb + 1024 + kp_off]; ld.shared.b32 %r105, [vtb + 1024 + kp_off + 16]; \
+    MMA_FP8_M16N8K32(%f8 ,%f9 ,%f10,%f11, p0,p1,p2,p3, %r104,%r105) \
+    ld.shared.b32 %r104, [vtb + 1536 + kp_off]; ld.shared.b32 %r105, [vtb + 1536 + kp_off + 16]; \
+    MMA_FP8_M16N8K32(%f12,%f13,%f14,%f15, p0,p1,p2,p3, %r104,%r105) \
+    ld.shared.b32 %r104, [vtb + 2048 + kp_off]; ld.shared.b32 %r105, [vtb + 2048 + kp_off + 16]; \
+    MMA_FP8_M16N8K32(%f16,%f17,%f18,%f19, p0,p1,p2,p3, %r104,%r105) \
+    ld.shared.b32 %r104, [vtb + 2560 + kp_off]; ld.shared.b32 %r105, [vtb + 2560 + kp_off + 16]; \
+    MMA_FP8_M16N8K32(%f20,%f21,%f22,%f23, p0,p1,p2,p3, %r104,%r105) \
+    ld.shared.b32 %r104, [vtb + 3072 + kp_off]; ld.shared.b32 %r105, [vtb + 3072 + kp_off + 16]; \
+    MMA_FP8_M16N8K32(%f24,%f25,%f26,%f27, p0,p1,p2,p3, %r104,%r105) \
+    ld.shared.b32 %r104, [vtb + 3584 + kp_off]; ld.shared.b32 %r105, [vtb + 3584 + kp_off + 16]; \
+    MMA_FP8_M16N8K32(%f28,%f29,%f30,%f31, p0,p1,p2,p3, %r104,%r105) \
+    ld.shared.b32 %r104, [vtb + 4096 + kp_off]; ld.shared.b32 %r105, [vtb + 4096 + kp_off + 16]; \
+    MMA_FP8_M16N8K32(%f32,%f33,%f34,%f35, p0,p1,p2,p3, %r104,%r105) \
+    ld.shared.b32 %r104, [vtb + 4608 + kp_off]; ld.shared.b32 %r105, [vtb + 4608 + kp_off + 16]; \
+    MMA_FP8_M16N8K32(%f36,%f37,%f38,%f39, p0,p1,p2,p3, %r104,%r105) \
+    ld.shared.b32 %r104, [vtb + 5120 + kp_off]; ld.shared.b32 %r105, [vtb + 5120 + kp_off + 16]; \
+    MMA_FP8_M16N8K32(%f40,%f41,%f42,%f43, p0,p1,p2,p3, %r104,%r105) \
+    ld.shared.b32 %r104, [vtb + 5632 + kp_off]; ld.shared.b32 %r105, [vtb + 5632 + kp_off + 16]; \
+    MMA_FP8_M16N8K32(%f44,%f45,%f46,%f47, p0,p1,p2,p3, %r104,%r105) \
+    ld.shared.b32 %r104, [vtb + 6144 + kp_off]; ld.shared.b32 %r105, [vtb + 6144 + kp_off + 16]; \
+    MMA_FP8_M16N8K32(%f48,%f49,%f50,%f51, p0,p1,p2,p3, %r104,%r105) \
+    ld.shared.b32 %r104, [vtb + 6656 + kp_off]; ld.shared.b32 %r105, [vtb + 6656 + kp_off + 16]; \
+    MMA_FP8_M16N8K32(%f52,%f53,%f54,%f55, p0,p1,p2,p3, %r104,%r105) \
+    ld.shared.b32 %r104, [vtb + 7168 + kp_off]; ld.shared.b32 %r105, [vtb + 7168 + kp_off + 16]; \
+    MMA_FP8_M16N8K32(%f56,%f57,%f58,%f59, p0,p1,p2,p3, %r104,%r105) \
+    ld.shared.b32 %r104, [vtb + 7680 + kp_off]; ld.shared.b32 %r105, [vtb + 7680 + kp_off + 16]; \
+    MMA_FP8_M16N8K32(%f60,%f61,%f62,%f63, p0,p1,p2,p3, %r104,%r105)
+
+// P store helpers (identical to V11)
+#define EXP_CLAMP_EX2(s, neg_mx_log2e) \
+    fma.rn.f32 s, s, %f199, neg_mx_log2e; \
+    max.f32 s, s, 0fC2FA0000; \
+    ex2.approx.ftz.f32 s, s;
+
+#define EXP_STORE_NG_FP8(s0,s1,s2,s3, nmx0, nmx1, pa0, pa1, ng_off) \
+    EXP_CLAMP_EX2(s0, nmx0)  EXP_CLAMP_EX2(s1, nmx0) \
+    EXP_CLAMP_EX2(s2, nmx1)  EXP_CLAMP_EX2(s3, nmx1) \
+    add.f32 %f194, %f194, s0;  add.f32 %f194, %f194, s1; \
+    add.f32 %f195, %f195, s2;  add.f32 %f195, %f195, s3; \
+    cvt.rn.satfinite.e4m3x2.f32 %h0, s1, s0; \
+    st.shared.b16 [pa0 + ng_off], %h0; \
+    cvt.rn.satfinite.e4m3x2.f32 %h0, s3, s2; \
+    st.shared.b16 [pa1 + ng_off], %h0;
+
+.visible .entry flash_attn_fp8_v12a_transpose(
+    .param .u64 param_Q_tma_ptr,
+    .param .u64 param_K_tma_ptr,
+    .param .u64 param_V_tma_ptr,    // V in standard [Skv, D] GMEM layout
+    .param .u64 param_O,
+    .param .u32 param_seq_q,
+    .param .u32 param_seq_kv,
+    .param .u32 param_num_heads,
+    .param .f32 param_scale
+)
+{
+    .reg .b32  %r<200>;
+    .reg .b64  %rd<32>;
+    .reg .f32  %f<200>;
+    .reg .b16  %h<8>;
+    .reg .pred %p<16>;
+
+    mov.u32         %r0, %tid.x;
+    shr.b32         %r1, %r0, 5;
+    and.b32         %r2, %r0, 31;
+
+    mov.u32         %r3, %ctaid.x;
+    mov.u32         %r4, %ctaid.y;
+    mov.u32         %r5, %ctaid.z;
+
+    ld.param.u32    %r6, [param_seq_q];
+    ld.param.u32    %r7, [param_seq_kv];
+    ld.param.u32    %r8, [param_num_heads];
+    ld.param.f32    %f196, [param_scale];
+
+    setp.eq.u32     %p0, %r0, 0;
+    @%p0 mbarrier.init.shared.b64 [smem + SMEM_MBAR_Q], 1;
+    @%p0 mbarrier.init.shared.b64 [smem + SMEM_MBAR_K0], 1;
+    @%p0 mbarrier.init.shared.b64 [smem + SMEM_MBAR_K1], 1;
+    @%p0 mbarrier.init.shared.b64 [smem + SMEM_MBAR_V0], 1;
+    @%p0 mbarrier.init.shared.b64 [smem + SMEM_MBAR_V1], 1;
+    @%p0 mbarrier.init.shared.b64 [smem + SMEM_MBAR_DONE0], NUM_MMA_WARPS;
+    @%p0 mbarrier.init.shared.b64 [smem + SMEM_MBAR_DONE1], NUM_MMA_WARPS;
+    fence.mbarrier_init.release.cluster;
+    bar.sync 0;
+
+    mul.lo.u32      %r9, %r5, %r8;
+    add.u32         %r9, %r9, %r4;
+    mul.lo.u32      %r10, %r9, %r6;
+    shl.b32         %r11, %r3, 6;
+    add.u32         %r10, %r10, %r11;
+    mul.lo.u32      %r12, %r9, %r7;
+
+    ld.param.u64    %rd0, [param_Q_tma_ptr];
+    ld.param.u64    %rd1, [param_K_tma_ptr];
+    ld.param.u64    %rd2, [param_V_tma_ptr];
+
+    setp.eq.u32     %p1, %r1, DMA_WARP_ID;
+    @%p1 bra        dma_path;
+
+    // ================================================================
+    // MMA WARP PATH (warps 0-3)
+    // ================================================================
+
+    shr.b32         %r13, %r2, 2;
+    and.b32         %r14, %r2, 3;
+    mov.u32         %r20, smem;
+
+    shl.b32         %r160, %r13, 4;
+    shl.b32         %r23, %r13, 7;
+    shl.b32         %r24, %r14, 2;
+
+    mul.lo.u32      %r161, %r1, 2048;
+    add.u32         %r162, %r20, SMEM_Q;
+    add.u32         %r162, %r162, %r161;
+    add.u32         %r162, %r162, %r23;
+    add.u32         %r163, %r162, 1024;
+
+mma_wait_q:
+    mbarrier.try_wait.parity.shared.b64 %p2, [smem + SMEM_MBAR_Q], 0;
+    @!%p2 bra mma_wait_q;
+
+    // Load Q (SWIZZLE_128B, 4 kc groups)
+    xor.b32         %r25, %r24, %r160;
+    add.u32         %r82, %r162, %r25;
+    ld.shared.b32   %r30, [%r82];
+    add.u32         %r82, %r163, %r25;
+    ld.shared.b32   %r31, [%r82];
+    add.u32         %r26, %r24, 16;
+    xor.b32         %r26, %r26, %r160;
+    add.u32         %r82, %r162, %r26;
+    ld.shared.b32   %r32, [%r82];
+    add.u32         %r82, %r163, %r26;
+    ld.shared.b32   %r33, [%r82];
+
+    add.u32         %r25, %r24, 32;
+    xor.b32         %r25, %r25, %r160;
+    add.u32         %r82, %r162, %r25;
+    ld.shared.b32   %r34, [%r82];
+    add.u32         %r82, %r163, %r25;
+    ld.shared.b32   %r35, [%r82];
+    add.u32         %r26, %r24, 48;
+    xor.b32         %r26, %r26, %r160;
+    add.u32         %r82, %r162, %r26;
+    ld.shared.b32   %r36, [%r82];
+    add.u32         %r82, %r163, %r26;
+    ld.shared.b32   %r37, [%r82];
+
+    add.u32         %r25, %r24, 64;
+    xor.b32         %r25, %r25, %r160;
+    add.u32         %r82, %r162, %r25;
+    ld.shared.b32   %r38, [%r82];
+    add.u32         %r82, %r163, %r25;
+    ld.shared.b32   %r39, [%r82];
+    add.u32         %r26, %r24, 80;
+    xor.b32         %r26, %r26, %r160;
+    add.u32         %r82, %r162, %r26;
+    ld.shared.b32   %r40, [%r82];
+    add.u32         %r82, %r163, %r26;
+    ld.shared.b32   %r41, [%r82];
+
+    add.u32         %r25, %r24, 96;
+    xor.b32         %r25, %r25, %r160;
+    add.u32         %r82, %r162, %r25;
+    ld.shared.b32   %r42, [%r82];
+    add.u32         %r82, %r163, %r25;
+    ld.shared.b32   %r43, [%r82];
+    add.u32         %r26, %r24, 112;
+    xor.b32         %r26, %r26, %r160;
+    add.u32         %r82, %r162, %r26;
+    ld.shared.b32   %r44, [%r82];
+    add.u32         %r82, %r163, %r26;
+    ld.shared.b32   %r45, [%r82];
+
+    // Initialize O accumulators and softmax
+    mov.f32 %f0, 0.0;   mov.f32 %f1, 0.0;   mov.f32 %f2, 0.0;   mov.f32 %f3, 0.0;
+    mov.f32 %f4, 0.0;   mov.f32 %f5, 0.0;   mov.f32 %f6, 0.0;   mov.f32 %f7, 0.0;
+    mov.f32 %f8, 0.0;   mov.f32 %f9, 0.0;   mov.f32 %f10, 0.0;  mov.f32 %f11, 0.0;
+    mov.f32 %f12, 0.0;  mov.f32 %f13, 0.0;  mov.f32 %f14, 0.0;  mov.f32 %f15, 0.0;
+    mov.f32 %f16, 0.0;  mov.f32 %f17, 0.0;  mov.f32 %f18, 0.0;  mov.f32 %f19, 0.0;
+    mov.f32 %f20, 0.0;  mov.f32 %f21, 0.0;  mov.f32 %f22, 0.0;  mov.f32 %f23, 0.0;
+    mov.f32 %f24, 0.0;  mov.f32 %f25, 0.0;  mov.f32 %f26, 0.0;  mov.f32 %f27, 0.0;
+    mov.f32 %f28, 0.0;  mov.f32 %f29, 0.0;  mov.f32 %f30, 0.0;  mov.f32 %f31, 0.0;
+    mov.f32 %f32, 0.0;  mov.f32 %f33, 0.0;  mov.f32 %f34, 0.0;  mov.f32 %f35, 0.0;
+    mov.f32 %f36, 0.0;  mov.f32 %f37, 0.0;  mov.f32 %f38, 0.0;  mov.f32 %f39, 0.0;
+    mov.f32 %f40, 0.0;  mov.f32 %f41, 0.0;  mov.f32 %f42, 0.0;  mov.f32 %f43, 0.0;
+    mov.f32 %f44, 0.0;  mov.f32 %f45, 0.0;  mov.f32 %f46, 0.0;  mov.f32 %f47, 0.0;
+    mov.f32 %f48, 0.0;  mov.f32 %f49, 0.0;  mov.f32 %f50, 0.0;  mov.f32 %f51, 0.0;
+    mov.f32 %f52, 0.0;  mov.f32 %f53, 0.0;  mov.f32 %f54, 0.0;  mov.f32 %f55, 0.0;
+    mov.f32 %f56, 0.0;  mov.f32 %f57, 0.0;  mov.f32 %f58, 0.0;  mov.f32 %f59, 0.0;
+    mov.f32 %f60, 0.0;  mov.f32 %f61, 0.0;  mov.f32 %f62, 0.0;  mov.f32 %f63, 0.0;
+
+    mov.b32         %f192, 0xff800000;
+    mov.b32         %f193, 0xff800000;
+    mov.f32         %f194, 0.0;
+    mov.f32         %f195, 0.0;
+
+    // P store addresses
+    mul.lo.u32      %r170, %r1, 1024;
+    add.u32         %r115, %r20, SMEM_P;
+    add.u32         %r115, %r115, %r170;
+    mul.lo.u32      %r116, %r13, 64;
+    add.u32         %r115, %r115, %r116;
+    shl.b32         %r117, %r14, 1;
+    add.u32         %r111, %r115, %r117;
+    add.u32         %r112, %r111, 512;
+
+    add.u32         %r118, %r115, %r24;
+    add.u32         %r119, %r118, 512;
+
+    // V_T per-thread offset: gid*64 + tip*4
+    mul.lo.u32      %r130, %r13, 64;
+    shl.b32         %r131, %r14, 2;
+    add.u32         %r131, %r130, %r131;
+
+    mul.f32         %f199, %f196, LOG2E;
+
+    add.u32         %r120, %r7, 63;
+    shr.b32         %r120, %r120, 6;
+
+    mov.u32         %r121, 0;
+    mov.u32         %r150, 0;
+    mov.u32         %r151, 0;  mov.u32 %r152, 0;
+    mov.u32         %r153, 0;  mov.u32 %r154, 0;
+
+kv_loop:
+    setp.ge.u32     %p7, %r121, %r120;
+    @%p7 bra        kv_done;
+
+    mul.lo.u32      %r172, %r150, 8192;
+    add.u32         %r75, %r20, SMEM_K0;
+    add.u32         %r75, %r75, %r172;
+    add.u32         %r75, %r75, %r23;
+
+    mul.lo.u32      %r171, %r150, 16;
+    add.u32         %r157, %r20, SMEM_MBAR_K0;
+    add.u32         %r157, %r157, %r171;
+    setp.eq.u32     %p14, %r150, 0;
+    selp.u32        %r155, %r151, %r152, %p14;
+
+mma_wait_k:
+    mbarrier.try_wait.parity.shared.b64 %p4, [%r157], %r155;
+    @!%p4 bra mma_wait_k;
+
+    mov.f32 %f64, 0.0;  mov.f32 %f65, 0.0;  mov.f32 %f66, 0.0;  mov.f32 %f67, 0.0;
+    mov.f32 %f68, 0.0;  mov.f32 %f69, 0.0;  mov.f32 %f70, 0.0;  mov.f32 %f71, 0.0;
+    mov.f32 %f72, 0.0;  mov.f32 %f73, 0.0;  mov.f32 %f74, 0.0;  mov.f32 %f75, 0.0;
+    mov.f32 %f76, 0.0;  mov.f32 %f77, 0.0;  mov.f32 %f78, 0.0;  mov.f32 %f79, 0.0;
+    mov.f32 %f80, 0.0;  mov.f32 %f81, 0.0;  mov.f32 %f82, 0.0;  mov.f32 %f83, 0.0;
+    mov.f32 %f84, 0.0;  mov.f32 %f85, 0.0;  mov.f32 %f86, 0.0;  mov.f32 %f87, 0.0;
+    mov.f32 %f88, 0.0;  mov.f32 %f89, 0.0;  mov.f32 %f90, 0.0;  mov.f32 %f91, 0.0;
+    mov.f32 %f92, 0.0;  mov.f32 %f93, 0.0;  mov.f32 %f94, 0.0;  mov.f32 %f95, 0.0;
+
+    // QK GEMM
+    xor.b32         %r76, %r24, %r160;
+    add.u32         %r76, %r75, %r76;
+    add.u32         %r27, %r24, 16;
+    xor.b32         %r27, %r27, %r160;
+    add.u32         %r77, %r75, %r27;
+    QK_NG8_FP8(%r30,%r31,%r32,%r33, %r76, %r77)
+
+    add.u32         %r76, %r24, 32;
+    xor.b32         %r76, %r76, %r160;
+    add.u32         %r76, %r75, %r76;
+    add.u32         %r77, %r24, 48;
+    xor.b32         %r77, %r77, %r160;
+    add.u32         %r77, %r75, %r77;
+    QK_NG8_FP8(%r34,%r35,%r36,%r37, %r76, %r77)
+
+    add.u32         %r76, %r24, 64;
+    xor.b32         %r76, %r76, %r160;
+    add.u32         %r76, %r75, %r76;
+    add.u32         %r77, %r24, 80;
+    xor.b32         %r77, %r77, %r160;
+    add.u32         %r77, %r75, %r77;
+    QK_NG8_FP8(%r38,%r39,%r40,%r41, %r76, %r77)
+
+    add.u32         %r76, %r24, 96;
+    xor.b32         %r76, %r76, %r160;
+    add.u32         %r76, %r75, %r76;
+    add.u32         %r77, %r24, 112;
+    xor.b32         %r77, %r77, %r160;
+    add.u32         %r77, %r75, %r77;
+    QK_NG8_FP8(%r42,%r43,%r44,%r45, %r76, %r77)
+
+    // Online softmax
+    mov.f32         %f96, %f64;
+    max.f32         %f96, %f96, %f65;
+    max.f32         %f96, %f96, %f68;  max.f32         %f96, %f96, %f69;
+    max.f32         %f96, %f96, %f72;  max.f32         %f96, %f96, %f73;
+    max.f32         %f96, %f96, %f76;  max.f32         %f96, %f96, %f77;
+    max.f32         %f96, %f96, %f80;  max.f32         %f96, %f96, %f81;
+    max.f32         %f96, %f96, %f84;  max.f32         %f96, %f96, %f85;
+    max.f32         %f96, %f96, %f88;  max.f32         %f96, %f96, %f89;
+    max.f32         %f96, %f96, %f92;  max.f32         %f96, %f96, %f93;
+
+    mov.f32         %f97, %f66;
+    max.f32         %f97, %f97, %f67;
+    max.f32         %f97, %f97, %f70;  max.f32         %f97, %f97, %f71;
+    max.f32         %f97, %f97, %f74;  max.f32         %f97, %f97, %f75;
+    max.f32         %f97, %f97, %f78;  max.f32         %f97, %f97, %f79;
+    max.f32         %f97, %f97, %f82;  max.f32         %f97, %f97, %f83;
+    max.f32         %f97, %f97, %f86;  max.f32         %f97, %f97, %f87;
+    max.f32         %f97, %f97, %f90;  max.f32         %f97, %f97, %f91;
+    max.f32         %f97, %f97, %f94;  max.f32         %f97, %f97, %f95;
+
+    GROUP4_REDUCE_MAX_F32(%f96, %f98)
+    GROUP4_REDUCE_MAX_F32(%f97, %f98)
+
+    mul.f32         %f96, %f96, %f196;
+    mul.f32         %f97, %f97, %f196;
+
+    max.f32         %f99, %f192, %f96;
+    max.f32         %f100, %f193, %f97;
+
+    mov.b32 %f98, 0xff800000; setp.eq.f32 %p10, %f99, %f98;
+    @%p10 mov.f32   %f99, 0f00000000;
+    mov.b32 %f98, 0xff800000; setp.eq.f32 %p10, %f100, %f98;
+    @%p10 mov.f32   %f100, 0f00000000;
+
+    sub.f32         %f101, %f192, %f99;
+    mul.f32         %f101, %f101, LOG2E;
+    max.f32         %f101, %f101, 0fC2FA0000;
+    ex2.approx.ftz.f32  %f101, %f101;
+    sub.f32         %f102, %f193, %f100;
+    mul.f32         %f102, %f102, LOG2E;
+    max.f32         %f102, %f102, 0fC2FA0000;
+    ex2.approx.ftz.f32  %f102, %f102;
+
+    mul.f32 %f0, %f0, %f101;    mul.f32 %f1, %f1, %f101;
+    mul.f32 %f2, %f2, %f102;    mul.f32 %f3, %f3, %f102;
+    mul.f32 %f4, %f4, %f101;    mul.f32 %f5, %f5, %f101;
+    mul.f32 %f6, %f6, %f102;    mul.f32 %f7, %f7, %f102;
+    mul.f32 %f8, %f8, %f101;    mul.f32 %f9, %f9, %f101;
+    mul.f32 %f10, %f10, %f102;  mul.f32 %f11, %f11, %f102;
+    mul.f32 %f12, %f12, %f101;  mul.f32 %f13, %f13, %f101;
+    mul.f32 %f14, %f14, %f102;  mul.f32 %f15, %f15, %f102;
+    mul.f32 %f16, %f16, %f101;  mul.f32 %f17, %f17, %f101;
+    mul.f32 %f18, %f18, %f102;  mul.f32 %f19, %f19, %f102;
+    mul.f32 %f20, %f20, %f101;  mul.f32 %f21, %f21, %f101;
+    mul.f32 %f22, %f22, %f102;  mul.f32 %f23, %f23, %f102;
+    mul.f32 %f24, %f24, %f101;  mul.f32 %f25, %f25, %f101;
+    mul.f32 %f26, %f26, %f102;  mul.f32 %f27, %f27, %f102;
+    mul.f32 %f28, %f28, %f101;  mul.f32 %f29, %f29, %f101;
+    mul.f32 %f30, %f30, %f102;  mul.f32 %f31, %f31, %f102;
+    mul.f32 %f32, %f32, %f101;  mul.f32 %f33, %f33, %f101;
+    mul.f32 %f34, %f34, %f102;  mul.f32 %f35, %f35, %f102;
+    mul.f32 %f36, %f36, %f101;  mul.f32 %f37, %f37, %f101;
+    mul.f32 %f38, %f38, %f102;  mul.f32 %f39, %f39, %f102;
+    mul.f32 %f40, %f40, %f101;  mul.f32 %f41, %f41, %f101;
+    mul.f32 %f42, %f42, %f102;  mul.f32 %f43, %f43, %f102;
+    mul.f32 %f44, %f44, %f101;  mul.f32 %f45, %f45, %f101;
+    mul.f32 %f46, %f46, %f102;  mul.f32 %f47, %f47, %f102;
+    mul.f32 %f48, %f48, %f101;  mul.f32 %f49, %f49, %f101;
+    mul.f32 %f50, %f50, %f102;  mul.f32 %f51, %f51, %f102;
+    mul.f32 %f52, %f52, %f101;  mul.f32 %f53, %f53, %f101;
+    mul.f32 %f54, %f54, %f102;  mul.f32 %f55, %f55, %f102;
+    mul.f32 %f56, %f56, %f101;  mul.f32 %f57, %f57, %f101;
+    mul.f32 %f58, %f58, %f102;  mul.f32 %f59, %f59, %f102;
+    mul.f32 %f60, %f60, %f101;  mul.f32 %f61, %f61, %f101;
+    mul.f32 %f62, %f62, %f102;  mul.f32 %f63, %f63, %f102;
+
+    mul.f32         %f194, %f194, %f101;
+    mul.f32         %f195, %f195, %f102;
+    mov.f32         %f192, %f99;
+    mov.f32         %f193, %f100;
+
+    // P store
+    mul.f32         %f197, %f99, LOG2E;
+    neg.f32         %f197, %f197;
+    mul.f32         %f198, %f100, LOG2E;
+    neg.f32         %f198, %f198;
+
+    EXP_STORE_NG_FP8(%f64,%f65,%f66,%f67, %f197, %f198, %r111, %r112, 0)
+    EXP_STORE_NG_FP8(%f68,%f69,%f70,%f71, %f197, %f198, %r111, %r112, 8)
+    EXP_STORE_NG_FP8(%f72,%f73,%f74,%f75, %f197, %f198, %r111, %r112, 16)
+    EXP_STORE_NG_FP8(%f76,%f77,%f78,%f79, %f197, %f198, %r111, %r112, 24)
+    EXP_STORE_NG_FP8(%f80,%f81,%f82,%f83, %f197, %f198, %r111, %r112, 32)
+    EXP_STORE_NG_FP8(%f84,%f85,%f86,%f87, %f197, %f198, %r111, %r112, 40)
+    EXP_STORE_NG_FP8(%f88,%f89,%f90,%f91, %f197, %f198, %r111, %r112, 48)
+    EXP_STORE_NG_FP8(%f92,%f93,%f94,%f95, %f197, %f198, %r111, %r112, 56)
+
+    // ================================================================
+    // Wait V (raw)
+    // ================================================================
+    add.u32         %r158, %r20, SMEM_MBAR_V0;
+    add.u32         %r158, %r158, %r171;
+    selp.u32        %r156, %r153, %r154, %p14;
+
+mma_wait_v:
+    mbarrier.try_wait.parity.shared.b64 %p8, [%r158], %r156;
+    @!%p8 bra mma_wait_v;
+
+    // ================================================================
+    // COOPERATIVE V -> V_T TRANSPOSE
+    //
+    // Only MMA warps (128 threads, IDs 0..127) run the transpose.
+    // DMA warp (warp 4, IDs 128..159) is in dma_path and never reaches here.
+    // Transpose V[Bc=64, D=128] (row-major stride 128) -> V_T[D=128, Bc=64] (stride 64).
+    //
+    // V source:   SMEM_V0 + stage*8192 (filled by TMA, stride 128)
+    // V_T dest:   SMEM_VT0 + stage*8192 (target, stride 64)
+    //
+    // For each byte at linear index e (0..8191):
+    //   V_row = e / 128, V_col = e % 128
+    //   V_T_addr = V_col * 64 + V_row
+    //
+    // Thread t handles bytes e = t, t+128, t+256, ..., while e < 8192.
+    // 8192 / 128 = 64 iterations per thread.
+    // ================================================================
+
+    // SMEM_V_stage base (without tip/gid offset)
+    add.u32         %r185, %r20, SMEM_V0;
+    add.u32         %r185, %r185, %r172;       // SMEM_V_stage
+
+    // SMEM_VT_stage base
+    add.u32         %r186, %r20, SMEM_VT0;
+    add.u32         %r186, %r186, %r172;       // SMEM_VT_stage
+
+    // Byte index for this thread
+    mov.u32         %r187, %r0;               // e = tid (0..127 for MMA warps)
+
+trans_loop:
+    setp.ge.u32     %p15, %r187, 8192;
+    @%p15 bra       trans_done;
+
+    // V_row = e >> 7 (= e / 128), V_col = e & 127 (= e % 128)
+    shr.b32         %r188, %r187, 7;          // V_row
+    and.b32         %r189, %r187, 127;        // V_col
+
+    // Read V[V_row, V_col]
+    add.u32         %r190, %r185, %r187;
+    ld.shared.u8    %r191, [%r190];
+
+    // Write V_T[V_col, V_row] = V_T[V_col*64 + V_row]
+    mul.lo.u32      %r192, %r189, 64;
+    add.u32         %r192, %r192, %r188;
+    add.u32         %r192, %r192, %r186;
+    st.shared.u8    [%r192], %r191;
+
+    add.u32         %r187, %r187, 128;        // e += 128 (stride = 4 MMA warps x 32 = 128)
+    bra             trans_loop;
+
+trans_done:
+    // Synchronize only the 128 MMA threads (DMA warp not involved)
+    bar.sync 0, 128;
+
+    // ================================================================
+    // PV GEMM using V_T
+    // ================================================================
+    add.u32         %r110, %r20, SMEM_VT0;
+    add.u32         %r110, %r110, %r172;       // SMEM_VT_stage
+    add.u32         %r110, %r110, %r131;       // + gid*64 + tip*4 = vtb
+
+    ld.shared.b32   %r106, [%r118];
+    ld.shared.b32   %r107, [%r119];
+    ld.shared.b32   %r108, [%r118 + 16];
+    ld.shared.b32   %r109, [%r119 + 16];
+
+    PV_NG16_VT(%r106,%r107,%r108,%r109, %r110, 0)
+
+    ld.shared.b32   %r106, [%r118 + 32];
+    ld.shared.b32   %r107, [%r119 + 32];
+    ld.shared.b32   %r108, [%r118 + 48];
+    ld.shared.b32   %r109, [%r119 + 48];
+
+    PV_NG16_VT(%r106,%r107,%r108,%r109, %r110, 32)
+
+    // Signal DONE[stage]
+    add.u32         %r159, %r20, SMEM_MBAR_DONE0;
+    add.u32         %r159, %r159, %r171;
+    setp.eq.u32     %p13, %r2, 0;
+    @%p13 mbarrier.arrive.shared.b64 _, [%r159];
+
+    @%p14 xor.b32   %r151, %r151, 1;
+    @!%p14 xor.b32  %r152, %r152, 1;
+    @%p14 xor.b32   %r153, %r153, 1;
+    @!%p14 xor.b32  %r154, %r154, 1;
+
+    add.u32         %r121, %r121, 1;
+    xor.b32         %r150, %r150, 1;
+    bra             kv_loop;
+
+kv_done:
+    // Epilogue
+    GROUP4_REDUCE_SUM_F32(%f194, %f98)
+    GROUP4_REDUCE_SUM_F32(%f195, %f98)
+
+    setp.eq.f32     %p10, %f194, 0f00000000;
+    @%p10 mov.f32   %f194, 0f3f800000;
+    setp.eq.f32     %p10, %f195, 0f00000000;
+    @%p10 mov.f32   %f195, 0f3f800000;
+
+    rcp.approx.f32  %f101, %f194;
+    rcp.approx.f32  %f102, %f195;
+
+    mul.f32 %f0, %f0, %f101;    mul.f32 %f1, %f1, %f101;
+    mul.f32 %f2, %f2, %f102;    mul.f32 %f3, %f3, %f102;
+    mul.f32 %f4, %f4, %f101;    mul.f32 %f5, %f5, %f101;
+    mul.f32 %f6, %f6, %f102;    mul.f32 %f7, %f7, %f102;
+    mul.f32 %f8, %f8, %f101;    mul.f32 %f9, %f9, %f101;
+    mul.f32 %f10, %f10, %f102;  mul.f32 %f11, %f11, %f102;
+    mul.f32 %f12, %f12, %f101;  mul.f32 %f13, %f13, %f101;
+    mul.f32 %f14, %f14, %f102;  mul.f32 %f15, %f15, %f102;
+    mul.f32 %f16, %f16, %f101;  mul.f32 %f17, %f17, %f101;
+    mul.f32 %f18, %f18, %f102;  mul.f32 %f19, %f19, %f102;
+    mul.f32 %f20, %f20, %f101;  mul.f32 %f21, %f21, %f101;
+    mul.f32 %f22, %f22, %f102;  mul.f32 %f23, %f23, %f102;
+    mul.f32 %f24, %f24, %f101;  mul.f32 %f25, %f25, %f101;
+    mul.f32 %f26, %f26, %f102;  mul.f32 %f27, %f27, %f102;
+    mul.f32 %f28, %f28, %f101;  mul.f32 %f29, %f29, %f101;
+    mul.f32 %f30, %f30, %f102;  mul.f32 %f31, %f31, %f102;
+    mul.f32 %f32, %f32, %f101;  mul.f32 %f33, %f33, %f101;
+    mul.f32 %f34, %f34, %f102;  mul.f32 %f35, %f35, %f102;
+    mul.f32 %f36, %f36, %f101;  mul.f32 %f37, %f37, %f101;
+    mul.f32 %f38, %f38, %f102;  mul.f32 %f39, %f39, %f102;
+    mul.f32 %f40, %f40, %f101;  mul.f32 %f41, %f41, %f101;
+    mul.f32 %f42, %f42, %f102;  mul.f32 %f43, %f43, %f102;
+    mul.f32 %f44, %f44, %f101;  mul.f32 %f45, %f45, %f101;
+    mul.f32 %f46, %f46, %f102;  mul.f32 %f47, %f47, %f102;
+    mul.f32 %f48, %f48, %f101;  mul.f32 %f49, %f49, %f101;
+    mul.f32 %f50, %f50, %f102;  mul.f32 %f51, %f51, %f102;
+    mul.f32 %f52, %f52, %f101;  mul.f32 %f53, %f53, %f101;
+    mul.f32 %f54, %f54, %f102;  mul.f32 %f55, %f55, %f102;
+    mul.f32 %f56, %f56, %f101;  mul.f32 %f57, %f57, %f101;
+    mul.f32 %f58, %f58, %f102;  mul.f32 %f59, %f59, %f102;
+    mul.f32 %f60, %f60, %f101;  mul.f32 %f61, %f61, %f101;
+    mul.f32 %f62, %f62, %f102;  mul.f32 %f63, %f63, %f102;
+
+    // Store O
+    ld.param.u64    %rd3, [param_O];
+
+    mul.lo.u32      %r141, %r1, 16;
+    add.u32         %r124, %r11, %r141;
+    add.u32         %r124, %r124, %r13;
+    add.u32         %r125, %r124, 8;
+
+    setp.lt.u32     %p11, %r124, %r6;
+    setp.lt.u32     %p12, %r125, %r6;
+
+    sub.u32         %r126, %r10, %r11;
+
+    add.u32         %r127, %r126, %r124;
+    mul.lo.u32      %r128, %r127, 256;
+    cvt.u64.u32     %rd4, %r128;
+    add.u64         %rd5, %rd3, %rd4;
+
+    add.u32         %r127, %r126, %r125;
+    mul.lo.u32      %r128, %r127, 256;
+    cvt.u64.u32     %rd4, %r128;
+    add.u64         %rd6, %rd3, %rd4;
+
+    shl.b32         %r129, %r14, 2;
+    cvt.u64.u32     %rd7, %r129;
+
+    #define STORE_NG(f0,f1,f2,f3, col_off) \
+        add.u64 %rd8, %rd5, %rd7; \
+        add.u64 %rd8, %rd8, col_off; \
+        cvt.rn.bf16.f32 %h0, f0;  cvt.rn.bf16.f32 %h1, f1; \
+        mov.b32 %r100, {%h0, %h1}; \
+        @%p11 st.global.b32 [%rd8], %r100; \
+        add.u64 %rd8, %rd6, %rd7; \
+        add.u64 %rd8, %rd8, col_off; \
+        cvt.rn.bf16.f32 %h0, f2;  cvt.rn.bf16.f32 %h1, f3; \
+        mov.b32 %r100, {%h0, %h1}; \
+        @%p12 st.global.b32 [%rd8], %r100;
+
+    STORE_NG(%f0,%f1,%f2,%f3, 0)
+    STORE_NG(%f4,%f5,%f6,%f7, 16)
+    STORE_NG(%f8,%f9,%f10,%f11, 32)
+    STORE_NG(%f12,%f13,%f14,%f15, 48)
+    STORE_NG(%f16,%f17,%f18,%f19, 64)
+    STORE_NG(%f20,%f21,%f22,%f23, 80)
+    STORE_NG(%f24,%f25,%f26,%f27, 96)
+    STORE_NG(%f28,%f29,%f30,%f31, 112)
+    STORE_NG(%f32,%f33,%f34,%f35, 128)
+    STORE_NG(%f36,%f37,%f38,%f39, 144)
+    STORE_NG(%f40,%f41,%f42,%f43, 160)
+    STORE_NG(%f44,%f45,%f46,%f47, 176)
+    STORE_NG(%f48,%f49,%f50,%f51, 192)
+    STORE_NG(%f52,%f53,%f54,%f55, 208)
+    STORE_NG(%f56,%f57,%f58,%f59, 224)
+    STORE_NG(%f60,%f61,%f62,%f63, 240)
+
+    ret;
+
+    // ================================================================
+    // DMA WARP: identical to V11 FP8 (loads V in standard layout)
+    // ================================================================
+dma_path:
+    and.b32         %r96, %r0, 31;
+    setp.eq.u32     %p6, %r96, 0;
+    mov.u32         %r84, smem;
+
+    add.u32         %r85, %r84, SMEM_MBAR_Q;
+    add.u32         %r86, %r84, SMEM_Q;
+    @%p6 mbarrier.arrive.expect_tx.shared.b64 _, [%r85], (BR * D * 1);
+    mov.u32         %r83, 0;
+    @%p6 cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
+        [%r86], [%rd0, {%r83, %r10}], [%r85];
+
+    add.u32         %r87, %r7, 63;
+    shr.b32         %r87, %r87, 6;
+
+    mov.u32         %r90, %r12;
+
+    add.u32         %r91, %r84, SMEM_MBAR_K0;
+    add.u32         %r92, %r84, SMEM_K0;
+    @%p6 mbarrier.arrive.expect_tx.shared.b64 _, [%r91], (BC * D * 1);
+    mov.u32         %r83, 0;
+    @%p6 cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
+        [%r92], [%rd1, {%r83, %r90}], [%r91];
+
+    // V: standard [Skv,D] layout, coord = {0, kv_row}
+    add.u32         %r93, %r84, SMEM_MBAR_V0;
+    add.u32         %r94, %r84, SMEM_V0;
+    @%p6 mbarrier.arrive.expect_tx.shared.b64 _, [%r93], (BC * D * 1);
+    mov.u32         %r83, 0;
+    @%p6 cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
+        [%r94], [%rd2, {%r83, %r90}], [%r93];
+
+    setp.gt.u32     %p9, %r87, 1;
+    @!%p9 bra       dma_prefetch_done;
+
+    add.u32         %r90, %r12, 64;
+
+    add.u32         %r91, %r84, SMEM_MBAR_K1;
+    add.u32         %r92, %r84, SMEM_K1;
+    @%p6 mbarrier.arrive.expect_tx.shared.b64 _, [%r91], (BC * D * 1);
+    mov.u32         %r83, 0;
+    @%p6 cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
+        [%r92], [%rd1, {%r83, %r90}], [%r91];
+
+    add.u32         %r93, %r84, SMEM_MBAR_V1;
+    add.u32         %r94, %r84, SMEM_V1;
+    @%p6 mbarrier.arrive.expect_tx.shared.b64 _, [%r93], (BC * D * 1);
+    mov.u32         %r83, 0;
+    @%p6 cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
+        [%r94], [%rd2, {%r83, %r90}], [%r93];
+
+dma_prefetch_done:
+    mov.u32         %r88, 2;
+    mov.u32         %r155, 0;
+    mov.u32         %r156, 0;
+
+dma_rest_loop:
+    setp.ge.u32     %p9, %r88, %r87;
+    @%p9 bra        dma_done;
+
+    and.b32         %r150, %r88, 1;
+    mul.lo.u32      %r160, %r150, 16;
+    add.u32         %r159, %r84, SMEM_MBAR_DONE0;
+    add.u32         %r159, %r159, %r160;
+
+    setp.eq.u32     %p10, %r150, 0;
+    selp.u32        %r161, %r155, %r156, %p10;
+
+dma_wait_done:
+    mbarrier.try_wait.parity.shared.b64 %p11, [%r159], %r161;
+    @!%p11 bra dma_wait_done;
+
+    @%p10 xor.b32   %r155, %r155, 1;
+    @!%p10 xor.b32  %r156, %r156, 1;
+
+    shl.b32         %r89, %r88, 6;
+    add.u32         %r90, %r12, %r89;
+
+    mul.lo.u32      %r170, %r150, 8192;
+    add.u32         %r92, %r84, SMEM_K0;
+    add.u32         %r92, %r92, %r170;
+    add.u32         %r91, %r84, SMEM_MBAR_K0;
+    add.u32         %r91, %r91, %r160;
+
+    @%p6 mbarrier.arrive.expect_tx.shared.b64 _, [%r91], (BC * D * 1);
+    mov.u32         %r83, 0;
+    @%p6 cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
+        [%r92], [%rd1, {%r83, %r90}], [%r91];
+
+    add.u32         %r94, %r84, SMEM_V0;
+    add.u32         %r94, %r94, %r170;
+    add.u32         %r93, %r84, SMEM_MBAR_V0;
+    add.u32         %r93, %r93, %r160;
+
+    @%p6 mbarrier.arrive.expect_tx.shared.b64 _, [%r93], (BC * D * 1);
+    mov.u32         %r83, 0;
+    @%p6 cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
+        [%r94], [%rd2, {%r83, %r90}], [%r93];
+
+    add.u32         %r88, %r88, 1;
+    bra             dma_rest_loop;
+
+dma_done:
+    ret;
+}

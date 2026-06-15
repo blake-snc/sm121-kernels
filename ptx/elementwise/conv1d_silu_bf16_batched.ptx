@@ -1,0 +1,140 @@
+// conv1d_silu_bf16_batched.ptx
+//
+// M-batched depthwise causal conv1d (kernel=4) + SiLU,
+// single-token decode. M independent sequences processed in one launch.
+//
+// For each sequence m and channel c independently:
+//   y = w[c, 0]*state[m, 0, c] + w[c, 1]*state[m, 1, c] + w[c, 2]*state[m, 2, c]
+//     + w[c, 3]*current[m, c]
+//   out[m, c] = silu(y) = y * sigmoid(y)
+//
+// State advances per sequence:
+//   state[m, 0, c] := state[m, 1, c]_old
+//   state[m, 1, c] := state[m, 2, c]_old
+//   state[m, 2, c] := current[m, c]
+//
+// Layouts:
+//   state:   [M, 3, total_qkv] BF16 (seq-outer, channel-minor within seq)
+//   current: [M, total_qkv] BF16
+//   weight:  [total_qkv, 1, 4] BF16 (shared across M sequences)
+//   out:     [M, total_qkv] BF16
+//
+// Grid: (ceil(total_qkv / BLOCK), M, 1).  Block: (128, 1, 1).
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+
+#define MINUS_LOG2E_F32 0fBFB8AA3B
+#define ONE_F32   0f3F800000
+
+.visible .entry conv1d_silu_bf16_batched(
+    .param .u64 param_state,      // [M, 3, total_qkv] BF16 in/out
+    .param .u64 param_current,    // [M, total_qkv] BF16
+    .param .u64 param_weight,     // [total_qkv, 1, 4] BF16
+    .param .u64 param_out,        // [M, total_qkv] BF16
+    .param .u32 param_total_qkv
+)
+{
+    .reg .b32  %r<32>;
+    .reg .b64  %rd<24>;
+    .reg .f32  %f<24>;
+    .reg .b16  %h<16>;
+    .reg .pred %p<4>;
+
+    // Channel index c = blockIdx.x * blockDim.x + threadIdx.x
+    mov.u32         %r0, %tid.x;
+    mov.u32         %r1, %ctaid.x;
+    mov.u32         %r2, %ntid.x;
+    mad.lo.u32      %r3, %r1, %r2, %r0;
+
+    ld.param.u32    %r4, [param_total_qkv];
+    setp.ge.u32     %p0, %r3, %r4;
+    @%p0 bra        done;
+
+    // Sequence index m = blockIdx.y
+    mov.u32         %r7, %ctaid.y;
+
+    ld.param.u64    %rd0, [param_state];
+    ld.param.u64    %rd1, [param_current];
+    ld.param.u64    %rd2, [param_weight];
+    ld.param.u64    %rd3, [param_out];
+
+    // Per-seq strides:
+    //   state seq stride = 3 * total_qkv * 2 bytes
+    //   current/out seq stride = total_qkv * 2 bytes
+    mul.lo.u32      %r5, %r4, 2;        // total_qkv * 2 = current/out seq stride
+    cvt.u64.u32     %rd6, %r5;
+    mul.lo.u32      %r8, %r5, 3;        // 3 * total_qkv * 2 = state seq stride
+    cvt.u64.u32     %rd14, %r8;
+
+    // Apply per-seq offsets
+    cvt.u64.u32     %rd15, %r7;
+    mul.lo.u64      %rd16, %rd15, %rd14;    // m * 3 * total_qkv * 2
+    add.u64         %rd0, %rd0, %rd16;       // state base for seq m
+    mul.lo.u64      %rd17, %rd15, %rd6;      // m * total_qkv * 2
+    add.u64         %rd1, %rd1, %rd17;       // current base for seq m
+    add.u64         %rd3, %rd3, %rd17;       // out base for seq m
+
+    // current[m, c] address = current_base + c*2
+    mul.wide.u32    %rd4, %r3, 2;
+    add.u64         %rd5, %rd1, %rd4;
+    ld.global.b16   %h0, [%rd5];
+    cvt.f32.bf16    %f0, %h0;
+
+    // state[m, 0, c] = state_base + 0*stride + c*2
+    add.u64         %rd7, %rd0, %rd4;
+    ld.global.b16   %h1, [%rd7];
+    cvt.f32.bf16    %f1, %h1;
+
+    // state[m, 1, c] = state_base + 1*stride + c*2
+    add.u64         %rd8, %rd7, %rd6;
+    ld.global.b16   %h2, [%rd8];
+    cvt.f32.bf16    %f2, %h2;
+
+    // state[m, 2, c] = state_base + 2*stride + c*2
+    add.u64         %rd9, %rd8, %rd6;
+    ld.global.b16   %h3, [%rd9];
+    cvt.f32.bf16    %f3, %h3;
+
+    // weight[c, 0..3] shared across seqs: 4 contiguous BF16 at c*8 bytes
+    shl.b32         %r6, %r3, 3;
+    cvt.u64.u32     %rd10, %r6;
+    add.u64         %rd11, %rd2, %rd10;
+    ld.global.b16   %h4, [%rd11];
+    ld.global.b16   %h5, [%rd11 + 2];
+    ld.global.b16   %h6, [%rd11 + 4];
+    ld.global.b16   %h7, [%rd11 + 6];
+    cvt.f32.bf16    %f4, %h4;
+    cvt.f32.bf16    %f5, %h5;
+    cvt.f32.bf16    %f6, %h6;
+    cvt.f32.bf16    %f7, %h7;
+
+    // y = w[0]*s[0] + w[1]*s[1] + w[2]*s[2] + w[3]*current
+    mul.f32         %f8, %f4, %f1;
+    fma.rn.f32      %f8, %f5, %f2, %f8;
+    fma.rn.f32      %f8, %f6, %f3, %f8;
+    fma.rn.f32      %f8, %f7, %f0, %f8;
+
+    // silu(y) = y * sigmoid(y) = y / (1 + exp(-y))
+    mul.f32         %f9, %f8, MINUS_LOG2E_F32;
+    ex2.approx.f32  %f10, %f9;
+    add.f32         %f11, %f10, ONE_F32;
+    rcp.approx.f32  %f12, %f11;
+    mul.f32         %f13, %f8, %f12;
+
+    // Store output
+    cvt.rn.bf16.f32 %h8, %f13;
+    add.u64         %rd12, %rd3, %rd4;
+    st.global.b16   [%rd12], %h8;
+
+    // Advance state in place
+    st.global.b16   [%rd7], %h2;       // state[m, 0] := old state[m, 1]
+    st.global.b16   [%rd8], %h3;       // state[m, 1] := old state[m, 2]
+    st.global.b16   [%rd9], %h0;       // state[m, 2] := current
+
+done:
+    ret;
+}

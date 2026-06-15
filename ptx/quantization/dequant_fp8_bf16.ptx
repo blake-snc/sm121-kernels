@@ -1,0 +1,158 @@
+// dequant_fp8_bf16.ptx
+//
+// FP8 E4M3 → BF16 dequantization with per-row scales.
+//
+// Operation (per element):
+//   out[row, i] = fp8_to_f32(x[row, i]) * scales[row]
+//                                     ^ downcast to bf16
+//
+// For per-tensor quant, pass a 1-element scales buffer and vocab=1 (all
+// rows share the same scale). Common case is per-row/per-token scales.
+//
+// Layout:
+//   x: [num_rows, hidden] fp8_e4m3 (u8)
+//   scales: [num_rows] f32
+//   out: [num_rows, hidden] bf16
+//
+// Grid: (num_rows, 1, 1). Block: (256, 1, 1).
+// Vectorized v4 / v2.b32 I/O.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+.visible .entry dequant_fp8_bf16(
+    .param .u64 param_x,         // [num_rows, hidden] fp8_e4m3
+    .param .u64 param_scales,    // [num_rows] f32
+    .param .u64 param_out,       // [num_rows, hidden] bf16
+    .param .u32 param_hidden
+)
+{
+    .reg .b32 %r<28>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<16>;
+    .reg .b16 %h<16>;
+    .reg .pred %p<4>;
+
+    mov.u32         %r0, BLOCK_ID_X;
+    mov.u32         %r1, THREAD_ID;
+
+    ld.param.u64    %rd0, [param_x];
+    ld.param.u64    %rd1, [param_scales];
+    ld.param.u64    %rd2, [param_out];
+    ld.param.u32    %r2, [param_hidden];
+
+    // Per-row pointers
+    mul.lo.u32      %r3, %r0, %r2;
+    mul.wide.u32    %rd3, %r3, 1;
+    add.u64         %rd4, %rd0, %rd3;        // &x[row, 0]
+    mul.wide.u32    %rd5, %r3, 2;
+    add.u64         %rd6, %rd2, %rd5;        // &out[row, 0]
+
+    // Load this row's scale
+    mul.wide.u32    %rd7, %r0, 4;
+    add.u64         %rd8, %rd1, %rd7;
+    ld.global.f32   %f0, [%rd8];             // scale
+
+    mov.u32         %r4, %ntid.x;
+    shl.b32         %r20, %r4, 2;            // vec_stride (4 FP8 per thread)
+    sub.u32         %r21, %r20, 1;
+    not.b32         %r21, %r21;
+    and.b32         %r22, %r2, %r21;
+
+    shl.b32         %r5, %r1, 2;             // i = tid * 4
+
+vec_loop:
+    setp.ge.u32     %p0, %r5, %r22;
+    @%p0 bra        vec_done;
+
+    // Load 4 packed FP8 bytes = 32 bits
+    mul.wide.u32    %rd9, %r5, 1;
+    add.u64         %rd10, %rd4, %rd9;
+    ld.global.b32   %r10, [%rd10];
+
+    // Unpack 2 pairs of FP8 via cvt.rn.f16x2.e4m3x2 (produces f16x2 in a b32)
+    mov.b32         {%h0, %h1}, %r10;         // h0 = first 2 FP8, h1 = next 2 FP8
+    cvt.rn.f16x2.e4m3x2 %r12, %h0;            // unpack pair 0 → f16x2
+    cvt.rn.f16x2.e4m3x2 %r13, %h1;            // unpack pair 1 → f16x2
+
+    mov.b32         {%h4, %h5}, %r12;         // h4, h5 are f16 halves
+    mov.b32         {%h6, %h7}, %r13;         // h6, h7 are f16 halves
+
+    // Convert f16 → f32, multiply by scale, convert to bf16
+    cvt.f32.f16     %f4, %h4;
+    cvt.f32.f16     %f5, %h5;
+    cvt.f32.f16     %f6, %h6;
+    cvt.f32.f16     %f7, %h7;
+    mul.f32         %f4, %f4, %f0;
+    mul.f32         %f5, %f5, %f0;
+    mul.f32         %f6, %f6, %f0;
+    mul.f32         %f7, %f7, %f0;
+    CVT_F32_BF16(%h8, %f4)
+    CVT_F32_BF16(%h9, %f5)
+    CVT_F32_BF16(%h10, %f6)
+    CVT_F32_BF16(%h11, %f7)
+    mov.b32         %r14, {%h8, %h9};
+    mov.b32         %r15, {%h10, %h11};
+
+    mul.wide.u32    %rd11, %r5, 2;
+    add.u64         %rd12, %rd6, %rd11;
+    st.global.v2.b32 [%rd12], {%r14, %r15};
+
+    add.u32         %r5, %r5, %r20;
+    bra             vec_loop;
+
+vec_done:
+    add.u32         %r5, %r22, %r1;
+
+tail:
+    setp.ge.u32     %p0, %r5, %r2;
+    @%p0 bra        done;
+    // Pair tail: load 2 packed FP8
+    add.u32         %r24, %r5, 1;
+    setp.ge.u32     %p1, %r24, %r2;
+    @%p1 bra        single_tail;
+
+    mul.wide.u32    %rd9, %r5, 1;
+    add.u64         %rd10, %rd4, %rd9;
+    ld.global.b16   %h0, [%rd10];
+    cvt.rn.f16x2.e4m3x2 %r12, %h0;
+    mov.b32         {%h4, %h5}, %r12;
+    cvt.f32.f16     %f4, %h4;
+    cvt.f32.f16     %f5, %h5;
+    mul.f32         %f4, %f4, %f0;
+    mul.f32         %f5, %f5, %f0;
+    CVT_F32_BF16(%h8, %f4)
+    CVT_F32_BF16(%h9, %f5)
+    mul.wide.u32    %rd11, %r5, 2;
+    add.u64         %rd12, %rd6, %rd11;
+    st.global.b16   [%rd12], %h8;
+    add.u64         %rd12, %rd12, 2;
+    st.global.b16   [%rd12], %h9;
+    add.u32         %r5, %r5, 2;
+    add.u32         %r5, %r5, %r4;
+    bra             tail;
+
+single_tail:
+    // Last odd element — load single FP8, unpack via paired cvt with 0
+    mul.wide.u32    %rd9, %r5, 1;
+    add.u64         %rd10, %rd4, %rd9;
+    ld.global.u8    %r10, [%rd10];
+    // Pair (hi=0, lo=x) → unpack
+    mov.u32         %r11, %r10;
+    cvt.u16.u32     %h0, %r11;
+    cvt.rn.f16x2.e4m3x2 %r12, %h0;
+    mov.b32         {%h4, _}, %r12;
+    cvt.f32.f16     %f4, %h4;
+    mul.f32         %f4, %f4, %f0;
+    CVT_F32_BF16(%h8, %f4)
+    mul.wide.u32    %rd11, %r5, 2;
+    add.u64         %rd12, %rd6, %rd11;
+    st.global.b16   [%rd12], %h8;
+
+done:
+    ret;
+}

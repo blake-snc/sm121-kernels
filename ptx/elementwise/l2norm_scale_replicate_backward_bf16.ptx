@@ -1,0 +1,205 @@
+// l2norm_scale_replicate_backward_bf16.ptx
+//
+// Backward for l2norm_scale_replicate_bf16 (Qwen3-Next / GDN-hybrid GDN Q/K norm).
+//
+// Forward:
+//   s2  = sum_d(x[h, :]^2) + eps             (per input head h)
+//   inv = scale / sqrt(s2)
+//   y[h * factor + r, d] = x[h, d] * inv     (r in 0..factor)
+//
+// Backward (combining the replicate-reduce with the L2-norm + scale derivative):
+//   dy_comb[h, d] = sum_{r=0..factor-1} dy[h*factor+r, d]
+//   inner = sum_d(x[h, d] * dy_comb[h, d])
+//   dx[h, d] = inv * dy_comb[h, d] - (inv / s2) * x[h, d] * inner
+//
+// Layouts (all BF16):
+//   x:  [num_heads_in,         head_dim]   in (original forward input)
+//   dy: [num_heads_in*factor,  head_dim]   in (upstream gradient on the
+//                                              replicated output)
+//   dx: [num_heads_in,         head_dim]   out
+//
+// Grid:  (num_heads_in, 1, 1)
+// Block: (head_dim, 1, 1) — head_dim must be a multiple of 32 and ≤ 1024.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "reduction.ptxh"
+#include "convert.ptxh"
+
+.shared .align 128 .b8 l2nbw_smem[256];
+
+.visible .entry l2norm_scale_replicate_backward_bf16(
+    .param .u64 param_x,
+    .param .u64 param_dy,
+    .param .u64 param_dx,
+    .param .u32 param_head_dim,
+    .param .u32 param_factor,
+    .param .f32 param_scale,
+    .param .f32 param_eps
+)
+{
+    .reg .b32  %r<32>;
+    .reg .b64  %rd<24>;
+    .reg .f32  %f<32>;
+    .reg .b16  %h<8>;
+    .reg .pred %p<8>;
+
+    mov.u32         %r0, %tid.x;             // d
+    mov.u32         %r1, %ctaid.x;           // h (input head)
+    mov.u32         %r2, %ntid.x;            // == head_dim
+    ld.param.u32    %r3, [param_head_dim];
+    ld.param.u32    %r4, [param_factor];
+    ld.param.f32    %f0, [param_scale];
+    ld.param.f32    %f1, [param_eps];
+
+    setp.ge.u32     %p0, %r0, %r3;           // OOB defensive guard
+
+    // Address setup for x[h, d]
+    ld.param.u64    %rd0, [param_x];
+    mul.lo.u32      %r5, %r1, %r3;           // h * head_dim
+    add.u32         %r6, %r5, %r0;           // h*head_dim + d
+    mul.wide.u32    %rd1, %r6, 2;
+    add.u64         %rd2, %rd0, %rd1;        // &x[h, d]
+
+    // Load x[h, d]
+    mov.f32         %f2, 0.0;
+    @%p0 bra        skip_load_x;
+    ld.global.b16   %h0, [%rd2];
+    cvt.f32.bf16    %f2, %h0;
+skip_load_x:
+
+    // ========================================================================
+    // Sum dy across the `factor` replicated output heads
+    //   dy_comb[h, d] = sum_{r=0..factor-1} dy[h*factor+r, d]
+    // ========================================================================
+    ld.param.u64    %rd3, [param_dy];
+    mul.lo.u32      %r7, %r1, %r4;           // h * factor (start row in dy)
+    mov.f32         %f3, 0.0;                // dy_comb accumulator
+    mov.u32         %r8, 0;                  // r
+loop_r:
+    setp.ge.u32     %p1, %r8, %r4;
+    @%p1 bra        loop_r_done;
+    add.u32         %r9, %r7, %r8;           // out head row
+    mul.lo.u32      %r10, %r9, %r3;          // row * head_dim
+    add.u32         %r10, %r10, %r0;
+    mul.wide.u32    %rd4, %r10, 2;
+    add.u64         %rd5, %rd3, %rd4;
+    @%p0 bra        skip_dy_load;
+    ld.global.b16   %h1, [%rd5];
+    cvt.f32.bf16    %f4, %h1;
+    add.f32         %f3, %f3, %f4;
+skip_dy_load:
+    add.u32         %r8, %r8, 1;
+    bra             loop_r;
+loop_r_done:
+
+    // ========================================================================
+    // REDUCTION 1: s2 = sum_d(x^2) + eps
+    // ========================================================================
+    mul.f32         %f5, %f2, %f2;           // x^2
+
+    WARP_REDUCE_SUM_F32(%f5, %f6)
+
+    WARP_ID(%r11, %r0)
+    LANE_ID(%r12, %r0)
+    setp.eq.u32     %p2, %r12, 0;
+    @!%p2 bra       skip_w1;
+    mul.wide.u32    %rd6, %r11, 4;
+    mov.u64         %rd7, l2nbw_smem;
+    add.u64         %rd7, %rd7, %rd6;
+    st.shared.f32   [%rd7], %f5;
+skip_w1:
+    bar.sync        0;
+
+    shr.u32         %r13, %r2, 5;            // num_warps
+    setp.ne.u32     %p3, %r11, 0;
+    @%p3 bra        post_r1;
+
+    setp.ge.u32     %p4, %r12, %r13;
+    mov.f32         %f7, 0.0;
+    @%p4 bra        skip_load_p1;
+    mul.wide.u32    %rd6, %r12, 4;
+    mov.u64         %rd7, l2nbw_smem;
+    add.u64         %rd7, %rd7, %rd6;
+    ld.shared.f32   %f7, [%rd7];
+skip_load_p1:
+    WARP_REDUCE_SUM_F32(%f7, %f8)
+
+    setp.ne.u32     %p5, %r12, 0;
+    @%p5 bra        post_r1;
+    add.f32         %f9, %f7, %f1;           // s2 = sum + eps
+    rsqrt.approx.f32 %f10, %f9;              // 1/sqrt(s2)
+    mul.f32         %f11, %f10, %f0;         // inv = scale/sqrt(s2)
+    // Broadcast both inv and s2 via SMEM (2 slots)
+    mov.u64         %rd7, l2nbw_smem;
+    st.shared.f32   [%rd7], %f11;            // slot 0: inv
+    add.u64         %rd7, %rd7, 4;
+    st.shared.f32   [%rd7], %f9;             // slot 1: s2
+
+post_r1:
+    bar.sync        0;
+    mov.u64         %rd7, l2nbw_smem;
+    ld.shared.f32   %f11, [%rd7];            // inv
+    add.u64         %rd7, %rd7, 4;
+    ld.shared.f32   %f9, [%rd7];             // s2
+
+    // ========================================================================
+    // REDUCTION 2: inner = sum_d(x[h, d] * dy_comb[h, d])
+    // ========================================================================
+    mul.f32         %f12, %f2, %f3;          // x * dy_comb
+
+    WARP_REDUCE_SUM_F32(%f12, %f13)
+
+    setp.eq.u32     %p2, %r12, 0;
+    @!%p2 bra       skip_w2;
+    mul.wide.u32    %rd6, %r11, 4;
+    mov.u64         %rd7, l2nbw_smem;
+    add.u64         %rd7, %rd7, %rd6;
+    st.shared.f32   [%rd7], %f12;
+skip_w2:
+    bar.sync        0;
+
+    setp.ne.u32     %p3, %r11, 0;
+    @%p3 bra        post_r2;
+
+    setp.ge.u32     %p4, %r12, %r13;
+    mov.f32         %f14, 0.0;
+    @%p4 bra        skip_load_p2;
+    mul.wide.u32    %rd6, %r12, 4;
+    mov.u64         %rd7, l2nbw_smem;
+    add.u64         %rd7, %rd7, %rd6;
+    ld.shared.f32   %f14, [%rd7];
+skip_load_p2:
+    WARP_REDUCE_SUM_F32(%f14, %f15)
+
+    setp.ne.u32     %p5, %r12, 0;
+    @%p5 bra        post_r2;
+    mov.u64         %rd7, l2nbw_smem;
+    st.shared.f32   [%rd7], %f14;            // broadcast inner
+
+post_r2:
+    bar.sync        0;
+    mov.u64         %rd7, l2nbw_smem;
+    ld.shared.f32   %f14, [%rd7];            // inner
+
+    // ========================================================================
+    // dx[h, d] = inv * dy_comb - (inv / s2) * x * inner
+    // ========================================================================
+    div.approx.f32  %f16, %f11, %f9;         // inv / s2
+    mul.f32         %f17, %f16, %f2;         // (inv/s2) * x
+    mul.f32         %f17, %f17, %f14;        // * inner
+    mul.f32         %f18, %f11, %f3;         // inv * dy_comb
+    sub.f32         %f19, %f18, %f17;        // final dx
+
+    @%p0 bra        done;
+    ld.param.u64    %rd8, [param_dx];
+    add.u64         %rd9, %rd8, %rd1;        // &dx[h, d]  (same offset as x)
+    cvt.rn.bf16.f32 %h2, %f19;
+    st.global.b16   [%rd9], %h2;
+
+done:
+    ret;
+}

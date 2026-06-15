@@ -1,0 +1,181 @@
+// gemv_w8a16_fused_bf16.ptx
+//
+// Fused W8A16 GEMV with direct BF16 output. Replaces the 3-launch
+// (cuMemsetD8Async + gemv_w8a16_split_k + f32_to_bf16) sequence with a
+// single kernel launch. Trades split-K parallelism for launch-overhead
+// savings — wins when N is large enough to saturate SMs without splitting.
+//
+// Compute:
+//   out[N] = bf16( (x[K] @ dequant(B[K, N])) )
+// where B is FP8 e4m3 and dequant(b) = scale * f32(b).
+//
+// Layout:
+//   x:    [K]    BF16  (caller-zero-padded to multiple of K alignment)
+//   B:    [K, N] FP8 e4m3 row-major (1 byte/elem)
+//   out:  [N]    BF16  (written direct; no separate cast)
+//
+// Block: 128 threads, 8 cols/thread → 1024 cols per CTA.
+// Grid:  (ceil(N / 1024), 1, 1).
+// SMEM:  K * 2 bytes for the X tile (full K; no split).
+//
+// Constraints:
+//   - N must be a multiple of 8 (8 cols/thread).
+//   - K * 2 bytes must fit per-CTA SMEM (max ~99 KB SM121; gives K ≤ ~32K).
+//   - Caller does NOT need to pre-zero the output (kernel writes once).
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+.extern .shared .align 16 .b8 smem_xfull_w8a16[];
+
+.visible .entry gemv_w8a16_fused_bf16(
+    .param .u64 param_x,         // [K] bf16
+    .param .u64 param_b,         // [K, N] fp8 e4m3
+    .param .u64 param_out_bf16,  // [N] bf16
+    .param .f32 param_scale,
+    .param .u32 param_n,
+    .param .u32 param_k
+)
+{
+    .reg .b32 %r<32>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<32>;
+    .reg .b16 %h<16>;
+    .reg .pred %p<8>;
+
+    mov.u32         %r0, %ctaid.x;            // n_tile
+    mov.u32         %r2, %tid.x;
+    mov.u32         %r3, %ntid.x;             // 128
+
+    // col_start = n_tile * 1024 + tid * 8
+    shl.b32         %r4, %r0, 10;
+    shl.b32         %r5, %r2, 3;
+    add.u32         %r6, %r4, %r5;            // this thread's first col
+
+    ld.param.u64    %rd0, [param_x];
+    ld.param.u64    %rd1, [param_b];
+    ld.param.u64    %rd2, [param_out_bf16];
+    ld.param.f32    %f30, [param_scale];
+    ld.param.u32    %r7, [param_n];
+    ld.param.u32    %r8, [param_k];           // full K
+
+    // ----- Load full X[0..K] into SMEM -----
+    mov.u32         %r12, smem_xfull_w8a16;
+    mov.u32         %r14, %r2;
+load_x:
+    setp.ge.u32     %p0, %r14, %r8;
+    @%p0 bra        load_done;
+    mul.wide.u32    %rd3, %r14, 2;
+    add.u64         %rd4, %rd0, %rd3;
+    ld.global.b16   %h0, [%rd4];
+    shl.b32         %r16, %r14, 1;
+    add.u32         %r17, %r12, %r16;
+    st.shared.b16   [%r17], %h0;
+    add.u32         %r14, %r14, %r3;
+    bra             load_x;
+load_done:
+    bar.sync        0;
+
+    // Skip whole thread if its 8-col group beyond N
+    setp.ge.u32     %p1, %r6, %r7;
+    @%p1 bra        ret;
+
+    // 8 accumulators
+    mov.f32         %f0, 0.0;
+    mov.f32         %f1, 0.0;
+    mov.f32         %f2, 0.0;
+    mov.f32         %f3, 0.0;
+    mov.f32         %f4, 0.0;
+    mov.f32         %f5, 0.0;
+    mov.f32         %f6, 0.0;
+    mov.f32         %f7, 0.0;
+
+    // K loop (full K, no shard)
+    mov.u32         %r18, 0;
+k_loop:
+    setp.ge.u32     %p2, %r18, %r8;
+    @%p2 bra        k_done;
+
+    // X[k] from SMEM, fold scale into x
+    shl.b32         %r19, %r18, 1;
+    add.u32         %r20, %r12, %r19;
+    ld.shared.b16   %h0, [%r20];
+    CVT_BF16_F32(%f8, %h0)
+    mul.f32         %f8, %f8, %f30;
+
+    // B[k, col_start..col_start+8] = 8 FP8 = 8 bytes = v2.b32
+    mul.lo.u32      %r22, %r18, %r7;
+    add.u32         %r22, %r22, %r6;
+    cvt.u64.u32     %rd5, %r22;
+    add.u64         %rd6, %rd1, %rd5;
+
+    ld.global.v2.b32 {%r23, %r24}, [%rd6];
+
+    mov.b32         {%h0, %h1}, %r23;
+    mov.b32         {%h2, %h3}, %r24;
+
+    cvt.rn.f16x2.e4m3x2 %r25, %h0;
+    cvt.rn.f16x2.e4m3x2 %r26, %h1;
+    cvt.rn.f16x2.e4m3x2 %r27, %h2;
+    cvt.rn.f16x2.e4m3x2 %r28, %h3;
+
+    mov.b32         {%h4, %h5}, %r25;
+    mov.b32         {%h6, %h7}, %r26;
+    mov.b32         {%h8, %h9}, %r27;
+    mov.b32         {%h10, %h11}, %r28;
+
+    cvt.f32.f16     %f9,  %h4;
+    cvt.f32.f16     %f10, %h5;
+    cvt.f32.f16     %f11, %h6;
+    cvt.f32.f16     %f12, %h7;
+    cvt.f32.f16     %f13, %h8;
+    cvt.f32.f16     %f14, %h9;
+    cvt.f32.f16     %f15, %h10;
+    cvt.f32.f16     %f16, %h11;
+
+    fma.rn.f32      %f0, %f8, %f9,  %f0;
+    fma.rn.f32      %f1, %f8, %f10, %f1;
+    fma.rn.f32      %f2, %f8, %f11, %f2;
+    fma.rn.f32      %f3, %f8, %f12, %f3;
+    fma.rn.f32      %f4, %f8, %f13, %f4;
+    fma.rn.f32      %f5, %f8, %f14, %f5;
+    fma.rn.f32      %f6, %f8, %f15, %f6;
+    fma.rn.f32      %f7, %f8, %f16, %f7;
+
+    add.u32         %r18, %r18, 1;
+    bra             k_loop;
+
+k_done:
+    // Cast 8 f32 accumulators to BF16 and write packed b32 stores.
+    .reg .b16 %hb0, %hb1, %hb2, %hb3, %hb4, %hb5, %hb6, %hb7;
+    CVT_F32_BF16(%hb0, %f0)
+    CVT_F32_BF16(%hb1, %f1)
+    CVT_F32_BF16(%hb2, %f2)
+    CVT_F32_BF16(%hb3, %f3)
+    CVT_F32_BF16(%hb4, %f4)
+    CVT_F32_BF16(%hb5, %f5)
+    CVT_F32_BF16(%hb6, %f6)
+    CVT_F32_BF16(%hb7, %f7)
+
+    // Pack pairs into b32 for vectorized stores. cols [c, c+1] go into b32_0,
+    // [c+2, c+3] into b32_1, etc. Output byte offset = col*2.
+    .reg .b32 %p0_, %p1_, %p2_, %p3_;
+    mov.b32         %p0_, {%hb0, %hb1};
+    mov.b32         %p1_, {%hb2, %hb3};
+    mov.b32         %p2_, {%hb4, %hb5};
+    mov.b32         %p3_, {%hb6, %hb7};
+
+    mul.wide.u32    %rd7, %r6, 2;
+    add.u64         %rd8, %rd2, %rd7;
+    st.global.b32   [%rd8 + 0],  %p0_;
+    st.global.b32   [%rd8 + 4],  %p1_;
+    st.global.b32   [%rd8 + 8],  %p2_;
+    st.global.b32   [%rd8 + 12], %p3_;
+
+ret:
+    ret;
+}

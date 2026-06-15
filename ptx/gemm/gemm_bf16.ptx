@@ -1,0 +1,258 @@
+// gemm_bf16.ptx
+//
+// Tiled BF16 GEMM: C[M,N] = A[M,K] x B[K,N]
+// All matrices row-major, BF16 input/output, FP32 accumulation.
+//
+// Tile: 16x16, K-block: 16, Block: 256 threads (16x16 thread grid).
+// Each thread computes one element of C.
+// Shared memory: 1024 bytes (512B for A tile + 512B for B tile).
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+.visible .entry gemm_bf16(
+    .param .u64 param_A,        // A: [M, K] row-major, bf16
+    .param .u64 param_B,        // B: [K, N] row-major, bf16
+    .param .u64 param_C,        // C: [M, N] row-major, bf16 (output)
+    .param .u32 param_M,
+    .param .u32 param_N,
+    .param .u32 param_K
+)
+{
+    .reg .b32  %r<32>;
+    .reg .b64  %rd<10>;
+    .reg .f32  %f<4>;
+    .reg .b16  %h<4>;
+    .reg .pred %p<5>;
+
+    // Shared memory: A tile (16x16 bf16) then B tile (16x16 bf16)
+    //   smem_A: offset 0,   size 512 bytes (16 rows x 16 cols x 2B)
+    //   smem_B: offset 512, size 512 bytes (16 rows x 16 cols x 2B)
+    .shared .align 16 .b8 smem[1024];
+
+    // Thread identification
+    mov.u32         %r0, %tid.x;            // tid [0..255]
+    and.b32         %r1, %r0, 15;           // tx = tid % 16
+    shr.b32         %r2, %r0, 4;            // ty = tid / 16
+
+    // Block position
+    mov.u32         %r3, %ctaid.x;          // block_x (N dimension)
+    mov.u32         %r4, %ctaid.y;          // block_y (M dimension)
+
+    // Load params
+    ld.param.u64    %rd0, [param_A];
+    ld.param.u64    %rd1, [param_B];
+    ld.param.u64    %rd2, [param_C];
+    ld.param.u32    %r5, [param_M];
+    ld.param.u32    %r6, [param_N];
+    ld.param.u32    %r7, [param_K];
+
+    // Global row/col for this thread's output element
+    shl.b32         %r8, %r4, 4;            // by * 16
+    add.u32         %r9, %r8, %r2;          // row = by*16 + ty
+    shl.b32         %r10, %r3, 4;           // bx * 16
+    add.u32         %r11, %r10, %r1;        // col = bx*16 + tx
+
+    // Initialize accumulator
+    mov.f32         %f0, 0.0;
+
+    // Precompute smem store offsets for this thread
+    //   smem_A[ty][tx]: byte offset = tid * 2 (since ty*16+tx = tid)
+    //   smem_B[ty][tx]: byte offset = 512 + tid * 2
+    shl.b32         %r12, %r0, 1;           // tid * 2
+    add.u32         %r13, %r12, 512;        // tid * 2 + 512
+
+    // Get shared memory base address
+    mov.u32         %r30, smem;
+
+    // K loop
+    mov.u32         %r14, 0;                // k = 0
+
+k_loop:
+    setp.ge.u32     %p0, %r14, %r7;
+    @%p0 bra        k_done;
+
+    // --- Load A tile: smem_A[ty][tx] = A[row][k+tx] ---
+    add.u32         %r15, %r14, %r1;        // k_col = k + tx
+    setp.lt.u32     %p1, %r9, %r5;          // row < M
+    setp.lt.u32     %p2, %r15, %r7;         // k_col < K
+    and.pred        %p3, %p1, %p2;
+
+    mul.lo.u32      %r16, %r9, %r7;         // row * K
+    add.u32         %r16, %r16, %r15;       // row * K + k_col
+    mul.wide.u32    %rd3, %r16, 2;          // byte offset
+    add.u64         %rd4, %rd0, %rd3;       // &A[row][k_col]
+
+    @%p3 ld.global.b16 %h0, [%rd4];
+    @!%p3 mov.b16   %h0, 0;
+
+    add.u32         %r16, %r30, %r12;       // smem_base + tid*2
+    st.shared.b16   [%r16], %h0;
+
+    // --- Load B tile: smem_B[ty][tx] = B[k+ty][col] ---
+    add.u32         %r17, %r14, %r2;        // k_row = k + ty
+    setp.lt.u32     %p1, %r17, %r7;         // k_row < K
+    setp.lt.u32     %p2, %r11, %r6;         // col < N
+    and.pred        %p3, %p1, %p2;
+
+    mul.lo.u32      %r18, %r17, %r6;        // k_row * N
+    add.u32         %r18, %r18, %r11;       // k_row * N + col
+    mul.wide.u32    %rd5, %r18, 2;          // byte offset
+    add.u64         %rd6, %rd1, %rd5;       // &B[k_row][col]
+
+    @%p3 ld.global.b16 %h1, [%rd6];
+    @!%p3 mov.b16   %h1, 0;
+
+    add.u32         %r18, %r30, %r13;       // smem_base + 512 + tid*2
+    st.shared.b16   [%r18], %h1;
+
+    bar.sync 0;
+
+    // --- Inner product: acc += smem_A[ty][kk] * smem_B[kk][tx] for kk=0..15 ---
+    // smem_A[ty][kk] at offset: ty * 32 + kk * 2
+    // smem_B[kk][tx] at offset: 512 + kk * 32 + tx * 2
+    shl.b32         %r19, %r2, 5;           // ty * 32
+    add.u32         %r19, %r30, %r19;       // smem_base + ty * 32
+    shl.b32         %r20, %r1, 1;           // tx * 2
+    add.u32         %r20, %r30, %r20;       // smem_base + tx * 2
+    add.u32         %r20, %r20, 512;        // smem_base + 512 + tx * 2
+
+    // kk = 0
+    ld.shared.b16   %h0, [%r19 + 0];
+    ld.shared.b16   %h1, [%r20 + 0];
+    CVT_BF16_F32(%f1, %h0)
+    CVT_BF16_F32(%f2, %h1)
+    fma.rn.f32      %f0, %f1, %f2, %f0;
+
+    // kk = 1
+    ld.shared.b16   %h0, [%r19 + 2];
+    ld.shared.b16   %h1, [%r20 + 32];
+    CVT_BF16_F32(%f1, %h0)
+    CVT_BF16_F32(%f2, %h1)
+    fma.rn.f32      %f0, %f1, %f2, %f0;
+
+    // kk = 2
+    ld.shared.b16   %h0, [%r19 + 4];
+    ld.shared.b16   %h1, [%r20 + 64];
+    CVT_BF16_F32(%f1, %h0)
+    CVT_BF16_F32(%f2, %h1)
+    fma.rn.f32      %f0, %f1, %f2, %f0;
+
+    // kk = 3
+    ld.shared.b16   %h0, [%r19 + 6];
+    ld.shared.b16   %h1, [%r20 + 96];
+    CVT_BF16_F32(%f1, %h0)
+    CVT_BF16_F32(%f2, %h1)
+    fma.rn.f32      %f0, %f1, %f2, %f0;
+
+    // kk = 4
+    ld.shared.b16   %h0, [%r19 + 8];
+    ld.shared.b16   %h1, [%r20 + 128];
+    CVT_BF16_F32(%f1, %h0)
+    CVT_BF16_F32(%f2, %h1)
+    fma.rn.f32      %f0, %f1, %f2, %f0;
+
+    // kk = 5
+    ld.shared.b16   %h0, [%r19 + 10];
+    ld.shared.b16   %h1, [%r20 + 160];
+    CVT_BF16_F32(%f1, %h0)
+    CVT_BF16_F32(%f2, %h1)
+    fma.rn.f32      %f0, %f1, %f2, %f0;
+
+    // kk = 6
+    ld.shared.b16   %h0, [%r19 + 12];
+    ld.shared.b16   %h1, [%r20 + 192];
+    CVT_BF16_F32(%f1, %h0)
+    CVT_BF16_F32(%f2, %h1)
+    fma.rn.f32      %f0, %f1, %f2, %f0;
+
+    // kk = 7
+    ld.shared.b16   %h0, [%r19 + 14];
+    ld.shared.b16   %h1, [%r20 + 224];
+    CVT_BF16_F32(%f1, %h0)
+    CVT_BF16_F32(%f2, %h1)
+    fma.rn.f32      %f0, %f1, %f2, %f0;
+
+    // kk = 8
+    ld.shared.b16   %h0, [%r19 + 16];
+    ld.shared.b16   %h1, [%r20 + 256];
+    CVT_BF16_F32(%f1, %h0)
+    CVT_BF16_F32(%f2, %h1)
+    fma.rn.f32      %f0, %f1, %f2, %f0;
+
+    // kk = 9
+    ld.shared.b16   %h0, [%r19 + 18];
+    ld.shared.b16   %h1, [%r20 + 288];
+    CVT_BF16_F32(%f1, %h0)
+    CVT_BF16_F32(%f2, %h1)
+    fma.rn.f32      %f0, %f1, %f2, %f0;
+
+    // kk = 10
+    ld.shared.b16   %h0, [%r19 + 20];
+    ld.shared.b16   %h1, [%r20 + 320];
+    CVT_BF16_F32(%f1, %h0)
+    CVT_BF16_F32(%f2, %h1)
+    fma.rn.f32      %f0, %f1, %f2, %f0;
+
+    // kk = 11
+    ld.shared.b16   %h0, [%r19 + 22];
+    ld.shared.b16   %h1, [%r20 + 352];
+    CVT_BF16_F32(%f1, %h0)
+    CVT_BF16_F32(%f2, %h1)
+    fma.rn.f32      %f0, %f1, %f2, %f0;
+
+    // kk = 12
+    ld.shared.b16   %h0, [%r19 + 24];
+    ld.shared.b16   %h1, [%r20 + 384];
+    CVT_BF16_F32(%f1, %h0)
+    CVT_BF16_F32(%f2, %h1)
+    fma.rn.f32      %f0, %f1, %f2, %f0;
+
+    // kk = 13
+    ld.shared.b16   %h0, [%r19 + 26];
+    ld.shared.b16   %h1, [%r20 + 416];
+    CVT_BF16_F32(%f1, %h0)
+    CVT_BF16_F32(%f2, %h1)
+    fma.rn.f32      %f0, %f1, %f2, %f0;
+
+    // kk = 14
+    ld.shared.b16   %h0, [%r19 + 28];
+    ld.shared.b16   %h1, [%r20 + 448];
+    CVT_BF16_F32(%f1, %h0)
+    CVT_BF16_F32(%f2, %h1)
+    fma.rn.f32      %f0, %f1, %f2, %f0;
+
+    // kk = 15
+    ld.shared.b16   %h0, [%r19 + 30];
+    ld.shared.b16   %h1, [%r20 + 480];
+    CVT_BF16_F32(%f1, %h0)
+    CVT_BF16_F32(%f2, %h1)
+    fma.rn.f32      %f0, %f1, %f2, %f0;
+
+    bar.sync 0;
+
+    // Advance k
+    add.u32         %r14, %r14, 16;
+    bra             k_loop;
+
+k_done:
+    // --- Store result: C[row][col] = bf16(acc) ---
+    setp.lt.u32     %p1, %r9, %r5;         // row < M
+    setp.lt.u32     %p2, %r11, %r6;        // col < N
+    and.pred        %p3, %p1, %p2;
+
+    CVT_F32_BF16(%h2, %f0)
+
+    mul.lo.u32      %r21, %r9, %r6;        // row * N
+    add.u32         %r21, %r21, %r11;      // row * N + col
+    mul.wide.u32    %rd7, %r21, 2;         // byte offset
+    add.u64         %rd8, %rd2, %rd7;      // &C[row][col]
+
+    @%p3 st.global.b16 [%rd8], %h2;
+
+    ret;
+}

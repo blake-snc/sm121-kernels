@@ -1,0 +1,25 @@
+# fa_fp8_v12c_vt variant manifest (production FP8 flagship family).
+#
+# Maps each generated variant to its file stem, kernel entry name, and the cpp -D
+# flag set that selects its feature blocks in fa_fp8_v12c_vt.ptx.in.
+#
+# Format (whitespace separated):
+#   <file_stem>  <entry_name>  <flags...>
+#     file_stem  = output file name without .ptx (matches the hand-written file)
+#     entry_name = -DSPARK_ENTRY=<entry_name> (the .visible .entry symbol)
+#     flags      = zero or more SPARK_* macros to -D, or "-" for none
+#
+# Feature axes (independent): SPARK_CAUSAL, SPARK_GQA, SPARK_VARLEN.
+# The GQA KV-row mapping differs on the varlen vs non-varlen path, so the GQA
+# block is nested inside the VARLEN guard in the template.
+#
+# All 8 variants of the family are templated; nothing is excluded.
+
+fa_fp8_v12c_vt                     flash_attn_fp8_v12c_vt                     -
+fa_fp8_v12c_vt_causal              flash_attn_fp8_v12c_vt_causal              SPARK_CAUSAL
+fa_fp8_v12c_vt_gqa                 flash_attn_fp8_v12c_vt_gqa                 SPARK_GQA
+fa_fp8_v12c_vt_gqa_causal          flash_attn_fp8_v12c_vt_gqa_causal          SPARK_GQA SPARK_CAUSAL
+fa_fp8_v12c_vt_varlen              flash_attn_fp8_v12c_vt_varlen              SPARK_VARLEN
+fa_fp8_v12c_vt_varlen_causal       flash_attn_fp8_v12c_vt_varlen_causal       SPARK_VARLEN SPARK_CAUSAL
+fa_fp8_v12c_vt_varlen_gqa          flash_attn_fp8_v12c_vt_varlen_gqa          SPARK_VARLEN SPARK_GQA
+fa_fp8_v12c_vt_varlen_gqa_causal   flash_attn_fp8_v12c_vt_varlen_gqa_causal   SPARK_VARLEN SPARK_GQA SPARK_CAUSAL

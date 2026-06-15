@@ -1,0 +1,330 @@
+// gemm_mxfp8_grouped_mma_v2.ptx
+//
+// v2: vectorized B loads (1 v4.b32 = 16 FP8 contiguous per inner iter) +
+// per-block UE8M0 scale hoisted into a register at K=32 block boundary.
+//
+// MoE grouped GEMM with MXFP8 weights (E4M3 values + UE8M0 scales per 32-element
+// K-block). Used by FlashInfer/SGLang MXFP8 MoE path for SM12x.
+//
+// Compute:
+//   Y_e[row, n] = Σ_k A_e[row, k] * B_e[n, k] * scale_e[n, k/32]
+//
+// UE8M0 scale: 1 byte per (n, k_block). Decoded as 2^(ue8m0 - 127), implemented
+// by shifting the byte into the FP32 exponent field.
+//
+// Layout (parallels FP8 block128 but with BLOCK_K=32 and 1 B/scale):
+//   A: [total_tokens, K] BF16, expert-permuted
+//   B: [num_experts, N, K] FP8 E4M3
+//   scales: [num_experts, N, K/32] u8 (UE8M0)
+//   C: [total_tokens, N] BF16
+//   expert_offsets: [num_experts+1] u32
+//
+// Tile: 32×32, 1 warp, BF16 m16n8k16. Scales refresh every K=32 (= 2 inner iters).
+// Grid: (ceil(N/32), ceil(max_M/32), num_experts). K must be multiple of 32.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+#include "mma.ptxh"
+
+.visible .entry gemm_mxfp8_grouped_mma_v2(
+    .param .u64 param_A,
+    .param .u64 param_B,
+    .param .u64 param_scales,
+    .param .u64 param_C,
+    .param .u64 param_expert_offsets,
+    .param .u32 param_N,
+    .param .u32 param_K
+)
+{
+    .reg .b32  %r<110>;
+    .reg .b64  %rd<16>;
+    .reg .f32  %f<40>;
+    .reg .b16  %h<6>;
+    .reg .pred %p<8>;
+
+    // SMEM: A 1024 + B 1024 + scales 128 = 2176, padded to 2304.
+    .shared .align 128 .b8 smem[2304];
+
+    mov.u32         %r40, %tid.x;
+    mov.u32         %r41, %ctaid.x;
+    mov.u32         %r42, %ctaid.y;
+    mov.u32         %r43, %ctaid.z;
+
+    ld.param.u64    %rd0, [param_A];
+    ld.param.u64    %rd1, [param_B];
+    ld.param.u64    %rd2, [param_scales];
+    ld.param.u64    %rd3, [param_C];
+    ld.param.u64    %rd4, [param_expert_offsets];
+    ld.param.u32    %r44, [param_N];
+    ld.param.u32    %r45, [param_K];
+
+    mul.wide.u32    %rd5, %r43, 4;
+    add.u64         %rd6, %rd4, %rd5;
+    ld.global.u32   %r46, [%rd6];
+    ld.global.u32   %r47, [%rd6 + 4];
+    sub.u32         %r48, %r47, %r46;
+
+    shl.b32         %r49, %r42, 5;
+    setp.ge.u32     %p0, %r49, %r48;
+    @%p0 ret;
+    shl.b32         %r50, %r41, 5;
+    setp.ge.u32     %p1, %r50, %r44;
+    @%p1 ret;
+
+    add.u32         %r51, %r46, %r49;
+    sub.u32         %r52, %r48, %r49;
+    min.u32         %r52, %r52, 32;
+
+    mul.lo.u32      %r53, %r51, %r45;
+    mul.wide.u32    %rd7, %r53, 2;
+    add.u64         %rd7, %rd0, %rd7;
+
+    // B base [expert, n_off, 0]: expert*N*K + n_off*K (FP8, 1B/elem)
+    mul.lo.u32      %r54, %r43, %r44;
+    add.u32         %r54, %r54, %r50;
+    mul.lo.u32      %r55, %r54, %r45;
+    cvt.u64.u32     %rd8, %r55;
+    add.u64         %rd8, %rd1, %rd8;
+
+    // Scales base [expert, n_off, 0]: (expert*N + n_off) * (K/32) u8
+    shr.b32         %r56, %r45, 5;               // K_blocks = K/32
+    mul.lo.u32      %r57, %r54, %r56;
+    cvt.u64.u32     %rd9, %r57;
+    add.u64         %rd9, %rd2, %rd9;
+
+    mov.f32 %f0, 0.0;  mov.f32 %f1, 0.0;  mov.f32 %f2, 0.0;  mov.f32 %f3, 0.0;
+    mov.f32 %f4, 0.0;  mov.f32 %f5, 0.0;  mov.f32 %f6, 0.0;  mov.f32 %f7, 0.0;
+    mov.f32 %f8, 0.0;  mov.f32 %f9, 0.0;  mov.f32 %f10, 0.0; mov.f32 %f11, 0.0;
+    mov.f32 %f12, 0.0; mov.f32 %f13, 0.0; mov.f32 %f14, 0.0; mov.f32 %f15, 0.0;
+    mov.f32 %f16, 0.0; mov.f32 %f17, 0.0; mov.f32 %f18, 0.0; mov.f32 %f19, 0.0;
+    mov.f32 %f20, 0.0; mov.f32 %f21, 0.0; mov.f32 %f22, 0.0; mov.f32 %f23, 0.0;
+    mov.f32 %f24, 0.0; mov.f32 %f25, 0.0; mov.f32 %f26, 0.0; mov.f32 %f27, 0.0;
+    mov.f32 %f28, 0.0; mov.f32 %f29, 0.0; mov.f32 %f30, 0.0; mov.f32 %f31, 0.0;
+
+    mov.u32         %r60, smem;
+    add.u32         %r61, %r60, 1024;
+    add.u32         %r62, %r60, 2048;            // smem_scales (FP32)
+
+    setp.lt.u32     %p2, %r40, 16;
+    @%p2 mul.lo.u32 %r63, %r40, 32;
+    @!%p2 sub.u32   %r63, %r40, 16;
+    @!%p2 mad.lo.u32 %r63, %r63, 32, 16;
+    add.u32         %r64, %r60, %r63;
+    add.u32         %r65, %r64, 512;
+
+    and.b32         %r66, %r40, 15;
+    shl.b32         %r66, %r66, 6;
+    add.u32         %r67, %r61, %r66;
+
+    shr.b32         %r68, %r40, 2;
+    and.b32         %r69, %r40, 3;
+    shl.b32         %r70, %r69, 1;
+
+    // v2: 1 col per thread, all K positions.
+    shl.b32         %r77, %r40, 1;               // lane*2
+    add.u32         %r77, %r61, %r77;            // smem_B + lane*2
+
+    add.u32         %r75, %r50, %r40;            // col_global
+    setp.lt.u32     %p5, %r75, %r44;
+
+    // Per-thread col-major B base (FP8 = 1 byte/elem).
+    mul.lo.u32      %r100, %r40, %r45;           // lane * K
+    cvt.u64.u32     %rd14, %r100;
+    add.u64         %rd14, %rd8, %rd14;          // &B[expert, n_off+lane, 0]
+
+    mul.lo.u32      %r76, %r40, 32;
+    add.u32         %r76, %r60, %r76;            // smem_A dst
+
+    shl.b32         %r74, %r40, 2;
+    add.u32         %r74, %r62, %r74;            // &scales_smem[lane]
+
+    setp.lt.u32     %p4, %r40, %r52;
+
+    // ==================== K BLOCK LOOP ====================
+    // One K-block = 32 elements. Each block = 2 inner K=16 iters.
+    mov.u32         %r80, 0;                     // k (global)
+    mov.u32         %r81, 0;                     // k_block
+
+k_block_loop:
+    setp.ge.u32     %p3, %r81, %r56;
+    @%p3 bra        k_block_done;
+
+    // Load 32 UE8M0 scales into SMEM as FP32.
+    // addr = &scales[expert, n_off+lane, k_block]
+    //      = rd9 + (lane*K_blocks + k_block)
+    mul.lo.u32      %r82, %r40, %r56;
+    add.u32         %r82, %r82, %r81;
+    cvt.u64.u32     %rd10, %r82;
+    add.u64         %rd10, %rd9, %rd10;
+
+    add.u32         %r83, %r50, %r40;
+    setp.lt.u32     %p6, %r83, %r44;
+
+    .reg .b32 _scu8;
+    mov.b32         _scu8, 0x3F800000;           // default 1.0 (FP32 bits) — unused slots
+    .reg .b32 _u8raw;
+    @%p6 ld.global.u8 _u8raw, [%rd10];
+    // Convert UE8M0 byte → FP32 = 2^(byte - 127): shift byte into FP32 exponent field.
+    @%p6 shl.b32    _scu8, _u8raw, 23;
+    shl.b32         %r84, %r40, 2;
+    add.u32         %r85, %r62, %r84;
+    st.shared.b32   [%r85], _scu8;
+
+    bar.sync        0;
+
+    // v2: hoist this thread's UE8M0-decoded scale into a register.
+    ld.shared.f32   %f32, [%r74];
+
+    // === Inner K=16 MMAs × 2 ===
+    mov.u32         %r86, 0;                     // k_inner (0, 16)
+k_inner_loop:
+    setp.ge.u32     %p7, %r86, 32;
+    @%p7 bra        k_inner_done;
+
+    add.u32         %r87, %r80, %r86;
+
+    // A tile
+    add.u32         %r88, %r51, %r40;
+    mul.lo.u32      %r89, %r88, %r45;
+    add.u32         %r89, %r89, %r87;
+    mul.wide.u32    %rd11, %r89, 2;
+    add.u64         %rd11, %rd0, %rd11;
+
+    .reg .b32 _a0a, _a1a, _a2a, _a3a, _a0b, _a1b, _a2b, _a3b;
+    @%p4 ld.global.v4.b32 {_a0a, _a1a, _a2a, _a3a}, [%rd11];
+    @%p4 ld.global.v4.b32 {_a0b, _a1b, _a2b, _a3b}, [%rd11 + 16];
+    @!%p4 mov.b32   _a0a, 0;
+    @!%p4 mov.b32   _a1a, 0;
+    @!%p4 mov.b32   _a2a, 0;
+    @!%p4 mov.b32   _a3a, 0;
+    @!%p4 mov.b32   _a0b, 0;
+    @!%p4 mov.b32   _a1b, 0;
+    @!%p4 mov.b32   _a2b, 0;
+    @!%p4 mov.b32   _a3b, 0;
+    st.shared.v4.b32 [%r76],      {_a0a, _a1a, _a2a, _a3a};
+    st.shared.v4.b32 [%r76 + 16], {_a0b, _a1b, _a2b, _a3b};
+
+    // === v2 B tile: 1 col × 16 K-rows = 16 FP8 contiguous (1 v4.b32) ===
+    cvt.u64.u32     %rd15, %r87;
+    add.u64         %rd12, %rd14, %rd15;         // &B[expert, n_off+lane, k_global]
+
+    .reg .b32 _b0, _b1, _b2, _b3;
+    @%p5 ld.global.v4.b32 {_b0, _b1, _b2, _b3}, [%rd12];
+    @!%p5 mov.b32   _b0, 0;
+    @!%p5 mov.b32   _b1, 0;
+    @!%p5 mov.b32   _b2, 0;
+    @!%p5 mov.b32   _b3, 0;
+
+#define DECODE_PAIR_TO_TWO_BF16_MX(fp8_b16, kbase) \
+    { .reg .b32 _f16x2; \
+      .reg .b16 _h0, _h1; \
+      .reg .f32 _v0, _v1; \
+      .reg .b16 _bv0, _bv1; \
+      cvt.rn.f16x2.e4m3x2 _f16x2, fp8_b16; \
+      mov.b32 {_h0, _h1}, _f16x2; \
+      cvt.f32.f16 _v0, _h0; \
+      cvt.f32.f16 _v1, _h1; \
+      mul.f32 _v0, _v0, %f32; \
+      mul.f32 _v1, _v1, %f32; \
+      CVT_F32_BF16(_bv0, _v0) \
+      CVT_F32_BF16(_bv1, _v1) \
+      st.shared.b16 [%r77 + (kbase)*64], _bv0; \
+      st.shared.b16 [%r77 + ((kbase)+1)*64], _bv1; \
+    }
+
+    .reg .b16 _lo0, _hi0, _lo1, _hi1, _lo2, _hi2, _lo3, _hi3;
+    mov.b32         {_lo0, _hi0}, _b0;
+    mov.b32         {_lo1, _hi1}, _b1;
+    mov.b32         {_lo2, _hi2}, _b2;
+    mov.b32         {_lo3, _hi3}, _b3;
+    DECODE_PAIR_TO_TWO_BF16_MX(_lo0, 0)
+    DECODE_PAIR_TO_TWO_BF16_MX(_hi0, 2)
+    DECODE_PAIR_TO_TWO_BF16_MX(_lo1, 4)
+    DECODE_PAIR_TO_TWO_BF16_MX(_hi1, 6)
+    DECODE_PAIR_TO_TWO_BF16_MX(_lo2, 8)
+    DECODE_PAIR_TO_TWO_BF16_MX(_hi2, 10)
+    DECODE_PAIR_TO_TWO_BF16_MX(_lo3, 12)
+    DECODE_PAIR_TO_TWO_BF16_MX(_hi3, 14)
+#undef DECODE_PAIR_TO_TWO_BF16_MX
+
+    bar.sync        0;
+
+    // ldmatrix + MMA × 8
+    .reg .b32 %rA0, %rA1, %rA2, %rA3, %rA4, %rA5, %rA6, %rA7;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%rA0, %rA1, %rA2, %rA3}, [%r64];
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%rA4, %rA5, %rA6, %rA7}, [%r65];
+
+    .reg .b32 %rB0, %rB1;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%rB0, %rB1}, [%r67];
+    MMA_BF16_M16N8K16(%f0,  %f1,  %f2,  %f3,  %rA0, %rA1, %rA2, %rA3, %rB0, %rB1)
+    MMA_BF16_M16N8K16(%f16, %f17, %f18, %f19, %rA4, %rA5, %rA6, %rA7, %rB0, %rB1)
+    add.u32         %r99, %r67, 16;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%rB0, %rB1}, [%r99];
+    MMA_BF16_M16N8K16(%f4,  %f5,  %f6,  %f7,  %rA0, %rA1, %rA2, %rA3, %rB0, %rB1)
+    MMA_BF16_M16N8K16(%f20, %f21, %f22, %f23, %rA4, %rA5, %rA6, %rA7, %rB0, %rB1)
+    add.u32         %r99, %r67, 32;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%rB0, %rB1}, [%r99];
+    MMA_BF16_M16N8K16(%f8,  %f9,  %f10, %f11, %rA0, %rA1, %rA2, %rA3, %rB0, %rB1)
+    MMA_BF16_M16N8K16(%f24, %f25, %f26, %f27, %rA4, %rA5, %rA6, %rA7, %rB0, %rB1)
+    add.u32         %r99, %r67, 48;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%rB0, %rB1}, [%r99];
+    MMA_BF16_M16N8K16(%f12, %f13, %f14, %f15, %rA0, %rA1, %rA2, %rA3, %rB0, %rB1)
+    MMA_BF16_M16N8K16(%f28, %f29, %f30, %f31, %rA4, %rA5, %rA6, %rA7, %rB0, %rB1)
+
+    bar.sync        0;
+
+    add.u32         %r86, %r86, 16;
+    bra             k_inner_loop;
+k_inner_done:
+
+    add.u32         %r80, %r80, 32;
+    add.u32         %r81, %r81, 1;
+    bra             k_block_loop;
+k_block_done:
+
+#define STORE_TILE_MX(mg, ng, d0, d1, d2, d3) \
+    { .reg .b32 _row, _col, _off; \
+      .reg .b64 _p; \
+      .reg .b16 _b0, _b1; \
+      .reg .b32 _pk; \
+      .reg .pred _rin; \
+      add.u32 _row, %r51, 0; \
+      add.u32 _row, _row, mg*16; \
+      add.u32 _row, _row, %r68; \
+      add.u32 _col, %r50, ng*8; \
+      add.u32 _col, _col, %r70; \
+      setp.lt.u32 _rin, _row, %r47; \
+      mul.lo.u32 _off, _row, %r44; \
+      add.u32 _off, _off, _col; \
+      mul.wide.u32 _p, _off, 2; \
+      add.u64 _p, %rd3, _p; \
+      CVT_F32_BF16(_b0, d0) \
+      CVT_F32_BF16(_b1, d1) \
+      mov.b32 _pk, {_b0, _b1}; \
+      @_rin st.global.b32 [_p], _pk; \
+      add.u32 _row, _row, 8; \
+      setp.lt.u32 _rin, _row, %r47; \
+      mul.lo.u32 _off, _row, %r44; \
+      add.u32 _off, _off, _col; \
+      mul.wide.u32 _p, _off, 2; \
+      add.u64 _p, %rd3, _p; \
+      CVT_F32_BF16(_b0, d2) \
+      CVT_F32_BF16(_b1, d3) \
+      mov.b32 _pk, {_b0, _b1}; \
+      @_rin st.global.b32 [_p], _pk; \
+    }
+    STORE_TILE_MX(0, 0, %f0,  %f1,  %f2,  %f3)
+    STORE_TILE_MX(0, 1, %f4,  %f5,  %f6,  %f7)
+    STORE_TILE_MX(0, 2, %f8,  %f9,  %f10, %f11)
+    STORE_TILE_MX(0, 3, %f12, %f13, %f14, %f15)
+    STORE_TILE_MX(1, 0, %f16, %f17, %f18, %f19)
+    STORE_TILE_MX(1, 1, %f20, %f21, %f22, %f23)
+    STORE_TILE_MX(1, 2, %f24, %f25, %f26, %f27)
+    STORE_TILE_MX(1, 3, %f28, %f29, %f30, %f31)
+
+    ret;
+}

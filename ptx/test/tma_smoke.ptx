@@ -1,0 +1,72 @@
+// tma_smoke.ptx
+// Minimal TMA smoke test: load a 64x128 BF16 tile via TMA.
+// TMA descriptor is passed as a device pointer (.param .u64).
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+.visible .entry tma_smoke_test(
+    .param .u64 param_tma_ptr,             // device pointer to 128-byte TMA descriptor
+    .param .u64 param_out,                  // output pointer (u16)
+    .param .u32 param_coord_x,
+    .param .u32 param_coord_y
+)
+{
+    .reg .b32  %r<32>;
+    .reg .b64  %rd<8>;
+    .reg .b16  %h<4>;
+    .reg .pred %p<4>;
+
+    .shared .align 128 .b8 smem[16512];
+    // smem[0..16383] = tile data
+    // smem[16384..16399] = mbarrier
+
+    mov.u32         %r0, %tid.x;
+    shr.b32         %r2, %r0, 5;             // warp_id
+    and.b32         %r3, %r0, 31;            // lane
+
+    // Thread 0: init mbarrier
+    setp.eq.u32     %p0, %r0, 0;
+    @%p0 mbarrier.init.shared.b64 [smem + 16384], 1;
+    fence.mbarrier_init.release.cluster;
+    bar.sync 0;
+
+    // DMA warp (warp 1), lane 0 only
+    setp.eq.u32     %p1, %r2, 1;
+    setp.eq.u32     %p2, %r3, 0;
+    and.pred        %p3, %p1, %p2;
+
+    // Load TMA descriptor pointer (device memory address)
+    ld.param.u64    %rd0, [param_tma_ptr];
+
+    // Load coordinates
+    ld.param.u32    %r10, [param_coord_x];
+    ld.param.u32    %r11, [param_coord_y];
+
+    // SMEM addresses
+    mov.u32         %r20, smem;
+    add.u32         %r21, %r20, 16384;       // mbarrier
+
+    // DMA: set expected TX bytes and issue TMA load
+    @%p3 mbarrier.arrive.expect_tx.shared.b64 _, [%r21], 16384;
+    @%p3 cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
+        [%r20], [%rd0, {%r10, %r11}], [%r21];
+
+    // Reader warp (warp 0): wait for TMA
+    setp.eq.u32     %p1, %r2, 0;
+    @!%p1 bra       done;
+
+wait_loop:
+    mbarrier.try_wait.parity.shared.b64 %p0, [smem + 16384], 0;
+    @!%p0 bra wait_loop;
+
+    // Read first BF16 from SMEM and write to output
+    ld.shared.u16   %h0, [smem];
+    ld.param.u64    %rd1, [param_out];
+    setp.eq.u32     %p0, %r0, 0;
+    @%p0 st.global.u16 [%rd1], %h0;
+
+done:
+    ret;
+}

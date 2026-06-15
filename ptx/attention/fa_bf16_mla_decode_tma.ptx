@@ -1,0 +1,404 @@
+// fa_bf16_mla_decode_tma.ptx
+//
+// Multi-head Latent Attention — BF16 decode, TMA-accelerated.
+//
+// SAME thread/head structure as fa_bf16_mla_decode.ptx (1 head per CTA,
+// 128 threads × 4 dims = D_C=512) so the grid launches num_heads*batch CTAs —
+// full GPU occupancy. The TMA retrofit operates purely on the c_kv/k_rope
+// GMEM→SMEM path: double-buffered 8-position chunks via TMA replace the
+// per-thread scalar ld.global.v2.b32 of the reference.
+//
+// Q_c (1KB) and Q_r (128B) are loaded scalar (one-shot); they're too small
+// to benefit from TMA (one-shot ~ one cache line).
+//
+// Grid: (num_heads, batch). Block: (128, 1, 1).
+// SMEM layout (~20 KB — fits in 48 KB default, no opt-in required):
+//   SMEM_Q_C       0     -  1023    (1 head × 512 BF16)
+//   SMEM_Q_R      1024   -  1151    (1 head × 64  BF16)
+//   SMEM_KV0_C    1152   -  9343    (8 × 512 BF16 = 8192)
+//   SMEM_KV0_R    9344   -  10367   (8 × 64  BF16 = 1024)
+//   SMEM_KV1_C    10368  -  18559
+//   SMEM_KV1_R    18560  -  19583
+//   SMEM_MBAR_KV0 19584  -  19599
+//   SMEM_MBAR_KV1 19600  -  19615
+//
+// TMA descriptor tiles:
+//   c_kv: [D_C=512 inner, B*S outer] NO_SWIZZLE, tile [64, 8]  — 8 TMAs per chunk
+//   k_rope: [D_R=64 inner, B*S outer] NO_SWIZZLE, tile [64, 8] — 1 TMA per chunk
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+#include "reduction.ptxh"
+
+#define D_C 512
+#define D_R 64
+#define BLOCK_DIM 128
+#define NUM_WARPS 4
+#define KV_CHUNK 8
+
+#define SMEM_Q_C        0
+#define SMEM_Q_R        1024
+#define SMEM_KV0_C      1152
+#define SMEM_KV0_R      9344
+#define SMEM_KV1_C      10368
+#define SMEM_KV1_R      18560
+#define SMEM_MBAR_KV0   19584
+#define SMEM_MBAR_KV1   19600
+
+.extern .shared .align 128 .b8 mla_tma_smem[];
+.shared .align 4 .b8 smem_mla_tma_warp_sum[16];
+.shared .align 4 .b8 smem_mla_tma_score[4];
+
+.visible .entry fa_bf16_mla_decode_tma(
+    .param .u64 param_Q_c,           // plain global [B, H, D_C] BF16
+    .param .u64 param_Q_r,           //              [B, H, D_R] BF16
+    .param .u64 param_c_kv_tma,      // TMA desc     [D_C=512, B*S] — 8 halves of 64 inner cols
+    .param .u64 param_k_rope_tma,    // TMA desc     [D_R=64,  B*S] — 1 half
+    .param .u64 param_O,             // plain global [B, H, D_C] BF16
+    .param .u32 param_num_heads,
+    .param .u32 param_seq_kv,
+    .param .f32 param_scale
+)
+{
+    .reg .b32  %r<64>;
+    .reg .b64  %rd<16>;
+    .reg .f32  %f<40>;
+    .reg .b16  %h<8>;
+    .reg .pred %p<10>;
+
+    mov.u32     %r0, %tid.x;
+    mov.u32     %r1, %ctaid.x;           // head
+    mov.u32     %r2, %ctaid.y;           // batch
+
+    ld.param.u64 %rd0, [param_Q_c];
+    ld.param.u64 %rd1, [param_Q_r];
+    ld.param.u64 %rd2, [param_c_kv_tma];
+    ld.param.u64 %rd3, [param_k_rope_tma];
+    ld.param.u64 %rd4, [param_O];
+    ld.param.u32 %r3, [param_num_heads];
+    ld.param.u32 %r4, [param_seq_kv];
+    ld.param.f32 %f0, [param_scale];
+
+    shr.b32     %r5, %r0, 5;
+    and.b32     %r6, %r0, 31;
+
+    mov.u32     %r7, mla_tma_smem;
+
+    // Init mbarriers
+    setp.eq.u32 %p0, %r0, 0;
+    add.u32     %r8, %r7, SMEM_MBAR_KV0;
+    add.u32     %r9, %r7, SMEM_MBAR_KV1;
+    @%p0 mbarrier.init.shared.b64 [%r8], 1;
+    @%p0 mbarrier.init.shared.b64 [%r9], 1;
+    fence.mbarrier_init.release.cluster;
+    bar.sync 0;
+
+    // Load Q_c and Q_r scalar (one-shot, 1KB + 128B)
+    mul.lo.u32  %r10, %r2, %r3;
+    add.u32     %r10, %r10, %r1;           // bh
+    mul.lo.u32  %r11, %r10, D_C;
+    mul.wide.u32 %rd5, %r11, 2;
+    add.u64     %rd6, %rd0, %rd5;
+    mul.lo.u32  %r12, %r10, D_R;
+    mul.wide.u32 %rd5, %r12, 2;
+    add.u64     %rd7, %rd1, %rd5;
+
+    shl.b32     %r13, %r0, 3;
+    cvt.u64.u32 %rd8, %r13;
+    add.u64     %rd9, %rd6, %rd8;
+    ld.global.v2.b32 {%r14, %r15}, [%rd9];
+    add.u32     %r16, %r7, SMEM_Q_C;
+    add.u32     %r16, %r16, %r13;
+    st.shared.v2.b32 [%r16], {%r14, %r15};
+
+    setp.lt.u32 %p1, %r0, D_R;
+    @%p1 shl.b32 %r13, %r0, 1;
+    @%p1 cvt.u64.u32 %rd8, %r13;
+    @%p1 add.u64 %rd9, %rd7, %rd8;
+    @%p1 ld.global.b16 %h0, [%rd9];
+    @%p1 add.u32 %r16, %r7, SMEM_Q_R;
+    @%p1 add.u32 %r16, %r16, %r13;
+    @%p1 st.shared.b16 [%r16], %h0;
+
+    // --------------------------------------------------------------
+    // Prefetch KV chunk 0 via TMA (8 halves for c_kv + 1 for k_rope)
+    // --------------------------------------------------------------
+    mul.lo.u32  %r20, %r2, %r4;           // b * seq_kv
+
+    @%p0 mbarrier.arrive.expect_tx.shared.b64 _, [%r8], (KV_CHUNK * (D_C + D_R) * 2);
+    mov.u32     %r21, 0;                    // half_idx
+    // c_kv halves: dst SMEM layout is contiguous 8×1024 B halves,
+    // each half contains 8 rows × 128 B of the c_kv tile. We lay out
+    // consecutive halves in SMEM so scalar reads at [col_byte = half*128 + in_half]
+    // naturally address the right element.
+cp_kv0_loop:
+    setp.ge.u32 %p2, %r21, 8;
+    @%p2 bra    cp_kv0_done;
+    shl.b32     %r22, %r21, 6;              // col_coord = half * 64
+    // SMEM dst: we interleave rows vs halves such that row r starts at offset
+    // r * 1024 (= 8 halves × 128 B per row) with each half contributing 128 B.
+    // Simpler: lay each half at its own contiguous 1KB region.
+    shl.b32     %r23, %r21, 10;              // half * 1024
+    add.u32     %r24, %r7, SMEM_KV0_C;
+    add.u32     %r24, %r24, %r23;
+    @%p0 cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
+        [%r24], [%rd2, {%r22, %r20}], [%r8];
+    add.u32     %r21, %r21, 1;
+    bra         cp_kv0_loop;
+cp_kv0_done:
+    // k_rope: 1 TMA
+    mov.u32     %r22, 0;
+    add.u32     %r24, %r7, SMEM_KV0_R;
+    @%p0 cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
+        [%r24], [%rd3, {%r22, %r20}], [%r8];
+
+    // Prefetch KV chunk 1
+    setp.gt.u32 %p2, %r4, KV_CHUNK;
+    and.pred    %p3, %p2, %p0;
+    add.u32     %r25, %r20, KV_CHUNK;
+    @%p3 mbarrier.arrive.expect_tx.shared.b64 _, [%r9], (KV_CHUNK * (D_C + D_R) * 2);
+    mov.u32     %r21, 0;
+cp_kv1_loop:
+    setp.ge.u32 %p4, %r21, 8;
+    @%p4 bra    cp_kv1_done;
+    shl.b32     %r22, %r21, 6;
+    shl.b32     %r23, %r21, 10;
+    add.u32     %r24, %r7, SMEM_KV1_C;
+    add.u32     %r24, %r24, %r23;
+    @%p3 cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
+        [%r24], [%rd2, {%r22, %r25}], [%r9];
+    add.u32     %r21, %r21, 1;
+    bra         cp_kv1_loop;
+cp_kv1_done:
+    mov.u32     %r22, 0;
+    add.u32     %r24, %r7, SMEM_KV1_R;
+    @%p3 cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
+        [%r24], [%rd3, {%r22, %r25}], [%r9];
+
+    bar.sync 0;
+
+    // Load this thread's Q slice into registers (from SMEM)
+    shl.b32     %r13, %r0, 3;
+    add.u32     %r16, %r7, SMEM_Q_C;
+    add.u32     %r16, %r16, %r13;
+    ld.shared.v2.b32 {%r14, %r15}, [%r16];
+    mov.b32     {%h0, %h1}, %r14;
+    mov.b32     {%h2, %h3}, %r15;
+    CVT_BF16_F32(%f1, %h0)
+    CVT_BF16_F32(%f2, %h1)
+    CVT_BF16_F32(%f3, %h2)
+    CVT_BF16_F32(%f4, %h3)
+
+    @%p1 shl.b32 %r13, %r0, 1;
+    @%p1 add.u32 %r16, %r7, SMEM_Q_R;
+    @%p1 add.u32 %r16, %r16, %r13;
+    @%p1 ld.shared.b16 %h0, [%r16];
+    mov.f32     %f5, 0f00000000;
+    @%p1 CVT_BF16_F32(%f5, %h0)
+
+    // Online softmax
+    mov.f32     %f10, 0.0;  mov.f32 %f11, 0.0;  mov.f32 %f12, 0.0;  mov.f32 %f13, 0.0;
+    mov.b32     %f6, 0xff800000;
+    mov.f32     %f7, 0.0;
+
+    // --------------------------------------------------------------
+    // Chunk loop
+    //
+    // Each thread's 4 dims live in HALF = t / 8 at byte_in_half = (t % 8) * 8.
+    // For each chunk position s_local: SMEM_c_kv_addr = KV_C_BASE + HALF*1024
+    //                                                 + s_local * 128 + byte_in_half
+    // --------------------------------------------------------------
+    shr.b32     %r30, %r0, 3;                  // half = t / 8 (0..15? No — 128/8 = 16)
+    // wait — 128 threads / 8 = 16 halves. But we only have 8 halves in SMEM (0..7).
+    // So we need t / 16 for half, not t / 8. Let me recompute:
+    //   Each half holds 64 cols × 8 rows. We distribute 128 threads across 8 halves ×
+    //   16 threads/half. Each thread handles 4 BF16 = 8 bytes.
+    //   Thread t: half = t / 16, byte_in_half = (t % 16) * 8.
+    //   Dim covered: half * 64 + (t % 16) * 4 .. (t % 16) * 4 + 3.
+    shr.b32     %r30, %r0, 4;                  // half = t / 16
+    and.b32     %r31, %r0, 15;                 // in_half = t % 16
+    shl.b32     %r32, %r30, 10;                // half * 1024 (SMEM offset for this half)
+    shl.b32     %r33, %r31, 3;                 // in_half * 8 (byte within-half per row)
+
+    mov.u32     %r40, 0;                        // chunk_idx
+    mov.u32     %r41, 0;                        // kv0 phase
+    mov.u32     %r42, 0;                        // kv1 phase
+chunk_loop:
+    mul.lo.u32  %r43, %r40, KV_CHUNK;
+    setp.ge.u32 %p5, %r43, %r4;
+    @%p5 bra    chunk_done;
+
+    and.b32     %r44, %r40, 1;
+    setp.eq.u32 %p6, %r44, 0;
+    selp.b32    %r45, SMEM_KV0_C, SMEM_KV1_C, %p6;
+    selp.b32    %r46, SMEM_KV0_R, SMEM_KV1_R, %p6;
+    selp.b32    %r47, SMEM_MBAR_KV0, SMEM_MBAR_KV1, %p6;
+    selp.b32    %r48, %r41, %r42, %p6;
+
+    add.u32     %r49, %r7, %r47;
+wait_kv:
+    mbarrier.try_wait.parity.shared.b64 %p7, [%r49], %r48;
+    @!%p7 bra wait_kv;
+
+    sub.u32     %r50, %r4, %r43;
+    min.u32     %r50, %r50, KV_CHUNK;
+
+    add.u32     %r51, %r7, %r45;              // c_kv buf base
+    add.u32     %r52, %r7, %r46;              // k_rope buf base
+
+    mov.u32     %r53, 0;                        // local position
+inner_s:
+    setp.ge.u32 %p8, %r53, %r50;
+    @%p8 bra    inner_done;
+
+    // c_kv[local_s, thread's 4 dims] in SMEM at:
+    //   c_kv_base + half*1024 + local_s*128 + in_half*8
+    shl.b32     %r54, %r53, 7;                 // local_s * 128
+    add.u32     %r55, %r51, %r32;              // c_kv_base + half*1024
+    add.u32     %r55, %r55, %r54;              // + local_s*128
+    add.u32     %r55, %r55, %r33;              // + in_half*8
+    ld.shared.v2.b32 {%r14, %r15}, [%r55];
+    mov.b32     {%h0, %h1}, %r14;
+    mov.b32     {%h2, %h3}, %r15;
+    .reg .f32 _c0, _c1, _c2, _c3;
+    CVT_BF16_F32(_c0, %h0)
+    CVT_BF16_F32(_c1, %h1)
+    CVT_BF16_F32(_c2, %h2)
+    CVT_BF16_F32(_c3, %h3)
+
+    mul.f32     %f20, %f1, _c0;
+    fma.rn.f32  %f20, %f2, _c1, %f20;
+    fma.rn.f32  %f20, %f3, _c2, %f20;
+    fma.rn.f32  %f20, %f4, _c3, %f20;
+
+    // k_rope: 1 bf16 per thread, only threads 0..63 (which map to dim 0..63)
+    // Half for k_rope is SMEM_KV*_R; layout: 8 rows × 128 bytes
+    //   k_rope[local_s, t] at KV_R_BASE + local_s * 128 + t * 2
+    mul.lo.u32  %r56, %r53, 128;
+    add.u32     %r57, %r52, %r56;
+    shl.b32     %r58, %r0, 1;
+    add.u32     %r57, %r57, %r58;
+    mov.f32     %f21, 0f00000000;
+    @%p1 ld.shared.b16 %h0, [%r57];
+    @%p1 CVT_BF16_F32(%f21, %h0)
+    fma.rn.f32  %f20, %f5, %f21, %f20;
+
+    // Block reduce
+    shfl.sync.bfly.b32  %f22|%p7, %f20, 0x10, 0x1f, 0xffffffff;
+    add.f32     %f20, %f20, %f22;
+    shfl.sync.bfly.b32  %f22|%p7, %f20, 0x08, 0x1f, 0xffffffff;
+    add.f32     %f20, %f20, %f22;
+    shfl.sync.bfly.b32  %f22|%p7, %f20, 0x04, 0x1f, 0xffffffff;
+    add.f32     %f20, %f20, %f22;
+    shfl.sync.bfly.b32  %f22|%p7, %f20, 0x02, 0x1f, 0xffffffff;
+    add.f32     %f20, %f20, %f22;
+    shfl.sync.bfly.b32  %f22|%p7, %f20, 0x01, 0x1f, 0xffffffff;
+    add.f32     %f20, %f20, %f22;
+
+    setp.eq.u32 %p9, %r6, 0;
+    shl.b32     %r59, %r5, 2;
+    mov.u32     %r60, smem_mla_tma_warp_sum;
+    add.u32     %r60, %r60, %r59;
+    @%p9 st.shared.f32 [%r60], %f20;
+    bar.sync 0;
+
+    setp.lt.u32 %p8, %r0, NUM_WARPS;
+    mov.f32     %f23, 0f00000000;
+    @%p8 shl.b32 %r59, %r0, 2;
+    @%p8 mov.u32 %r60, smem_mla_tma_warp_sum;
+    @%p8 add.u32 %r60, %r60, %r59;
+    @%p8 ld.shared.f32 %f23, [%r60];
+    shfl.sync.bfly.b32  %f24|%p7, %f23, 0x02, 0x1f, 0xffffffff;
+    add.f32     %f23, %f23, %f24;
+    shfl.sync.bfly.b32  %f24|%p7, %f23, 0x01, 0x1f, 0xffffffff;
+    add.f32     %f23, %f23, %f24;
+
+    setp.eq.u32 %p9, %r0, 0;
+    mul.f32     %f23, %f23, %f0;
+    mov.u32     %r60, smem_mla_tma_score;
+    @%p9 st.shared.f32 [%r60], %f23;
+    bar.sync 0;
+    ld.shared.f32 %f25, [smem_mla_tma_score];
+
+    max.f32     %f30, %f6, %f25;
+    sub.f32     %f31, %f6, %f30;
+    mul.f32     %f31, %f31, LOG2E;
+    ex2.approx.ftz.f32 %f31, %f31;
+    sub.f32     %f32, %f25, %f30;
+    mul.f32     %f32, %f32, LOG2E;
+    ex2.approx.ftz.f32 %f32, %f32;
+    mov.f32     %f6, %f30;
+    mul.f32     %f7, %f7, %f31;
+    add.f32     %f7, %f7, %f32;
+
+    mul.f32     %f10, %f10, %f31;  fma.rn.f32 %f10, %f32, _c0, %f10;
+    mul.f32     %f11, %f11, %f31;  fma.rn.f32 %f11, %f32, _c1, %f11;
+    mul.f32     %f12, %f12, %f31;  fma.rn.f32 %f12, %f32, _c2, %f12;
+    mul.f32     %f13, %f13, %f31;  fma.rn.f32 %f13, %f32, _c3, %f13;
+
+    add.u32     %r53, %r53, 1;
+    bra         inner_s;
+inner_done:
+
+    @%p6 xor.b32 %r41, %r41, 1;
+    @!%p6 xor.b32 %r42, %r42, 1;
+
+    // Prefetch chunk+2
+    add.u32     %r61, %r40, 2;
+    mul.lo.u32  %r62, %r61, KV_CHUNK;
+    setp.lt.u32 %p2, %r62, %r4;
+    and.pred    %p3, %p2, %p0;
+    add.u32     %r63, %r20, %r62;
+
+    @%p3 mbarrier.arrive.expect_tx.shared.b64 _, [%r49], (KV_CHUNK * (D_C + D_R) * 2);
+    mov.u32     %r21, 0;
+pref_loop:
+    setp.ge.u32 %p4, %r21, 8;
+    @%p4 bra    pref_done;
+    shl.b32     %r22, %r21, 6;
+    shl.b32     %r23, %r21, 10;
+    add.u32     %r24, %r7, %r45;
+    add.u32     %r24, %r24, %r23;
+    @%p3 cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
+        [%r24], [%rd2, {%r22, %r63}], [%r49];
+    add.u32     %r21, %r21, 1;
+    bra         pref_loop;
+pref_done:
+    mov.u32     %r22, 0;
+    add.u32     %r24, %r7, %r46;
+    @%p3 cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
+        [%r24], [%rd3, {%r22, %r63}], [%r49];
+
+    add.u32     %r40, %r40, 1;
+    bra         chunk_loop;
+chunk_done:
+
+    setp.eq.f32 %p9, %f7, 0f00000000;
+    @%p9 mov.f32 %f7, 0f3f800000;
+    rcp.approx.f32 %f31, %f7;
+    mul.f32 %f10, %f10, %f31;  mul.f32 %f11, %f11, %f31;
+    mul.f32 %f12, %f12, %f31;  mul.f32 %f13, %f13, %f31;
+
+    // Store O[b, h, thread's 4 dims]
+    // dim_global = half * 64 + in_half * 4 = (%r30 * 64) + (%r31 * 4)
+    shl.b32     %r56, %r30, 6;
+    shl.b32     %r57, %r31, 2;
+    add.u32     %r56, %r56, %r57;               // dim_start
+    mul.lo.u32  %r58, %r10, D_C;
+    add.u32     %r58, %r58, %r56;
+    mul.wide.u32 %rd10, %r58, 2;
+    add.u64     %rd11, %rd4, %rd10;
+    cvt.rn.bf16.f32 %h0, %f10;
+    cvt.rn.bf16.f32 %h1, %f11;
+    mov.b32     %r14, {%h0, %h1};
+    cvt.rn.bf16.f32 %h0, %f12;
+    cvt.rn.bf16.f32 %h1, %f13;
+    mov.b32     %r15, {%h0, %h1};
+    st.global.v2.b32 [%rd11], {%r14, %r15};
+
+    ret;
+}

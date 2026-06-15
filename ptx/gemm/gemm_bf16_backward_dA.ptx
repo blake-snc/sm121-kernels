@@ -1,0 +1,118 @@
+// gemm_bf16_backward_dA.ptx
+//
+// Computes dA[M, K] = dC[M, N] @ B^T[N, K] for the backward of C = A @ B.
+//
+// Layout (all row-major):
+//   dC: [M, N] BF16 (input)
+//   B:  [K, N] BF16 (input — same B from forward)
+//   dA: [M, K] BF16 (output)
+//
+// Mathematically:
+//   dA[m, k] = sum_n(dC[m, n] * B[k, n])
+//
+// Scalar correctness-first implementation. One thread per (m, k) output
+// element. Inner loop over N. Accumulates in f32, casts to bf16.
+//
+// Grid:  (ceil(M/BM), ceil(K/BK), 1)
+// Block: (BM * BK, 1, 1) — flat thread layout, each thread maps to one
+//                          output element in the (BM × BK) tile.
+//
+// MVP: BM = 8, BK = 32 → 256 threads/block.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+#define BM 8
+#define BK 32
+
+.visible .entry gemm_bf16_backward_dA(
+    .param .u64 param_dC,
+    .param .u64 param_B,
+    .param .u64 param_dA,
+    .param .u32 param_M,
+    .param .u32 param_N,
+    .param .u32 param_K
+)
+{
+    .reg .b32  %r<24>;
+    .reg .b64  %rd<16>;
+    .reg .f32  %f<8>;
+    .reg .b16  %h<4>;
+    .reg .pred %p<4>;
+
+    mov.u32         %r0, %ctaid.x;
+    mov.u32         %r1, %ctaid.y;
+    mov.u32         %r2, %tid.x;
+
+    // Map thread to (local_m, local_k) within the BM×BK tile.
+    // local_m = tid / BK, local_k = tid % BK
+    div.u32         %r3, %r2, BK;          // local_m
+    rem.u32         %r4, %r2, BK;          // local_k
+
+    // Global m, k
+    mul.lo.u32      %r5, %r0, BM;
+    add.u32         %r5, %r5, %r3;          // m
+    mul.lo.u32      %r6, %r1, BK;
+    add.u32         %r6, %r6, %r4;          // k
+
+    ld.param.u32    %r7, [param_M];
+    ld.param.u32    %r8, [param_N];
+    ld.param.u32    %r9, [param_K];
+
+    setp.ge.u32     %p0, %r5, %r7;
+    @%p0 bra        done;
+    setp.ge.u32     %p1, %r6, %r9;
+    @%p1 bra        done;
+
+    ld.param.u64    %rd0, [param_dC];
+    ld.param.u64    %rd1, [param_B];
+    ld.param.u64    %rd2, [param_dA];
+
+    // dC row base: &dC[m, 0] = dC + m*N*2
+    mul.lo.u32      %r10, %r5, %r8;
+    mul.wide.u32    %rd3, %r10, 2;
+    add.u64         %rd4, %rd0, %rd3;
+
+    // B row base: &B[k, 0] = B + k*N*2
+    mul.lo.u32      %r11, %r6, %r8;
+    mul.wide.u32    %rd5, %r11, 2;
+    add.u64         %rd6, %rd1, %rd5;
+
+    // Accumulate sum_n(dC[m, n] * B[k, n])
+    mov.f32         %f0, 0.0;
+    mov.u32         %r12, 0;                // n
+
+n_loop:
+    setp.ge.u32     %p2, %r12, %r8;
+    @%p2 bra        n_done;
+
+    mul.wide.u32    %rd7, %r12, 2;
+    add.u64         %rd8, %rd4, %rd7;       // &dC[m, n]
+    add.u64         %rd9, %rd6, %rd7;       // &B[k, n]
+
+    ld.global.b16   %h0, [%rd8];
+    CVT_BF16_F32(%f1, %h0)                  // dC[m, n]
+    ld.global.b16   %h1, [%rd9];
+    CVT_BF16_F32(%f2, %h1)                  // B[k, n]
+
+    fma.rn.f32      %f0, %f1, %f2, %f0;
+
+    add.u32         %r12, %r12, 1;
+    bra             n_loop;
+
+n_done:
+    // dA[m, k] = sum
+    mul.lo.u32      %r13, %r5, %r9;         // m * K
+    add.u32         %r13, %r13, %r6;        // + k
+    mul.wide.u32    %rd10, %r13, 2;
+    add.u64         %rd11, %rd2, %rd10;
+    CVT_F32_BF16(%h2, %f0)
+    st.global.b16   [%rd11], %h2;
+
+done:
+    ret;
+}

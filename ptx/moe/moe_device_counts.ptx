@@ -1,0 +1,64 @@
+// moe_device_counts.ptx
+//
+// Multi-node expert-parallel primitive: given expert_ids and experts_per_node,
+// compute per-destination-device token counts for NCCL alltoall sizing.
+//
+//   for each entry i in [0, total_entries):
+//     dev = expert_ids[i] / experts_per_node
+//     atomicAdd(device_counts[dev], 1)
+//
+// Inputs:
+//   expert_ids         : [total_entries] u32
+//   total_entries      : u32
+//   experts_per_node   : u32
+//   num_devices        : u32
+// Outputs:
+//   device_counts      : [num_devices] u32  (caller zero-initializes)
+//
+// Grid: (ceil(total_entries / 256), 1, 1). Block: (256, 1, 1).
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+
+.visible .entry moe_device_counts(
+    .param .u64 param_expert_ids,
+    .param .u64 param_device_counts,
+    .param .u32 param_total_entries,
+    .param .u32 param_experts_per_node
+)
+{
+    .reg .b32  %r<16>;
+    .reg .b64  %rd<8>;
+    .reg .pred %p<4>;
+
+    mov.u32      %r0, %tid.x;
+    mov.u32      %r1, %ctaid.x;
+    mov.u32      %r2, %ntid.x;
+    mad.lo.u32   %r3, %r1, %r2, %r0;            // global thread idx = entry idx
+
+    ld.param.u32 %r4, [param_total_entries];
+    ld.param.u32 %r5, [param_experts_per_node];
+    setp.ge.u32  %p0, %r3, %r4;
+    @%p0 ret;
+
+    ld.param.u64 %rd0, [param_expert_ids];
+    ld.param.u64 %rd1, [param_device_counts];
+
+    // Load expert_id for this entry
+    mul.wide.u32 %rd2, %r3, 4;
+    add.u64      %rd3, %rd0, %rd2;
+    ld.global.u32 %r6, [%rd3];                   // expert_id
+
+    // device = expert_id / experts_per_node
+    div.u32      %r7, %r6, %r5;
+
+    // atomicAdd(device_counts[device], 1)
+    mul.wide.u32 %rd2, %r7, 4;
+    add.u64      %rd4, %rd1, %rd2;
+    atom.global.add.u32 %r8, [%rd4], 1;
+
+    ret;
+}

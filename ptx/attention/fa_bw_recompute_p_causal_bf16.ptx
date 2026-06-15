@@ -1,0 +1,180 @@
+// fa_bw_recompute_p_causal_bf16.ptx
+//
+// Same as fa_bw_recompute_p_bf16 but applies causal masking: when n > m,
+// score = -inf so P[m, n] = 0 after softmax.
+//
+// Equivalent to non-causal kernel with `if (n > m) score = -inf;` between
+// the dot product and the max reduction.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "reduction.ptxh"
+#include "convert.ptxh"
+
+.shared .align 128 .b8 smem[8192];
+
+.visible .entry fa_bw_recompute_p_causal_bf16(
+    .param .u64 param_Q,
+    .param .u64 param_K,
+    .param .u64 param_P,
+    .param .u32 param_S,
+    .param .u32 param_D,
+    .param .f32 param_scale
+)
+{
+    .reg .b32  %r<24>;
+    .reg .b64  %rd<20>;
+    .reg .f32  %f<24>;
+    .reg .b16  %h<4>;
+    .reg .pred %p<8>;
+
+    mov.u32         %r0, %ctaid.x;          // m
+    mov.u32         %r1, %tid.x;
+    mov.u32         %r4, %ntid.x;
+
+    ld.param.u64    %rd0, [param_Q];
+    ld.param.u64    %rd1, [param_K];
+    ld.param.u64    %rd2, [param_P];
+    ld.param.u32    %r2, [param_S];
+    ld.param.u32    %r3, [param_D];
+    ld.param.f32    %f0, [param_scale];
+
+    mul.lo.u32      %r5, %r0, %r3;
+    mul.wide.u32    %rd3, %r5, 2;
+    add.u64         %rd4, %rd0, %rd3;
+    mov.u64         %rd6, smem;
+
+    // Stage 1 + causal mask
+    mov.u32         %r7, %r1;
+scores_loop:
+    setp.ge.u32     %p0, %r7, %r2;
+    @%p0 bra        scores_done;
+
+    mul.lo.u32      %r8, %r7, %r3;
+    mul.wide.u32    %rd7, %r8, 2;
+    add.u64         %rd8, %rd1, %rd7;
+
+    mov.f32         %f10, 0.0;
+    mov.u32         %r9, 0;
+dot_loop:
+    setp.ge.u32     %p1, %r9, %r3;
+    @%p1 bra        dot_done;
+    mul.wide.u32    %rd9, %r9, 2;
+    add.u64         %rd10, %rd4, %rd9;
+    add.u64         %rd11, %rd8, %rd9;
+    ld.global.b16   %h0, [%rd10];
+    CVT_BF16_F32(%f1, %h0)
+    ld.global.b16   %h1, [%rd11];
+    CVT_BF16_F32(%f2, %h1)
+    fma.rn.f32      %f10, %f1, %f2, %f10;
+    add.u32         %r9, %r9, 1;
+    bra             dot_loop;
+dot_done:
+    mul.f32         %f10, %f10, %f0;        // * scale
+
+    // Causal mask: if n > m, set score = -inf
+    setp.gt.u32     %p2, %r7, %r0;
+    @%p2 mov.f32    %f10, 0FFF800000;       // -inf
+
+    mul.wide.u32    %rd12, %r7, 4;
+    add.u64         %rd13, %rd6, %rd12;
+    st.shared.f32   [%rd13], %f10;
+
+    add.u32         %r7, %r7, %r4;
+    bra             scores_loop;
+
+scores_done:
+    bar.sync        0;
+
+    // (Same max + exp + sum + write phases as non-causal)
+    setp.eq.u32     %p2, %r1, 0;
+    @!%p2 bra       skip_max;
+    mov.f32         %f11, 0FFF800000;
+    mov.u32         %r10, 0;
+max_loop:
+    setp.ge.u32     %p3, %r10, %r2;
+    @%p3 bra        max_done;
+    mul.wide.u32    %rd14, %r10, 4;
+    add.u64         %rd15, %rd6, %rd14;
+    ld.shared.f32   %f12, [%rd15];
+    max.f32         %f11, %f11, %f12;
+    add.u32         %r10, %r10, 1;
+    bra             max_loop;
+max_done:
+    mul.wide.u32    %rd14, %r2, 4;
+    add.u64         %rd15, %rd6, %rd14;
+    st.shared.f32   [%rd15], %f11;
+skip_max:
+    bar.sync        0;
+    mul.wide.u32    %rd14, %r2, 4;
+    add.u64         %rd15, %rd6, %rd14;
+    ld.shared.f32   %f13, [%rd15];
+
+    mov.u32         %r7, %r1;
+exp_loop:
+    setp.ge.u32     %p0, %r7, %r2;
+    @%p0 bra        exp_done;
+    mul.wide.u32    %rd12, %r7, 4;
+    add.u64         %rd13, %rd6, %rd12;
+    ld.shared.f32   %f10, [%rd13];
+    sub.f32         %f10, %f10, %f13;
+    mov.f32         %f14, 0F3FB8AA3B;
+    mul.f32         %f15, %f10, %f14;
+    ex2.approx.ftz.f32 %f16, %f15;
+    st.shared.f32   [%rd13], %f16;
+    add.u32         %r7, %r7, %r4;
+    bra             exp_loop;
+exp_done:
+    bar.sync        0;
+
+    setp.eq.u32     %p2, %r1, 0;
+    @!%p2 bra       skip_sum;
+    mov.f32         %f17, 0.0;
+    mov.u32         %r10, 0;
+sum_loop:
+    setp.ge.u32     %p3, %r10, %r2;
+    @%p3 bra        sum_done;
+    mul.wide.u32    %rd14, %r10, 4;
+    add.u64         %rd15, %rd6, %rd14;
+    ld.shared.f32   %f18, [%rd15];
+    add.f32         %f17, %f17, %f18;
+    add.u32         %r10, %r10, 1;
+    bra             sum_loop;
+sum_done:
+    add.u32         %r10, %r2, 1;
+    mul.wide.u32    %rd14, %r10, 4;
+    add.u64         %rd15, %rd6, %rd14;
+    st.shared.f32   [%rd15], %f17;
+skip_sum:
+    bar.sync        0;
+
+    add.u32         %r10, %r2, 1;
+    mul.wide.u32    %rd14, %r10, 4;
+    add.u64         %rd15, %rd6, %rd14;
+    ld.shared.f32   %f19, [%rd15];
+    rcp.approx.f32  %f20, %f19;
+
+    mul.lo.u32      %r11, %r0, %r2;
+    mul.wide.u32    %rd16, %r11, 2;
+    add.u64         %rd18, %rd2, %rd16;
+
+    mov.u32         %r7, %r1;
+write_loop:
+    setp.ge.u32     %p0, %r7, %r2;
+    @%p0 bra        write_done;
+    mul.wide.u32    %rd12, %r7, 4;
+    add.u64         %rd13, %rd6, %rd12;
+    ld.shared.f32   %f10, [%rd13];
+    mul.f32         %f10, %f10, %f20;
+    mul.wide.u32    %rd14, %r7, 2;
+    add.u64         %rd15, %rd18, %rd14;
+    CVT_F32_BF16(%h2, %f10)
+    st.global.b16   [%rd15], %h2;
+    add.u32         %r7, %r7, %r4;
+    bra             write_loop;
+write_done:
+    ret;
+}

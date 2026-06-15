@@ -1,0 +1,152 @@
+// quant_bf16_to_nvfp4.ptx
+//
+// NVIDIA NVFP4 quantization: FP4 E2M1 values with 16-element blocks and
+// FP8 E4M3 per-block scales. Used by CUTLASS / FlashInfer NVFP4 GEMM on
+// SM121 (356 TFLOPS reference).
+//
+// Operation (per 16-element block):
+//   abs_max   = max(|x[block]|)
+//   scale_f32 = abs_max / FP4_E2M1_MAX                 (FP4 max normal = 6.0)
+//   scale_fp8 = round_to_e4m3(scale_f32)                (stored as E4M3 byte)
+//   dequant_scale = fp8_to_f32(scale_fp8)               (re-decoded actual scale)
+//   out[2i..2i+2] = pack_fp4(round_to_e2m1(x / dequant_scale))
+//   scales[block] = scale_fp8 byte
+//
+// Layout:
+//   x: [num_rows, hidden] bf16 (hidden multiple of 16)
+//   out: [num_rows, hidden/2] u8 (packed FP4)
+//   scales: [num_rows, hidden/16] u8 (FP8 E4M3 scales)
+//
+// Grid: (num_rows, num_blocks, 1). Block: (4, 1, 1) — each lane handles
+// 4 elements = 2 packed FP4 bytes.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "reduction.ptxh"
+#include "convert.ptxh"
+
+#define NVFP4_BLOCK 16
+// FP4 E2M1 max normal = 6.0. inv = 1/6 = 0.166666...
+#define FP4_E2M1_MAX 6.0
+#define FP4_E2M1_MAX_INV 0f3E2AAAAB
+
+.visible .entry quant_bf16_to_nvfp4(
+    .param .u64 param_x,
+    .param .u64 param_out,       // [num_rows, hidden/2] packed FP4
+    .param .u64 param_scales,    // [num_rows, hidden/16] FP8 e4m3 scales
+    .param .u32 param_hidden
+)
+{
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<12>;
+    .reg .b16 %h<8>;
+    .reg .pred %p<4>;
+
+    mov.u32         %r0, BLOCK_ID_X;
+    mov.u32         %r1, BLOCK_ID_Y;
+    mov.u32         %r2, THREAD_ID;            // 0..3
+
+    ld.param.u64    %rd0, [param_x];
+    ld.param.u64    %rd1, [param_out];
+    ld.param.u64    %rd2, [param_scales];
+    ld.param.u32    %r3, [param_hidden];
+
+    mul.lo.u32      %r4, %r0, %r3;
+    shl.b32         %r5, %r1, 4;               // block * 16
+    add.u32         %r4, %r4, %r5;
+    mul.wide.u32    %rd3, %r4, 2;
+    add.u64         %rd4, %rd0, %rd3;
+
+    shr.u32         %r7, %r4, 1;
+    mul.wide.u32    %rd5, %r7, 1;
+    add.u64         %rd6, %rd1, %rd5;
+
+    shl.b32         %r6, %r2, 2;
+
+    mul.wide.u32    %rd7, %r6, 2;
+    add.u64         %rd8, %rd4, %rd7;
+    ld.global.v2.b32 {%r10, %r11}, [%rd8];
+    mov.b32         {%h0, %h1}, %r10;
+    mov.b32         {%h2, %h3}, %r11;
+    CVT_BF16_F32(%f0, %h0)
+    CVT_BF16_F32(%f1, %h1)
+    CVT_BF16_F32(%f2, %h2)
+    CVT_BF16_F32(%f3, %h3)
+
+    abs.f32         %f4, %f0;
+    abs.f32         %f5, %f1;
+    abs.f32         %f6, %f2;
+    abs.f32         %f7, %f3;
+    max.f32         %f8, %f4, %f5;
+    max.f32         %f9, %f6, %f7;
+    max.f32         %f8, %f8, %f9;
+
+    // 4-lane butterfly max (2 rounds)
+    .reg .b32 _sh;
+    shfl.sync.bfly.b32 _sh, %f8, 2, 31, 0xFFFFFFFF;
+    mov.b32         %f9, _sh;
+    max.f32         %f8, %f8, %f9;
+    shfl.sync.bfly.b32 _sh, %f8, 1, 31, 0xFFFFFFFF;
+    mov.b32         %f9, _sh;
+    max.f32         %f8, %f8, %f9;
+
+    // scale = abs_max / 6, then round to FP8 e4m3, then decode back for exact
+    // match at dequant. Clamp scale to non-zero to avoid div-by-0.
+    mul.f32         %f10, %f8, FP4_E2M1_MAX_INV;
+    max.f32         %f10, %f10, 0f3727C5AC;     // > 1e-5
+
+    // Encode scale as FP8 E4M3 (via paired cvt with 0 in high slot)
+    .reg .b16 _scale_pair;
+    CVT_F32X2_E4M3X2(_scale_pair, 0f00000000, %f10)
+    // Low byte = FP8 scale
+    .reg .b8 _scale_b0, _scale_b1;
+    mov.b16         {_scale_b0, _scale_b1}, _scale_pair;
+
+    // Decode the FP8 scale back to FP32 for exact quantization consistency
+    .reg .b32 _pf16x2;
+    cvt.rn.f16x2.e4m3x2 _pf16x2, _scale_pair;
+    .reg .b16 _h_lo, _h_hi;
+    mov.b32         {_h_lo, _h_hi}, _pf16x2;
+    cvt.f32.f16     %f10, _h_lo;               // decoded scale as FP32
+    max.f32         %f10, %f10, 0f3727C5AC;    // guard against subnormal decode
+    rcp.approx.f32  %f11, %f10;                // inv_scale
+
+    // Lane 0 writes the FP8 scale byte
+    setp.eq.u32     %p0, %r2, 0;
+    @%p0 bra        write_scale;
+    bra             quantize;
+
+write_scale:
+    shr.u32         %r20, %r3, 4;              // num_blocks = hidden / 16
+    mul.lo.u32      %r21, %r0, %r20;
+    add.u32         %r21, %r21, %r1;
+    mul.wide.u32    %rd9, %r21, 1;
+    add.u64         %rd10, %rd2, %rd9;
+    st.global.b8    [%rd10], _scale_b0;
+
+quantize:
+    mul.f32         %f4, %f0, %f11;
+    mul.f32         %f5, %f1, %f11;
+    mul.f32         %f6, %f2, %f11;
+    mul.f32         %f7, %f3, %f11;
+
+    .reg .b8 _n0, _n1;
+    CVT_F32X2_E2M1X2(_n0, %f5, %f4)
+    CVT_F32X2_E2M1X2(_n1, %f7, %f6)
+
+    cvt.u16.u8      %h4, _n0;
+    cvt.u16.u8      %h5, _n1;
+    shl.b16         %h5, %h5, 8;
+    or.b16          %h4, %h4, %h5;
+
+    shl.b32         %r15, %r2, 1;
+    mul.wide.u32    %rd11, %r15, 1;
+    add.u64         %rd12, %rd6, %rd11;
+    st.global.b16   [%rd12], %h4;
+
+    ret;
+}

@@ -1,0 +1,88 @@
+// repeat_kv_groups_bf16.ptx
+//
+// Replicate KV heads across query head groups (GQA forward expansion).
+//
+// x: [B, H_kv, S, d] BF16  (input)
+// y: [B, H_q,  S, d] BF16  (output)
+//
+// where H_q = H_kv * group_size, and:
+//   y[b, h_q, s, k] = x[b, h_q / group_size, s, k]
+//
+// Grid: ceil(B*H_q*S*d / 256) blocks of 256 threads.
+// Each thread handles one element of y.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+
+.visible .entry repeat_kv_groups_bf16(
+    .param .u64 param_x,
+    .param .u64 param_y,
+    .param .u32 param_B,
+    .param .u32 param_H_kv,
+    .param .u32 param_H_q,
+    .param .u32 param_S,
+    .param .u32 param_D
+)
+{
+    .reg .b32  %r<24>;
+    .reg .b64  %rd<8>;
+    .reg .b16  %h<2>;
+    .reg .pred %p<2>;
+
+    mov.u32         %r0, %ctaid.x;
+    mov.u32         %r1, %ntid.x;
+    mov.u32         %r2, %tid.x;
+    mad.lo.u32      %r3, %r0, %r1, %r2;     // global tid (linear y index)
+
+    ld.param.u32    %r4, [param_B];
+    ld.param.u32    %r5, [param_H_kv];
+    ld.param.u32    %r6, [param_H_q];
+    ld.param.u32    %r7, [param_S];
+    ld.param.u32    %r8, [param_D];
+
+    // Total y elements = B * H_q * S * D
+    mul.lo.u32      %r9, %r4, %r6;
+    mul.lo.u32      %r9, %r9, %r7;
+    mul.lo.u32      %r9, %r9, %r8;
+
+    setp.ge.u32     %p0, %r3, %r9;
+    @%p0 bra        done;
+
+    // Decompose y idx into (b, h_q, s, k)
+    // idx = ((b * H_q + h_q) * S + s) * D + k
+    rem.u32         %r10, %r3, %r8;          // k
+    div.u32         %r11, %r3, %r8;          // (((b * H_q) + h_q) * S + s)
+    rem.u32         %r12, %r11, %r7;         // s
+    div.u32         %r13, %r11, %r7;         // b * H_q + h_q
+    rem.u32         %r14, %r13, %r6;         // h_q
+    div.u32         %r15, %r13, %r6;         // b
+
+    // group_size = H_q / H_kv → h_kv = h_q / group_size
+    div.u32         %r16, %r6, %r5;          // group_size
+    div.u32         %r17, %r14, %r16;        // h_kv
+
+    // x idx = ((b * H_kv + h_kv) * S + s) * D + k
+    mul.lo.u32      %r18, %r15, %r5;
+    add.u32         %r18, %r18, %r17;
+    mul.lo.u32      %r18, %r18, %r7;
+    add.u32         %r18, %r18, %r12;
+    mul.lo.u32      %r18, %r18, %r8;
+    add.u32         %r18, %r18, %r10;
+
+    ld.param.u64    %rd0, [param_x];
+    ld.param.u64    %rd1, [param_y];
+
+    mul.wide.u32    %rd2, %r18, 2;
+    add.u64         %rd3, %rd0, %rd2;
+    mul.wide.u32    %rd4, %r3, 2;
+    add.u64         %rd5, %rd1, %rd4;
+
+    ld.global.b16   %h0, [%rd3];
+    st.global.b16   [%rd5], %h0;
+
+done:
+    ret;
+}

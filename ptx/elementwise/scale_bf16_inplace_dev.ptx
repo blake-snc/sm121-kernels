@@ -1,0 +1,79 @@
+// scale_bf16_inplace_dev.ptx
+//
+// In-place broadcast multiply by a single BF16 scalar read from a device
+// pointer at launch time. `buf[i] *= *scalar` for i in [0, n).
+//
+// Used by Gemma-4-style models that have a per-layer scalar weight applied
+// to the residual stream after each block. Replaces the dtoh/host-mul/htod
+// roundtrip pattern.
+//
+// Layout:
+//   buf:    [n] bf16, in-place
+//   scalar: 1 element bf16 (device pointer; read once per thread)
+//
+// Vectorized: each thread iteration processes 2 consecutive elements via
+// packed b32 loads/stores. n must be even.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+.visible .entry scale_bf16_inplace_dev(
+    .param .u64 param_buf,      // [n] bf16 in-place
+    .param .u64 param_scalar,   // [1] bf16 device pointer
+    .param .u32 param_n         // total elements (must be even)
+)
+{
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<8>;
+    .reg .f32 %f<8>;
+    .reg .b16 %h<8>;
+    .reg .pred %p<2>;
+
+    mov.u32         %r0, BLOCK_ID_X;
+    mov.u32         %r1, %ntid.x;
+    mov.u32         %r2, THREAD_ID;
+    mad.lo.u32      %r3, %r0, %r1, %r2;
+    mov.u32         %r4, %nctaid.x;
+    mul.lo.u32      %r5, %r4, %r1;
+
+    shl.b32         %r8, %r3, 1;            // i = 2 * tid
+    shl.b32         %r5, %r5, 1;            // stride *= 2
+
+    ld.param.u64    %rd0, [param_buf];
+    ld.param.u64    %rd1, [param_scalar];
+    ld.param.u32    %r6, [param_n];
+
+    // Load scalar once into a register.
+    ld.global.b16   %h0, [%rd1];
+    CVT_BF16_F32(%f0, %h0)
+
+loop:
+    setp.ge.u32     %p0, %r8, %r6;
+    @%p0 bra        done;
+
+    mul.wide.u32    %rd3, %r8, 2;
+    add.u64         %rd4, %rd0, %rd3;
+
+    ld.global.b32   %r10, [%rd4];           // buf[i..i+1]
+    mov.b32         {%h2, %h3}, %r10;
+    CVT_BF16_F32(%f1, %h2)
+    CVT_BF16_F32(%f2, %h3)
+
+    mul.f32         %f3, %f1, %f0;
+    mul.f32         %f4, %f2, %f0;
+
+    CVT_F32_BF16(%h4, %f3)
+    CVT_F32_BF16(%h5, %f4)
+    mov.b32         %r12, {%h4, %h5};
+    st.global.b32   [%rd4], %r12;
+
+    add.u32         %r8, %r8, %r5;
+    bra             loop;
+
+done:
+    ret;
+}

@@ -1,0 +1,108 @@
+// silu_mul_bf16.ptx
+//
+// Fused SiLU activation with multiply: out[i] = silu(gate[i]) * up[i]
+// Input layout: [N, 2*D] where first D elements are gate, second D are up.
+// Output: [N, D]
+//
+// Vectorized: each thread iteration processes 2 consecutive output elements
+// (which live in the same row). Uses packed b32 loads/stores (2× BF16).
+// D must be even.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+.visible .entry silu_mul_bf16(
+    .param .u64 param_input,    // input: [N * 2 * D] bf16 (gate || up)
+    .param .u64 param_out,      // output: [N * D] bf16
+    .param .u32 param_n,        // total number of output elements (N * D)
+    .param .u32 param_d         // D (half of input dim; must be even)
+)
+{
+    .reg .b32 %r<20>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<16>;
+    .reg .b16 %h<8>;
+    .reg .pred %p<4>;
+
+    // Global thread index
+    mov.u32         %r0, BLOCK_ID_X;
+    mov.u32         %r1, %ntid.x;
+    mov.u32         %r2, THREAD_ID;
+    mad.lo.u32      %r3, %r0, %r1, %r2;    // global_idx
+
+    // Total grid stride
+    mov.u32         %r4, %nctaid.x;
+    mul.lo.u32      %r5, %r4, %r1;          // grid_stride (threads)
+
+    // Each thread iteration consumes 2 output elements at positions i, i+1.
+    // Start: i = 2 * global_idx
+    // Stride: 2 * grid_stride
+    shl.b32         %r8, %r3, 1;            // i = 2 * global_idx
+    shl.b32         %r5, %r5, 1;            // stride *= 2
+
+    // Load params
+    ld.param.u64    %rd0, [param_input];
+    ld.param.u64    %rd1, [param_out];
+    ld.param.u32    %r6, [param_n];          // total elements (N * D)
+    ld.param.u32    %r7, [param_d];          // D
+
+loop:
+    setp.ge.u32     %p0, %r8, %r6;
+    @%p0 bra        done;
+
+    // Compute row and col: row = i / D, col = i % D.
+    // Since i is even and stride is even, col stays even; i+1 is in same row.
+    div.u32         %r9, %r8, %r7;          // row
+    rem.u32         %r10, %r8, %r7;         // col (even)
+
+    // gate offset: row * 2 * D + col (in elements)
+    mul.lo.u32      %r11, %r9, %r7;
+    shl.b32         %r11, %r11, 1;          // row * 2 * D
+    add.u32         %r12, %r11, %r10;       // gate_idx = row * 2D + col
+
+    // up offset: row * 2 * D + D + col
+    add.u32         %r13, %r12, %r7;        // up_idx = gate_idx + D
+
+    // Load gate[i..i+1] as packed b32 (2× BF16)
+    mul.wide.u32    %rd2, %r12, 2;
+    add.u64         %rd3, %rd0, %rd2;
+    ld.global.b32   %r14, [%rd3];
+    mov.b32         {%h0, %h1}, %r14;       // h0 = gate[i], h1 = gate[i+1]
+    CVT_BF16_F32(%f0, %h0)
+    CVT_BF16_F32(%f1, %h1)
+
+    // Load up[i..i+1] as packed b32
+    mul.wide.u32    %rd4, %r13, 2;
+    add.u64         %rd5, %rd0, %rd4;
+    ld.global.b32   %r15, [%rd5];
+    mov.b32         {%h2, %h3}, %r15;       // h2 = up[i], h3 = up[i+1]
+    CVT_BF16_F32(%f2, %h2)
+    CVT_BF16_F32(%f3, %h3)
+
+    // silu(gate) = gate * sigmoid(gate)  (two independent operands)
+    SILU_F32(%f4, %f0, %f8, %f9)
+    SILU_F32(%f5, %f1, %f10, %f11)
+
+    // out = silu(gate) * up
+    mul.f32         %f6, %f4, %f2;
+    mul.f32         %f7, %f5, %f3;
+
+    // Store as packed b32
+    CVT_F32_BF16(%h4, %f6)
+    CVT_F32_BF16(%h5, %f7)
+    mov.b32         %r16, {%h4, %h5};
+    mul.wide.u32    %rd6, %r8, 2;
+    add.u64         %rd7, %rd1, %rd6;
+    st.global.b32   [%rd7], %r16;
+
+    // i += stride
+    add.u32         %r8, %r8, %r5;
+    bra             loop;
+
+done:
+    ret;
+}

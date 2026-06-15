@@ -1,0 +1,111 @@
+// attn_output_gate_backward_bf16.ptx
+//
+// Backward for `attn_output_gate` (GDN-hybrid / GDN-hybrid hybrid attention layer).
+//
+// Forward:                 out = attn_out * sigmoid(gate)
+// Backward:
+//   s    = sigmoid(gate)
+//   da   = dy * s
+//   dg   = dy * attn_out * s * (1 - s)
+//
+// Both gradients are computed in one fused kernel.
+//
+// Layouts:
+//   attn_out:    [N_tokens, D] BF16  — original pre-gate values (must be
+//                                       saved during forward; this kernel
+//                                       does NOT recompute attn_out from the
+//                                       gated output because sigmoid(g)
+//                                       can be near-zero and divide blows up)
+//   gate_logits: [N_tokens, D] BF16  — pre-sigmoid gate
+//   dy:          [N_tokens, D] BF16  — upstream gradient
+//   da:          [N_tokens, D] BF16  — output: grad wrt attn_out
+//   dg:          [N_tokens, D] BF16  — output: grad wrt gate_logits
+//
+// Grid: (N_tokens, 1, 1). Block: (128, 1, 1). Each thread strides by 128 across D.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+.visible .entry attn_output_gate_backward_bf16(
+    .param .u64 param_attn_out,
+    .param .u64 param_gate_logits,
+    .param .u64 param_dy,
+    .param .u64 param_da,
+    .param .u64 param_dg,
+    .param .u32 param_hidden_dim
+)
+{
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<16>;
+    .reg .b16 %h<8>;
+    .reg .pred %p<4>;
+
+    mov.u32     %r0, %tid.x;
+    mov.u32     %r1, %ctaid.x;          // token id
+    ld.param.u64 %rd0, [param_attn_out];
+    ld.param.u64 %rd1, [param_gate_logits];
+    ld.param.u64 %rd2, [param_dy];
+    ld.param.u64 %rd3, [param_da];
+    ld.param.u64 %rd4, [param_dg];
+    ld.param.u32 %r2, [param_hidden_dim];
+
+    // Token base pointer
+    mul.lo.u32   %r3, %r1, %r2;
+    mul.wide.u32 %rd5, %r3, 2;
+    add.u64      %rd6,  %rd0, %rd5;     // &attn_out[token, 0]
+    add.u64      %rd7,  %rd1, %rd5;     // &gate_logits[token, 0]
+    add.u64      %rd8,  %rd2, %rd5;     // &dy[token, 0]
+    add.u64      %rd9,  %rd3, %rd5;     // &da[token, 0]
+    add.u64      %rd10, %rd4, %rd5;     // &dg[token, 0]
+
+    mov.u32     %r4, %r0;                // starting dim index
+loop_dim:
+    setp.ge.u32 %p1, %r4, %r2;
+    @%p1 bra    done;
+
+    mul.wide.u32 %rd11, %r4, 2;
+    .reg .b64 _ad, _gd, _yd, _dad, _dgd;
+    add.u64     _ad,  %rd6,  %rd11;
+    add.u64     _gd,  %rd7,  %rd11;
+    add.u64     _yd,  %rd8,  %rd11;
+    add.u64     _dad, %rd9,  %rd11;
+    add.u64     _dgd, %rd10, %rd11;
+
+    // Load attn_out, gate_logits, dy
+    ld.global.b16 %h0, [_ad];
+    ld.global.b16 %h1, [_gd];
+    ld.global.b16 %h2, [_yd];
+    CVT_BF16_F32(%f0, %h0)               // a
+    CVT_BF16_F32(%f1, %h1)               // g
+    CVT_BF16_F32(%f2, %h2)               // dy
+
+    // s = sigmoid(g) = 1 / (1 + exp(-g))
+    neg.f32     %f3, %f1;
+    mul.f32     %f3, %f3, LOG2E;
+    ex2.approx.ftz.f32 %f3, %f3;
+    add.f32     %f3, %f3, 1.0;
+    rcp.approx.f32 %f3, %f3;             // s
+
+    // da = dy * s
+    mul.f32     %f4, %f2, %f3;
+    cvt.rn.bf16.f32 %h3, %f4;
+    st.global.b16 [_dad], %h3;
+
+    // dg = dy * a * s * (1 - s)
+    sub.f32     %f5, 1.0, %f3;           // 1 - s
+    mul.f32     %f6, %f3, %f5;           // s * (1 - s)
+    mul.f32     %f7, %f2, %f0;           // dy * a
+    mul.f32     %f7, %f7, %f6;           // dy * a * s * (1 - s)
+    cvt.rn.bf16.f32 %h4, %f7;
+    st.global.b16 [_dgd], %h4;
+
+    add.u32     %r4, %r4, 128;
+    bra         loop_dim;
+done:
+    ret;
+}

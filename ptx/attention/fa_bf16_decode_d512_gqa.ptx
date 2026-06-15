@@ -1,0 +1,233 @@
+// fa_bf16_decode_d512_gqa.ptx
+//
+// BF16 GQA flash-attention DECODE kernel (Sq=1) for d=512.
+// Used by Gemma-4 full-attention layers (head_dim=512, no sliding window).
+//
+// Same online-softmax algorithm as d=128/d=256 variants; this kernel just
+// scales the per-d-slot mapping to 512 threads/block (16 warps).
+//
+// Layout:
+//   Q       : [B, H, D=512]                     BF16
+//   K       : [B, num_kv_heads, kv_stride, 512] BF16 (KV cache)
+//   V       : [B, num_kv_heads, kv_stride, 512] BF16
+//   O       : [B, H, 512]                       BF16
+//
+// GQA mapping: kv_head = q_head / (num_q_heads / num_kv_heads).
+//
+// Grid: (num_q_heads, batch_size). Block: (512, 1, 1) — 16 warps.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+#define D 512
+#define NWARPS 16
+
+// SMEM: 16 warp partials × 4 bytes = 64 bytes for reduction, plus 4 bytes for
+// the broadcast score. 1 KB total leaves headroom for any future additions.
+.shared .align 128 .b8 smem_d512_decode[1024];
+
+#define OFF_SCORE   0
+#define OFF_RED     64
+
+.visible .entry fa_bf16_decode_d512_gqa(
+    .param .u64 param_Q,
+    .param .u64 param_K,
+    .param .u64 param_V,
+    .param .u64 param_O,
+    .param .u32 param_num_heads,        // num_q_heads
+    .param .u32 param_num_kv_heads,
+    .param .u32 param_seq_kv,
+    .param .u32 param_kv_stride,        // max_seq (cache stride per kv_head)
+    .param .f32 param_scale
+)
+{
+    .reg .b32  %r<70>;
+    .reg .b64  %rd<24>;
+    .reg .f32  %f<32>;
+    .reg .b16  %h<8>;
+    .reg .pred %p<8>;
+
+    mov.u32      %r0, %tid.x;                 // d (0..511)
+    mov.u32      %r1, %ctaid.x;               // q_head
+    mov.u32      %r2, %ctaid.y;               // batch
+    shr.b32      %r3, %r0, 5;                 // warp_id (0..15)
+    and.b32      %r4, %r0, 31;                // lane (0..31)
+
+    ld.param.u64 %rd0, [param_Q];
+    ld.param.u64 %rd1, [param_K];
+    ld.param.u64 %rd2, [param_V];
+    ld.param.u64 %rd3, [param_O];
+    ld.param.u32 %r10, [param_num_heads];
+    ld.param.u32 %r50, [param_num_kv_heads];
+    ld.param.u32 %r11, [param_seq_kv];
+    ld.param.u32 %r53, [param_kv_stride];
+    ld.param.f32 %f20, [param_scale];
+
+    // GQA: kv_head = q_head / (num_q_heads / num_kv_heads)
+    div.u32      %r51, %r10, %r50;
+    div.u32      %r52, %r1, %r51;
+
+    // Q/O base: batch * num_q_heads * D + q_head * D, in BF16 elements.
+    mul.lo.u32   %r12, %r2, %r10;
+    mul.lo.u32   %r12, %r12, D;
+    mul.lo.u32   %r13, %r1, D;
+    add.u32      %r12, %r12, %r13;
+    mul.wide.u32 %rd4, %r12, 2;
+    add.u64      %rd4, %rd0, %rd4;            // &Q[batch, q_head, 0]
+    mul.wide.u32 %rd6, %r12, 2;
+    add.u64      %rd6, %rd3, %rd6;            // &O[batch, q_head, 0]
+
+    // KV base = batch * num_kv_heads * kv_stride * D + kv_head * kv_stride * D
+    mul.lo.u32   %r14, %r50, %r53;
+    mul.lo.u32   %r14, %r14, D;
+    mul.lo.u32   %r15, %r2, %r14;
+    mul.lo.u32   %r16, %r53, D;
+    mul.lo.u32   %r17, %r52, %r16;
+    add.u32      %r15, %r15, %r17;
+    mul.wide.u32 %rd5, %r15, 2;
+    add.u64      %rd16, %rd1, %rd5;
+    add.u64      %rd17, %rd2, %rd5;
+
+    // Load Q[d] into register %f0
+    shl.b32      %r20, %r0, 1;
+    cvt.u64.u32  %rd7, %r20;
+    add.u64      %rd7, %rd4, %rd7;
+    ld.global.b16 %h0, [%rd7];
+    CVT_BF16_F32(%f0, %h0)
+
+    mov.u32      %r21, smem_d512_decode;
+
+    mov.f32      %f25, 0fFF800000;            // m_i = -inf
+    mov.f32      %f26, 0.0;                   // l_i = 0
+    mov.f32      %f27, 0.0;                   // O_acc[d] = 0
+
+    bar.sync 0;
+
+    mov.u32      %r30, 0;
+kv_loop:
+    setp.ge.u32  %p0, %r30, %r11;
+    @%p0 bra     kv_done;
+
+    // K[k, d] BF16
+    mul.lo.u32   %r31, %r30, D;
+    add.u32      %r31, %r31, %r0;
+    shl.b32      %r31, %r31, 1;
+    cvt.u64.u32  %rd8, %r31;
+    add.u64      %rd9, %rd16, %rd8;
+    ld.global.b16 %h1, [%rd9];
+
+    .reg .f32 _kv;
+    CVT_BF16_F32(_kv, %h1)
+
+    .reg .f32 _qk;
+    mul.f32      _qk, %f0, _kv;
+
+    // Warp reduction
+    .reg .f32 _t;
+    shfl.sync.bfly.b32 _t|%p1, _qk, 0x10, 0x1f, 0xffffffff; add.f32 _qk, _qk, _t;
+    shfl.sync.bfly.b32 _t|%p1, _qk, 0x08, 0x1f, 0xffffffff; add.f32 _qk, _qk, _t;
+    shfl.sync.bfly.b32 _t|%p1, _qk, 0x04, 0x1f, 0xffffffff; add.f32 _qk, _qk, _t;
+    shfl.sync.bfly.b32 _t|%p1, _qk, 0x02, 0x1f, 0xffffffff; add.f32 _qk, _qk, _t;
+    shfl.sync.bfly.b32 _t|%p1, _qk, 0x01, 0x1f, 0xffffffff; add.f32 _qk, _qk, _t;
+
+    // Lane 0 of each warp writes to SMEM_RED[warp_id]
+    add.u32      %r33, %r21, OFF_RED;
+    setp.eq.u32  %p2, %r4, 0;
+    shl.b32      %r34, %r3, 2;
+    add.u32      %r35, %r33, %r34;
+    @%p2 st.shared.f32 [%r35], _qk;
+
+    bar.sync 0;
+
+    // Thread 0 sums 16 warp partials, scales, broadcasts
+    setp.ne.u32  %p2, %r0, 0;
+    @%p2 bra     score_ready;
+    .reg .f32 _w0, _w1, _w2, _w3, _w4, _w5, _w6, _w7, _w8, _w9;
+    .reg .f32 _w10, _w11, _w12, _w13, _w14, _w15, _sum;
+    ld.shared.f32 _w0,  [%r33];
+    ld.shared.f32 _w1,  [%r33 + 4];
+    ld.shared.f32 _w2,  [%r33 + 8];
+    ld.shared.f32 _w3,  [%r33 + 12];
+    ld.shared.f32 _w4,  [%r33 + 16];
+    ld.shared.f32 _w5,  [%r33 + 20];
+    ld.shared.f32 _w6,  [%r33 + 24];
+    ld.shared.f32 _w7,  [%r33 + 28];
+    ld.shared.f32 _w8,  [%r33 + 32];
+    ld.shared.f32 _w9,  [%r33 + 36];
+    ld.shared.f32 _w10, [%r33 + 40];
+    ld.shared.f32 _w11, [%r33 + 44];
+    ld.shared.f32 _w12, [%r33 + 48];
+    ld.shared.f32 _w13, [%r33 + 52];
+    ld.shared.f32 _w14, [%r33 + 56];
+    ld.shared.f32 _w15, [%r33 + 60];
+    add.f32      _sum, _w0, _w1;
+    add.f32      _sum, _sum, _w2;
+    add.f32      _sum, _sum, _w3;
+    add.f32      _sum, _sum, _w4;
+    add.f32      _sum, _sum, _w5;
+    add.f32      _sum, _sum, _w6;
+    add.f32      _sum, _sum, _w7;
+    add.f32      _sum, _sum, _w8;
+    add.f32      _sum, _sum, _w9;
+    add.f32      _sum, _sum, _w10;
+    add.f32      _sum, _sum, _w11;
+    add.f32      _sum, _sum, _w12;
+    add.f32      _sum, _sum, _w13;
+    add.f32      _sum, _sum, _w14;
+    add.f32      _sum, _sum, _w15;
+    mul.f32      _sum, _sum, %f20;            // * scale
+    add.u32      %r36, %r21, OFF_SCORE;
+    st.shared.f32 [%r36], _sum;
+score_ready:
+
+    bar.sync 0;
+
+    .reg .f32 _score;
+    add.u32      %r36, %r21, OFF_SCORE;
+    ld.shared.f32 _score, [%r36];
+
+    // Online softmax update
+    .reg .f32 _m_new, _alpha, _p;
+    max.f32      _m_new, %f25, _score;
+    sub.f32      _alpha, %f25, _m_new;
+    ex2.approx.f32 _alpha, _alpha;
+    sub.f32      _p, _score, _m_new;
+    ex2.approx.f32 _p, _p;
+
+    fma.rn.f32   %f26, %f26, _alpha, _p;
+    mul.f32      %f27, %f27, _alpha;
+
+    // V[k, d]
+    mul.lo.u32   %r31, %r30, D;
+    add.u32      %r31, %r31, %r0;
+    shl.b32      %r31, %r31, 1;
+    cvt.u64.u32  %rd8, %r31;
+    add.u64      %rd9, %rd17, %rd8;
+    ld.global.b16 %h1, [%rd9];
+    CVT_BF16_F32(_kv, %h1)
+
+    fma.rn.f32   %f27, _p, _kv, %f27;
+
+    mov.f32      %f25, _m_new;
+
+    add.u32      %r30, %r30, 1;
+    bra          kv_loop;
+kv_done:
+
+    // Final normalize and write
+    rcp.approx.f32 %f28, %f26;
+    mul.f32      %f27, %f27, %f28;
+
+    .reg .b16 _o_bf16;
+    CVT_F32_BF16(_o_bf16, %f27)
+    shl.b32      %r40, %r0, 1;
+    cvt.u64.u32  %rd11, %r40;
+    add.u64      %rd12, %rd6, %rd11;
+    st.global.b16 [%rd12], _o_bf16;
+
+    ret;
+}

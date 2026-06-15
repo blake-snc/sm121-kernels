@@ -1,0 +1,23 @@
+/target
+*.cubin
+*.o
+*.so
+*.dylib
+tests/reference/data/
+.DS_Store
+__pycache__/
+*.pyc
+*.npz
+unsloth_compiled_cache/
+analysis/sass/
+analysis/sm121a_instructions.txt
+analysis/sm121a_repos/
+
+# Python build / packaging artifacts
+build/
+dist/
+python/sm121_kernels.egg-info/
+/build.rs
+
+# SASS audit working dir (per-machine artifacts)
+analysis/sass_audit/

@@ -1,0 +1,100 @@
+// scale_bf16_rows_inplace.ptx
+//
+// Post-scale for W8A16-via-FP8-v3 GEMM:
+//   buf[i, j] *= row_scales[i] * b_scale
+//
+// Used after `gemm_fp8_mma_v3` to recover the true magnitude of C when
+// A and B were quantized via per-token (A) + per-tensor (B) scales:
+//
+//   accum[i, j] = sum_k (a[i, k]/a_scales[i] * b[k, j]/b_scale)
+//   C_true[i, j] = (a_scales[i] * b_scale) * accum[i, j]
+//
+// Layout:
+//   buf:        [m, n] bf16, row-major in-place
+//   row_scales: [m] f32 (per-row a_scale)
+//   b_scale:    scalar f32 (per-tensor B scale, broadcast)
+//
+// Optimization: ONE thread per block loads row_scale, broadcasts via
+// shared memory. Avoids 256-way redundant f32 loads per block.
+//
+// Vectorized: each thread processes 2 consecutive BF16 elements via a
+// packed b32 load/store. n must be even (always true for our decode shapes).
+//
+// Grid: (n/(2*BLOCK), m, 1); Block: 256 threads.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+.visible .entry scale_bf16_rows_inplace(
+    .param .u64 param_buf,         // [m, n] bf16 in-place
+    .param .u64 param_row_scales,  // [m] f32
+    .param .u32 param_m,
+    .param .u32 param_n,
+    .param .f32 param_b_scale
+)
+{
+    .reg .b32  %r<16>;
+    .reg .b64  %rd<8>;
+    .reg .f32  %f<8>;
+    .reg .b16  %h<5>;
+    .reg .pred %p<3>;
+
+    .shared .align 4 .b8 shared_scale[4];   // one f32
+
+    ld.param.u64    %rd0, [param_buf];
+    ld.param.u64    %rd1, [param_row_scales];
+    ld.param.u32    %r0, [param_m];
+    ld.param.u32    %r1, [param_n];
+    ld.param.f32    %f0, [param_b_scale];
+
+    mov.u32         %r2, %ctaid.y;          // row index
+    setp.ge.u32     %p0, %r2, %r0;
+    @%p0 ret;
+
+    mov.u32         %r5, %tid.x;            // thread within block
+
+    // ONE thread per block loads the row scale, multiplies by b_scale,
+    // stores to shared mem. All other threads wait + load from shared.
+    setp.ne.u32     %p1, %r5, 0;
+    @%p1 bra        skip_scale_load;
+    mul.wide.u32    %rd2, %r2, 4;
+    add.u64         %rd3, %rd1, %rd2;
+    ld.global.f32   %f1, [%rd3];
+    mul.f32         %f1, %f1, %f0;          // combined = row_scale * b_scale
+    st.shared.f32   [shared_scale], %f1;
+skip_scale_load:
+    bar.sync        0;
+    ld.shared.f32   %f1, [shared_scale];
+
+    // Per-thread column index: col = (ctaid.x * blockDim.x + tid) * 2
+    mov.u32         %r3, %ctaid.x;
+    mov.u32         %r4, %ntid.x;
+    mad.lo.u32      %r6, %r3, %r4, %r5;     // linear thread idx within row
+    shl.b32         %r7, %r6, 1;            // col (pair index × 2)
+
+    setp.ge.u32     %p2, %r7, %r1;
+    @%p2 ret;
+
+    // Compute buf offset = row * n + col, in bytes (×2 for bf16)
+    mul.lo.u32      %r8, %r2, %r1;
+    add.u32         %r8, %r8, %r7;
+    mul.wide.u32    %rd4, %r8, 2;
+    add.u64         %rd5, %rd0, %rd4;
+
+    // Packed load: two BF16 (4 bytes total)
+    ld.global.b32   %r9, [%rd5];
+    mov.b32         {%h0, %h1}, %r9;
+    CVT_BF16_F32(%f2, %h0)
+    CVT_BF16_F32(%f3, %h1)
+    mul.f32         %f4, %f2, %f1;
+    mul.f32         %f5, %f3, %f1;
+    CVT_F32_BF16(%h2, %f4)
+    CVT_F32_BF16(%h3, %f5)
+    mov.b32         %r10, {%h2, %h3};
+    st.global.b32   [%rd5], %r10;
+    ret;
+}

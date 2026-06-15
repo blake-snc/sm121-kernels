@@ -1,0 +1,283 @@
+// fa_bf16_mla_prefill.ptx
+//
+// Multi-head Latent Attention (MLA) — BF16 prefill (seq_q > 1, always causal).
+// Used by DeepSeek V3/V3.1/R1, GLM-4.5/5.
+//
+// Each CTA handles ONE (q_idx, head, batch) position.
+// Causal: only s in [0, q_idx] contributes; s > q_idx set to -inf.
+//
+// Layouts (prefill):
+//   Q_c:    [B, seq_q, H, D_C=512] BF16
+//   Q_r:    [B, seq_q, H, D_R=64 ] BF16
+//   c_kv:   [B, seq_kv,   D_C    ] BF16 (shared across heads)
+//   k_rope: [B, seq_kv,   D_R    ] BF16 (shared across heads)
+//   O:      [B, seq_q, H, D_C    ] BF16
+//
+// For prefill with decoding q positions being absolute positions in the sequence:
+//   q_abs = q_idx (since prefill starts from position 0 typically).
+//   kv_abs = s. Causal: s <= q_idx.
+//
+// Grid: (seq_q, num_heads, batch). Block: (128, 1, 1).
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+#include "reduction.ptxh"
+
+#define D_C 512
+#define D_R 64
+#define BLOCK_DIM 128
+#define NUM_WARPS 4
+
+.shared .align 4 .b8 smem_warp_sum_p[16];
+.shared .align 4 .b8 smem_score_p[4];
+.shared .align 16 .b8 smem_qc_p[1024];
+.shared .align 4  .b8 smem_qr_p[128];
+
+.visible .entry fa_bf16_mla_prefill(
+    .param .u64 param_Q_c,         // [B, seq_q, H, D_C]
+    .param .u64 param_Q_r,         // [B, seq_q, H, D_R]
+    .param .u64 param_c_kv,        // [B, seq_kv, D_C]
+    .param .u64 param_k_rope,      // [B, seq_kv, D_R]
+    .param .u64 param_O,           // [B, seq_q, H, D_C]
+    .param .u32 param_num_heads,
+    .param .u32 param_seq_q,
+    .param .u32 param_seq_kv,
+    .param .f32 param_scale
+)
+{
+    .reg .b32 %r<64>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<40>;
+    .reg .b16 %h<8>;
+    .reg .pred %p<8>;
+
+    mov.u32     %r0, %tid.x;               // 0..127
+    mov.u32     %r30, %ctaid.x;            // q_idx
+    mov.u32     %r1, %ctaid.y;             // head
+    mov.u32     %r2, %ctaid.z;             // batch
+
+    ld.param.u64 %rd0, [param_Q_c];
+    ld.param.u64 %rd1, [param_Q_r];
+    ld.param.u64 %rd2, [param_c_kv];
+    ld.param.u64 %rd3, [param_k_rope];
+    ld.param.u64 %rd4, [param_O];
+    ld.param.u32 %r3, [param_num_heads];
+    ld.param.u32 %r31, [param_seq_q];
+    ld.param.u32 %r4, [param_seq_kv];
+    ld.param.f32 %f0, [param_scale];
+
+    shr.b32     %r5, %r0, 5;
+    and.b32     %r6, %r0, 31;
+
+    // Effective kv limit (causal): s < q_idx+1, clamped to seq_kv.
+    // (For prefill, typically seq_kv == seq_q so q_idx+1 <= seq_kv always.
+    //  Clamp defensively.)
+    add.u32     %r32, %r30, 1;             // q_idx + 1
+    min.u32     %r33, %r32, %r4;           // effective_seq_kv
+
+    // ================================================================
+    // Compute Q_c and Q_r base:
+    //   Q_c[b, q, h, :] base = Q_c + ((b*seq_q + q)*H + h)*D_C*2
+    //   Q_r[b, q, h, :] base = Q_r + ((b*seq_q + q)*H + h)*D_R*2
+    // ================================================================
+    mul.lo.u32  %r7, %r2, %r31;            // b * seq_q
+    add.u32     %r7, %r7, %r30;            // + q
+    mul.lo.u32  %r7, %r7, %r3;             // * H
+    add.u32     %r7, %r7, %r1;             // + h    = row offset
+
+    mul.lo.u32  %r8, %r7, D_C;
+    mul.wide.u32 %rd5, %r8, 2;
+    add.u64     %rd6, %rd0, %rd5;          // &Q_c[b,q,h,0]
+    mul.lo.u32  %r9, %r7, D_R;
+    mul.wide.u32 %rd5, %r9, 2;
+    add.u64     %rd7, %rd1, %rd5;          // &Q_r[b,q,h,0]
+
+    // Stage Q_c and Q_r into SMEM
+    shl.b32     %r11, %r0, 3;
+    cvt.u64.u32 %rd10, %r11;
+    add.u64     %rd8, %rd6, %rd10;
+    ld.global.v2.b32 {%r12, %r13}, [%rd8];
+    mov.u32     %r14, smem_qc_p;
+    add.u32     %r14, %r14, %r11;
+    st.shared.v2.b32 [%r14], {%r12, %r13};
+
+    setp.lt.u32 %p0, %r0, D_R;
+    @%p0 shl.b32   %r11, %r0, 1;
+    @%p0 cvt.u64.u32 %rd10, %r11;
+    @%p0 add.u64   %rd8, %rd7, %rd10;
+    @%p0 ld.global.b16 %h0, [%rd8];
+    @%p0 mov.u32   %r14, smem_qr_p;
+    @%p0 add.u32   %r14, %r14, %r11;
+    @%p0 st.shared.b16 [%r14], %h0;
+
+    bar.sync 0;
+
+    // Load this thread's Q slice into registers
+    mov.u32     %r14, smem_qc_p;
+    shl.b32     %r11, %r0, 3;
+    add.u32     %r14, %r14, %r11;
+    ld.shared.v2.b32 {%r12, %r13}, [%r14];
+    mov.b32     {%h0, %h1}, %r12;
+    mov.b32     {%h2, %h3}, %r13;
+    CVT_BF16_F32(%f1, %h0)
+    CVT_BF16_F32(%f2, %h1)
+    CVT_BF16_F32(%f3, %h2)
+    CVT_BF16_F32(%f4, %h3)
+
+    @%p0 shl.b32   %r11, %r0, 1;
+    @%p0 mov.u32   %r14, smem_qr_p;
+    @%p0 add.u32   %r14, %r14, %r11;
+    @%p0 ld.shared.b16 %h0, [%r14];
+    mov.f32     %f5, 0f00000000;
+    @%p0 CVT_BF16_F32(%f5, %h0)
+
+    // Online softmax state
+    mov.f32     %f10, 0.0;  mov.f32 %f11, 0.0;  mov.f32 %f12, 0.0;  mov.f32 %f13, 0.0;
+    mov.b32     %f6, 0xff800000;
+    mov.f32     %f7, 0.0;
+
+    // c_kv[b, 0, t*4] base address
+    mul.lo.u32  %r15, %r2, %r4;            // b * seq_kv
+    mul.lo.u32  %r16, %r15, D_C;
+    mul.wide.u32 %rd5, %r16, 2;
+    add.u64     %rd8, %rd2, %rd5;
+    shl.b32     %r17, %r0, 3;
+    cvt.u64.u32 %rd10, %r17;
+    add.u64     %rd8, %rd8, %rd10;
+
+    // k_rope[b, 0, t] base address
+    mul.lo.u32  %r18, %r15, D_R;
+    mul.wide.u32 %rd5, %r18, 2;
+    add.u64     %rd9, %rd3, %rd5;
+    @%p0 shl.b32   %r19, %r0, 1;
+    @%p0 cvt.u64.u32 %rd10, %r19;
+    @%p0 add.u64   %rd9, %rd9, %rd10;
+
+    // Main loop: s = 0 .. effective_seq_kv
+    mov.u32     %r20, 0;
+s_loop:
+    setp.ge.u32 %p1, %r20, %r33;
+    @%p1 bra    s_done;
+
+    mul.lo.u32  %r21, %r20, D_C;
+    mul.wide.u32 %rd5, %r21, 2;
+    add.u64     %rd11, %rd8, %rd5;
+    ld.global.v2.b32 {%r22, %r23}, [%rd11];
+    mov.b32     {%h0, %h1}, %r22;
+    mov.b32     {%h2, %h3}, %r23;
+    CVT_BF16_F32(%f20, %h0)
+    CVT_BF16_F32(%f21, %h1)
+    CVT_BF16_F32(%f22, %h2)
+    CVT_BF16_F32(%f23, %h3)
+
+    mul.f32     %f24, %f1, %f20;
+    fma.rn.f32  %f24, %f2, %f21, %f24;
+    fma.rn.f32  %f24, %f3, %f22, %f24;
+    fma.rn.f32  %f24, %f4, %f23, %f24;
+
+    mul.lo.u32  %r24, %r20, D_R;
+    mul.wide.u32 %rd5, %r24, 2;
+    add.u64     %rd11, %rd9, %rd5;
+    mov.f32     %f25, 0f00000000;
+    @%p0 ld.global.b16 %h0, [%rd11];
+    @%p0 CVT_BF16_F32(%f25, %h0)
+
+    fma.rn.f32  %f24, %f5, %f25, %f24;
+
+    // Warp reduce
+    shfl.sync.bfly.b32  %f26|%p5, %f24, 0x10, 0x1f, 0xffffffff;
+    add.f32     %f24, %f24, %f26;
+    shfl.sync.bfly.b32  %f26|%p5, %f24, 0x08, 0x1f, 0xffffffff;
+    add.f32     %f24, %f24, %f26;
+    shfl.sync.bfly.b32  %f26|%p5, %f24, 0x04, 0x1f, 0xffffffff;
+    add.f32     %f24, %f24, %f26;
+    shfl.sync.bfly.b32  %f26|%p5, %f24, 0x02, 0x1f, 0xffffffff;
+    add.f32     %f24, %f24, %f26;
+    shfl.sync.bfly.b32  %f26|%p5, %f24, 0x01, 0x1f, 0xffffffff;
+    add.f32     %f24, %f24, %f26;
+
+    // Cross-warp reduce
+    setp.eq.u32 %p2, %r6, 0;
+    shl.b32     %r25, %r5, 2;
+    mov.u32     %r26, smem_warp_sum_p;
+    add.u32     %r26, %r26, %r25;
+    @%p2 st.shared.f32 [%r26], %f24;
+    bar.sync 0;
+
+    setp.lt.u32 %p3, %r0, NUM_WARPS;
+    mov.f32     %f27, 0f00000000;
+    @%p3 shl.b32 %r25, %r0, 2;
+    @%p3 mov.u32 %r26, smem_warp_sum_p;
+    @%p3 add.u32 %r26, %r26, %r25;
+    @%p3 ld.shared.f32 %f27, [%r26];
+    shfl.sync.bfly.b32  %f28|%p5, %f27, 0x02, 0x1f, 0xffffffff;
+    add.f32     %f27, %f27, %f28;
+    shfl.sync.bfly.b32  %f28|%p5, %f27, 0x01, 0x1f, 0xffffffff;
+    add.f32     %f27, %f27, %f28;
+
+    setp.eq.u32 %p4, %r0, 0;
+    mul.f32     %f27, %f27, %f0;
+    mov.u32     %r26, smem_score_p;
+    @%p4 st.shared.f32 [%r26], %f27;
+    bar.sync 0;
+
+    ld.shared.f32 %f29, [smem_score_p];
+
+    // Online softmax update
+    max.f32     %f30, %f6, %f29;
+    sub.f32     %f31, %f6, %f30;
+    mul.f32     %f31, %f31, LOG2E;
+    ex2.approx.ftz.f32 %f31, %f31;
+    sub.f32     %f32, %f29, %f30;
+    mul.f32     %f32, %f32, LOG2E;
+    ex2.approx.ftz.f32 %f32, %f32;
+
+    mov.f32     %f6, %f30;
+    mul.f32     %f7, %f7, %f31;
+    add.f32     %f7, %f7, %f32;
+
+    mul.f32     %f10, %f10, %f31;
+    fma.rn.f32  %f10, %f32, %f20, %f10;
+    mul.f32     %f11, %f11, %f31;
+    fma.rn.f32  %f11, %f32, %f21, %f11;
+    mul.f32     %f12, %f12, %f31;
+    fma.rn.f32  %f12, %f32, %f22, %f12;
+    mul.f32     %f13, %f13, %f31;
+    fma.rn.f32  %f13, %f32, %f23, %f13;
+
+    add.u32     %r20, %r20, 1;
+    bra         s_loop;
+
+s_done:
+    // Normalize O /= row_sum
+    setp.eq.f32 %p6, %f7, 0f00000000;
+    @%p6 mov.f32 %f7, 0f3f800000;
+    rcp.approx.f32 %f31, %f7;
+    mul.f32     %f10, %f10, %f31;
+    mul.f32     %f11, %f11, %f31;
+    mul.f32     %f12, %f12, %f31;
+    mul.f32     %f13, %f13, %f31;
+
+    // Store O[b, q, h, t*4..t*4+3]
+    // Same base as Q_c (same layout)
+    mul.lo.u32  %r8, %r7, D_C;
+    mul.wide.u32 %rd5, %r8, 2;
+    add.u64     %rd12, %rd4, %rd5;
+    shl.b32     %r17, %r0, 3;
+    cvt.u64.u32 %rd10, %r17;
+    add.u64     %rd12, %rd12, %rd10;
+
+    cvt.rn.bf16.f32 %h0, %f10;
+    cvt.rn.bf16.f32 %h1, %f11;
+    mov.b32     %r12, {%h0, %h1};
+    cvt.rn.bf16.f32 %h0, %f12;
+    cvt.rn.bf16.f32 %h1, %f13;
+    mov.b32     %r13, {%h0, %h1};
+    st.global.v2.b32 [%rd12], {%r12, %r13};
+
+    ret;
+}

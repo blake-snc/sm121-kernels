@@ -1,0 +1,741 @@
+// gemm_w8a16_mma_v3.ptx
+//
+// Dense W8A16 GEMM v3 — BF16 A × FP8 (E4M3) B × per-tensor scale → BF16 C.
+// Modeled on `gemm_bf16_mma_v3.ptx`: 128×128 tile, 8 warps in 2×4 layout,
+// K-block 32, 2-stage cp.async pipeline. ONLY the B-load path differs:
+//
+//   - B cp.async transfers HALF the bytes per stage (FP8 = 1 byte/elem vs BF16's 2)
+//     → 256 threads × 16 B/thread = 4 KB per stage (vs BF16's 8 KB)
+//   - After cp.async barrier: each thread dequantizes its 16 FP8 bytes from
+//     the FP8 staging area, multiplies by per-tensor `scale`, writes 16 BF16
+//     (32 bytes) into the dequanted-B SMEM area at the SAME offset BF16 v3
+//     uses → ldmatrix path is byte-identical to BF16 v3
+//   - Standard BF16 MMA loop (m16n8k16) — unchanged
+//
+// Per-tensor scale: applied inline during dequant. NO post-multiplication
+// kernel needed (vs the composite quant-GEMM recipe's `scale_bf16_rows_inplace`).
+//
+// Per warp work: 64×32 output, 4 m-groups × 4 n-groups = 16 MMAs per K-tile,
+// 32 MMAs per K-iter. 64 fp32 accumulators per thread.
+//
+// SMEM (20 KB × 2 stages = 40 KB; fits SM121's 99 KB cap):
+//   A_tile:        128 × 32 BF16 = 8192 bytes (offset 0)
+//   B_tile:         32 × 128 BF16 = 8192 bytes (offset 8192, dequanted area)
+//   B_fp8_stage:    32 × 128 FP8  = 4096 bytes (offset 16384, staging)
+//
+// Constraints: M%128, N%128, K%32 — same as BF16/FP8 v3.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+#include "mma.ptxh"
+
+// Per-stage byte offsets within smem[]:
+#define A_BYTES_PER_STAGE   8192
+#define B_OFF               8192      // dequanted BF16 B
+#define B_FP8_OFF           16384     // FP8 staging
+#define STAGE_BYTES         20480
+
+.visible .entry gemm_w8a16_mma_v3(
+    .param .u64 param_A,        // [M, K] row-major bf16
+    .param .u64 param_B,        // [K, N] row-major fp8 e4m3
+    .param .u64 param_C,        // [M, N] row-major bf16 output
+    .param .u32 param_M,
+    .param .u32 param_N,
+    .param .u32 param_K,
+    .param .f32 param_b_scale   // per-tensor B dequant scale
+)
+{
+    .reg .b32  %r<100>;
+    .reg .b64  %rd<16>;
+    .reg .f32  %f<68>;          // 64 accumulators + temps for dequant
+    .reg .b16  %h<16>;
+    .reg .pred %p<8>;
+
+    .shared .align 128 .b8 smem[40960];
+
+    // === Thread/Warp identification ===
+    mov.u32         %r20, %tid.x;                // tid [0..255]
+    shr.b32         %r21, %r20, 5;               // warp_id [0..7]
+    and.b32         %r22, %r20, 31;              // lane [0..31]
+    shr.b32         %r23, %r21, 2;               // warp_m [0..1]
+    and.b32         %r24, %r21, 3;               // warp_n [0..3]
+
+    // === Load params ===
+    ld.param.u64    %rd0, [param_A];
+    ld.param.u64    %rd1, [param_B];
+    ld.param.u64    %rd2, [param_C];
+    ld.param.u32    %r25, [param_M];
+    ld.param.u32    %r26, [param_N];
+    ld.param.u32    %r27, [param_K];
+    ld.param.f32    %f64, [param_b_scale];
+
+    // === CTA tile offsets (128×128 tile) ===
+    mov.u32         %r28, %ctaid.y;
+    mov.u32         %r29, %ctaid.x;
+    shl.b32         %r30, %r28, 7;               // m_off = by * 128
+    shl.b32         %r31, %r29, 7;               // n_off = bx * 128
+
+    mov.u32         %r32, smem;
+
+    // === Init 64 accumulators ===
+    mov.f32 %f0, 0.0;  mov.f32 %f1, 0.0;  mov.f32 %f2, 0.0;  mov.f32 %f3, 0.0;
+    mov.f32 %f4, 0.0;  mov.f32 %f5, 0.0;  mov.f32 %f6, 0.0;  mov.f32 %f7, 0.0;
+    mov.f32 %f8, 0.0;  mov.f32 %f9, 0.0;  mov.f32 %f10, 0.0; mov.f32 %f11, 0.0;
+    mov.f32 %f12, 0.0; mov.f32 %f13, 0.0; mov.f32 %f14, 0.0; mov.f32 %f15, 0.0;
+    mov.f32 %f16, 0.0; mov.f32 %f17, 0.0; mov.f32 %f18, 0.0; mov.f32 %f19, 0.0;
+    mov.f32 %f20, 0.0; mov.f32 %f21, 0.0; mov.f32 %f22, 0.0; mov.f32 %f23, 0.0;
+    mov.f32 %f24, 0.0; mov.f32 %f25, 0.0; mov.f32 %f26, 0.0; mov.f32 %f27, 0.0;
+    mov.f32 %f28, 0.0; mov.f32 %f29, 0.0; mov.f32 %f30, 0.0; mov.f32 %f31, 0.0;
+    mov.f32 %f32, 0.0; mov.f32 %f33, 0.0; mov.f32 %f34, 0.0; mov.f32 %f35, 0.0;
+    mov.f32 %f36, 0.0; mov.f32 %f37, 0.0; mov.f32 %f38, 0.0; mov.f32 %f39, 0.0;
+    mov.f32 %f40, 0.0; mov.f32 %f41, 0.0; mov.f32 %f42, 0.0; mov.f32 %f43, 0.0;
+    mov.f32 %f44, 0.0; mov.f32 %f45, 0.0; mov.f32 %f46, 0.0; mov.f32 %f47, 0.0;
+    mov.f32 %f48, 0.0; mov.f32 %f49, 0.0; mov.f32 %f50, 0.0; mov.f32 %f51, 0.0;
+    mov.f32 %f52, 0.0; mov.f32 %f53, 0.0; mov.f32 %f54, 0.0; mov.f32 %f55, 0.0;
+    mov.f32 %f56, 0.0; mov.f32 %f57, 0.0; mov.f32 %f58, 0.0; mov.f32 %f59, 0.0;
+    mov.f32 %f60, 0.0; mov.f32 %f61, 0.0; mov.f32 %f62, 0.0; mov.f32 %f63, 0.0;
+
+    // === Precompute ldmatrix A base (within stage) ===
+    setp.lt.u32     %p0, %r22, 16;
+    @%p0 mul.lo.u32 %r33, %r22, 64;
+    @!%p0 sub.u32   %r33, %r22, 16;
+    @!%p0 mad.lo.u32 %r33, %r33, 64, 16;
+    shl.b32         %r34, %r23, 12;
+    add.u32         %r33, %r33, %r34;
+    add.u32         %r33, %r32, %r33;            // ldm_a_base_k0
+
+    // === Precompute ldmatrix B base (reads from dequanted BF16 area) ===
+    // Same layout as BF16 v3: 32 rows × 128 cols × 2B = 256 bytes/row.
+    and.b32         %r35, %r22, 15;
+    shl.b32         %r35, %r35, 8;
+    shl.b32         %r36, %r24, 6;
+    add.u32         %r35, %r35, %r36;
+    add.u32         %r35, %r35, B_OFF;
+    add.u32         %r35, %r32, %r35;            // ldm_b_base_k0
+
+    // === Precompute cp.async destinations ===
+    // A: each thread writes 32 bytes (= 2 × 16B) → tid*32 offset.
+    shl.b32         %r37, %r20, 5;
+    add.u32         %r37, %r32, %r37;            // smem_a_dst (first 16B)
+
+    // B FP8: each thread writes 16 bytes (= 1 × 16B) → tid*16 offset.
+    // 256 threads × 16 = 4096 bytes per stage, packed as 32 rows × 128 cols
+    // (8 threads per row, 16 bytes each).
+    shl.b32         %r38, %r20, 4;               // tid * 16
+    add.u32         %r38, %r38, B_FP8_OFF;
+    add.u32         %r38, %r32, %r38;            // smem_b_fp8_dst
+
+    // Each thread's dequant destination: writes 32 bytes (16 BF16) into the
+    // dequanted area. Layout matches BF16 v3 B (tid*32 within B_OFF area).
+    shl.b32         %r39, %r20, 5;               // tid * 32
+    add.u32         %r39, %r39, B_OFF;
+    add.u32         %r39, %r32, %r39;            // smem_b_bf16_dst
+
+    // === Precompute global source addresses ===
+    // A: each thread loads 32 bytes from row=t/2, col=(t%2)*16 elements.
+    shr.b32         %r40, %r20, 1;               // a_row = t/2
+    and.b32         %r41, %r20, 1;               // t%2
+    shl.b32         %r42, %r41, 4;               // (t%2)*16
+    add.u32         %r40, %r30, %r40;
+    mul.lo.u32      %r43, %r40, %r27;
+    add.u32         %r43, %r43, %r42;
+    mul.wide.u32    %rd3, %r43, 2;
+    add.u64         %rd3, %rd0, %rd3;            // &A[..][k=0]
+
+    // B FP8: each thread loads 16 bytes (16 FP8 elems) from row=t/8,
+    // col=(t%8)*16 elements. Global addr = &B[(k + t/8) * N + n_off + (t%8)*16].
+    shr.b32         %r44, %r20, 3;               // b_row = t/8
+    and.b32         %r45, %r20, 7;               // t%8
+    shl.b32         %r46, %r45, 4;               // (t%8)*16
+    add.u32         %r46, %r31, %r46;            // n_off + b_col_elem
+    // gmem stride for advancing K-rows: N bytes (FP8 = 1 byte/elem)
+
+    // === Precompute store addresses (identical to BF16 v3) ===
+    shr.b32         %r47, %r22, 2;               // groupID [0..7]
+    and.b32         %r48, %r22, 3;               // tidInGroup [0..3]
+
+    shl.b32         %r49, %r23, 6;               // warp_m * 64
+    add.u32         %r49, %r30, %r49;
+    add.u32         %r50, %r49, %r47;            // base_row_d0
+    add.u32         %r51, %r50, 8;               // base_row_d2
+
+    shl.b32         %r52, %r24, 5;               // warp_n * 32
+    add.u32         %r52, %r31, %r52;
+    shl.b32         %r53, %r48, 1;               // tidInGroup * 2
+    add.u32         %r53, %r52, %r53;            // base_col_d0
+
+    // ==================== PIPELINE PROLOGUE ====================
+    // Stage 0 load: A (32B/thread = 2 × 16B), B FP8 (16B/thread = 1 × 16B)
+    cp.async.cg.shared.global [%r37],      [%rd3],      16;
+    add.u32         %r54, %r37, 16;
+    add.u64         %rd4, %rd3, 16;
+    cp.async.cg.shared.global [%r54], [%rd4], 16;
+
+    add.u32         %r55, %r44, 0;               // 0 + b_row
+    mul.lo.u32      %r56, %r55, %r26;            // (k+b_row) * N (N is byte stride for FP8)
+    add.u32         %r56, %r56, %r46;
+    // FP8 = 1 byte per element → no ×2 widen
+    mul.wide.u32    %rd5, %r56, 1;
+    add.u64         %rd6, %rd1, %rd5;
+    cp.async.cg.shared.global [%r38], [%rd6], 16;
+
+    cp.async.commit_group;
+    cp.async.wait_group 0;
+
+    // === Dequant pass: FP8 staging → BF16 dequanted, with inline scale ===
+    // Each thread reads 16 FP8 bytes from [smem_b_fp8_dst], converts to 16 BF16
+    // via 8 cvt.rn.bf16x2.e4m3x2 + 16 mul.f32 scale + cvt.rn.bf16x2.f32,
+    // writes 32 bytes to [smem_b_bf16_dst].
+    {
+        .reg .b32 _fp8x4_0, _fp8x4_1, _fp8x4_2, _fp8x4_3;   // 4 × 4-FP8-packed
+        .reg .b16 _hh0, _hh1, _hh2, _hh3;                    // FP8 pair (2 bytes)
+        .reg .b32 _bf16x2;
+        .reg .f32 _fa, _fb, _fc, _fd;
+
+        // Load 16 FP8 bytes as 4 × b32.
+        ld.shared.b32   _fp8x4_0, [%r38];
+        ld.shared.b32   _fp8x4_1, [%r38 + 4];
+        ld.shared.b32   _fp8x4_2, [%r38 + 8];
+        ld.shared.b32   _fp8x4_3, [%r38 + 12];
+
+        // Split each b32 into 2 × b16 (each b16 = 2 FP8 bytes = e4m3x2 pair).
+        // Then convert each pair to f32 pair, scale, repack to bf16 pair, store.
+
+        // --- chunk 0: fp8x4_0 → 2 bf16 pairs → 4 bytes BF16 ---
+        // Per FP8 pair (b16 reg holding 2 packed bytes):
+        //   cvt.rn.bf16x2.e4m3x2  → raw BF16 pair (numerical FP8 value)
+        //   split → CVT_BF16_F32 → mul by scale → repack via cvt.rn.bf16x2.f32
+        // 4 instructions per pair, 2 pairs per chunk b32, 4 chunks per thread per stage.
+
+        .reg .b32 _raw_bf16x2;
+        .reg .b16 _b0, _b1;
+
+        mov.b32         {_hh0, _hh1}, _fp8x4_0;
+        cvt.rn.f16x2.e4m3x2  _raw_bf16x2, _hh0;
+        mov.b32         {_b0, _b1}, _raw_bf16x2;
+        cvt.f32.f16     _fa, _b0;
+        cvt.f32.f16     _fb, _b1;
+        mul.f32         _fa, _fa, %f64;
+        mul.f32         _fb, _fb, %f64;
+        cvt.rn.bf16x2.f32    _bf16x2, _fb, _fa;
+        st.shared.b32   [%r39], _bf16x2;
+
+        cvt.rn.f16x2.e4m3x2  _raw_bf16x2, _hh1;
+        mov.b32         {_b0, _b1}, _raw_bf16x2;
+        cvt.f32.f16     _fc, _b0;
+        cvt.f32.f16     _fd, _b1;
+        mul.f32         _fc, _fc, %f64;
+        mul.f32         _fd, _fd, %f64;
+        cvt.rn.bf16x2.f32    _bf16x2, _fd, _fc;
+        st.shared.b32   [%r39 + 4], _bf16x2;
+
+        mov.b32         {_hh0, _hh1}, _fp8x4_1;
+        cvt.rn.f16x2.e4m3x2  _raw_bf16x2, _hh0;
+        mov.b32         {_b0, _b1}, _raw_bf16x2;
+        cvt.f32.f16     _fa, _b0;
+        cvt.f32.f16     _fb, _b1;
+        mul.f32         _fa, _fa, %f64;
+        mul.f32         _fb, _fb, %f64;
+        cvt.rn.bf16x2.f32    _bf16x2, _fb, _fa;
+        st.shared.b32   [%r39 + 8], _bf16x2;
+
+        cvt.rn.f16x2.e4m3x2  _raw_bf16x2, _hh1;
+        mov.b32         {_b0, _b1}, _raw_bf16x2;
+        cvt.f32.f16     _fc, _b0;
+        cvt.f32.f16     _fd, _b1;
+        mul.f32         _fc, _fc, %f64;
+        mul.f32         _fd, _fd, %f64;
+        cvt.rn.bf16x2.f32    _bf16x2, _fd, _fc;
+        st.shared.b32   [%r39 + 12], _bf16x2;
+
+        mov.b32         {_hh0, _hh1}, _fp8x4_2;
+        cvt.rn.f16x2.e4m3x2  _raw_bf16x2, _hh0;
+        mov.b32         {_b0, _b1}, _raw_bf16x2;
+        cvt.f32.f16     _fa, _b0;
+        cvt.f32.f16     _fb, _b1;
+        mul.f32         _fa, _fa, %f64;
+        mul.f32         _fb, _fb, %f64;
+        cvt.rn.bf16x2.f32    _bf16x2, _fb, _fa;
+        st.shared.b32   [%r39 + 16], _bf16x2;
+
+        cvt.rn.f16x2.e4m3x2  _raw_bf16x2, _hh1;
+        mov.b32         {_b0, _b1}, _raw_bf16x2;
+        cvt.f32.f16     _fc, _b0;
+        cvt.f32.f16     _fd, _b1;
+        mul.f32         _fc, _fc, %f64;
+        mul.f32         _fd, _fd, %f64;
+        cvt.rn.bf16x2.f32    _bf16x2, _fd, _fc;
+        st.shared.b32   [%r39 + 20], _bf16x2;
+
+        mov.b32         {_hh0, _hh1}, _fp8x4_3;
+        cvt.rn.f16x2.e4m3x2  _raw_bf16x2, _hh0;
+        mov.b32         {_b0, _b1}, _raw_bf16x2;
+        cvt.f32.f16     _fa, _b0;
+        cvt.f32.f16     _fb, _b1;
+        mul.f32         _fa, _fa, %f64;
+        mul.f32         _fb, _fb, %f64;
+        cvt.rn.bf16x2.f32    _bf16x2, _fb, _fa;
+        st.shared.b32   [%r39 + 24], _bf16x2;
+
+        cvt.rn.f16x2.e4m3x2  _raw_bf16x2, _hh1;
+        mov.b32         {_b0, _b1}, _raw_bf16x2;
+        cvt.f32.f16     _fc, _b0;
+        cvt.f32.f16     _fd, _b1;
+        mul.f32         _fc, _fc, %f64;
+        mul.f32         _fd, _fd, %f64;
+        cvt.rn.bf16x2.f32    _bf16x2, _fd, _fc;
+        st.shared.b32   [%r39 + 28], _bf16x2;
+    }
+
+    bar.sync 0;
+
+    // ==================== K LOOP ====================
+    mov.u32         %r58, 0;                     // k = 0
+    mov.u32         %r59, 0;                     // read_off
+    mov.u32         %r78, STAGE_BYTES;           // write_off (other stage)
+
+k_loop:
+    setp.ge.u32     %p2, %r58, %r27;
+    @%p2 bra        k_done;
+
+    // === Issue load for stage at (k + 32) into write_off ===
+    add.u32         %r60, %r58, 32;
+    setp.lt.u32     %p3, %r60, %r27;
+    @!%p3 bra       skip_load;
+
+    add.u32         %r62, %r37, %r78;            // smem_a_dst + write_off
+    mul.wide.u32    %rd4, %r60, 2;
+    add.u64         %rd5, %rd3, %rd4;
+    cp.async.cg.shared.global [%r62], [%rd5], 16;
+    add.u32         %r54, %r62, 16;
+    add.u64         %rd7, %rd5, 16;
+    cp.async.cg.shared.global [%r54], [%rd7], 16;
+
+    add.u32         %r63, %r38, %r78;            // smem_b_fp8_dst + write_off
+    add.u32         %r55, %r44, %r60;
+    mul.lo.u32      %r56, %r55, %r26;
+    add.u32         %r56, %r56, %r46;
+    mul.wide.u32    %rd5, %r56, 1;
+    add.u64         %rd6, %rd1, %rd5;
+    cp.async.cg.shared.global [%r63], [%rd6], 16;
+
+skip_load:
+    cp.async.commit_group;
+
+    // === Compute on current read stage (covers K-tile 0 and K-tile 1) ===
+    add.u32         %r64, %r33, %r59;            // ldm_a_base + read_off
+    add.u32         %r65, %r35, %r59;            // ldm_b_base + read_off
+
+    // --- Load 8 B fragments (4 n-groups × 2 K-tiles) ---
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r0, %r1}, [%r65];
+    add.u32         %r66, %r65, 16;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r2, %r3}, [%r66];
+    add.u32         %r66, %r65, 32;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r4, %r5}, [%r66];
+    add.u32         %r66, %r65, 48;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r6, %r7}, [%r66];
+    add.u32         %r67, %r65, 4096;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r8, %r9},   [%r67];
+    add.u32         %r66, %r67, 16;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r10, %r11}, [%r66];
+    add.u32         %r66, %r67, 32;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r12, %r13}, [%r66];
+    add.u32         %r66, %r67, 48;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r14, %r15}, [%r66];
+
+    // --- m-group 0 ---
+    .reg .b32 _a0, _a1, _a2, _a3, _a4, _a5, _a6, _a7;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {_a0, _a1, _a2, _a3}, [%r64];
+    add.u32         %r66, %r64, 32;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {_a4, _a5, _a6, _a7}, [%r66];
+    MMA_BF16_M16N8K16(%f0,  %f1,  %f2,  %f3,  _a0, _a1, _a2, _a3, %r0, %r1)
+    MMA_BF16_M16N8K16(%f0,  %f1,  %f2,  %f3,  _a4, _a5, _a6, _a7, %r8, %r9)
+    MMA_BF16_M16N8K16(%f4,  %f5,  %f6,  %f7,  _a0, _a1, _a2, _a3, %r2, %r3)
+    MMA_BF16_M16N8K16(%f4,  %f5,  %f6,  %f7,  _a4, _a5, _a6, _a7, %r10, %r11)
+    MMA_BF16_M16N8K16(%f8,  %f9,  %f10, %f11, _a0, _a1, _a2, _a3, %r4, %r5)
+    MMA_BF16_M16N8K16(%f8,  %f9,  %f10, %f11, _a4, _a5, _a6, _a7, %r12, %r13)
+    MMA_BF16_M16N8K16(%f12, %f13, %f14, %f15, _a0, _a1, _a2, _a3, %r6, %r7)
+    MMA_BF16_M16N8K16(%f12, %f13, %f14, %f15, _a4, _a5, _a6, _a7, %r14, %r15)
+
+    // --- m-group 1 ---
+    add.u32         %r66, %r64, 1024;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {_a0, _a1, _a2, _a3}, [%r66];
+    add.u32         %r66, %r64, 1056;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {_a4, _a5, _a6, _a7}, [%r66];
+    MMA_BF16_M16N8K16(%f16, %f17, %f18, %f19, _a0, _a1, _a2, _a3, %r0, %r1)
+    MMA_BF16_M16N8K16(%f16, %f17, %f18, %f19, _a4, _a5, _a6, _a7, %r8, %r9)
+    MMA_BF16_M16N8K16(%f20, %f21, %f22, %f23, _a0, _a1, _a2, _a3, %r2, %r3)
+    MMA_BF16_M16N8K16(%f20, %f21, %f22, %f23, _a4, _a5, _a6, _a7, %r10, %r11)
+    MMA_BF16_M16N8K16(%f24, %f25, %f26, %f27, _a0, _a1, _a2, _a3, %r4, %r5)
+    MMA_BF16_M16N8K16(%f24, %f25, %f26, %f27, _a4, _a5, _a6, _a7, %r12, %r13)
+    MMA_BF16_M16N8K16(%f28, %f29, %f30, %f31, _a0, _a1, _a2, _a3, %r6, %r7)
+    MMA_BF16_M16N8K16(%f28, %f29, %f30, %f31, _a4, _a5, _a6, _a7, %r14, %r15)
+
+    // --- m-group 2 ---
+    add.u32         %r66, %r64, 2048;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {_a0, _a1, _a2, _a3}, [%r66];
+    add.u32         %r66, %r64, 2080;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {_a4, _a5, _a6, _a7}, [%r66];
+    MMA_BF16_M16N8K16(%f32, %f33, %f34, %f35, _a0, _a1, _a2, _a3, %r0, %r1)
+    MMA_BF16_M16N8K16(%f32, %f33, %f34, %f35, _a4, _a5, _a6, _a7, %r8, %r9)
+    MMA_BF16_M16N8K16(%f36, %f37, %f38, %f39, _a0, _a1, _a2, _a3, %r2, %r3)
+    MMA_BF16_M16N8K16(%f36, %f37, %f38, %f39, _a4, _a5, _a6, _a7, %r10, %r11)
+    MMA_BF16_M16N8K16(%f40, %f41, %f42, %f43, _a0, _a1, _a2, _a3, %r4, %r5)
+    MMA_BF16_M16N8K16(%f40, %f41, %f42, %f43, _a4, _a5, _a6, _a7, %r12, %r13)
+    MMA_BF16_M16N8K16(%f44, %f45, %f46, %f47, _a0, _a1, _a2, _a3, %r6, %r7)
+    MMA_BF16_M16N8K16(%f44, %f45, %f46, %f47, _a4, _a5, _a6, _a7, %r14, %r15)
+
+    // --- m-group 3 ---
+    add.u32         %r66, %r64, 3072;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {_a0, _a1, _a2, _a3}, [%r66];
+    add.u32         %r66, %r64, 3104;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {_a4, _a5, _a6, _a7}, [%r66];
+    MMA_BF16_M16N8K16(%f48, %f49, %f50, %f51, _a0, _a1, _a2, _a3, %r0, %r1)
+    MMA_BF16_M16N8K16(%f48, %f49, %f50, %f51, _a4, _a5, _a6, _a7, %r8, %r9)
+    MMA_BF16_M16N8K16(%f52, %f53, %f54, %f55, _a0, _a1, _a2, _a3, %r2, %r3)
+    MMA_BF16_M16N8K16(%f52, %f53, %f54, %f55, _a4, _a5, _a6, _a7, %r10, %r11)
+    MMA_BF16_M16N8K16(%f56, %f57, %f58, %f59, _a0, _a1, _a2, _a3, %r4, %r5)
+    MMA_BF16_M16N8K16(%f56, %f57, %f58, %f59, _a4, _a5, _a6, _a7, %r12, %r13)
+    MMA_BF16_M16N8K16(%f60, %f61, %f62, %f63, _a0, _a1, _a2, _a3, %r6, %r7)
+    MMA_BF16_M16N8K16(%f60, %f61, %f62, %f63, _a4, _a5, _a6, _a7, %r14, %r15)
+
+    // === Wait for next stage, dequant it, swap ===
+    cp.async.wait_group 0;
+
+    // Dequant the JUST-LOADED stage (at write_off) before bar.sync.
+    {
+        .reg .b32 _fp8x4_0, _fp8x4_1, _fp8x4_2, _fp8x4_3;
+        .reg .b16 _hh0, _hh1, _hh2, _hh3;
+        .reg .b32 _bf16x2, _raw_bf16x2;
+        .reg .b16 _b0, _b1;
+        .reg .f32 _fa, _fb, _fc, _fd;
+        .reg .b32 _fp8_src, _bf16_dst;
+
+        add.u32         _fp8_src, %r38, %r78;
+        add.u32         _bf16_dst, %r39, %r78;
+
+        ld.shared.b32   _fp8x4_0, [_fp8_src];
+        ld.shared.b32   _fp8x4_1, [_fp8_src + 4];
+        ld.shared.b32   _fp8x4_2, [_fp8_src + 8];
+        ld.shared.b32   _fp8x4_3, [_fp8_src + 12];
+
+        mov.b32         {_hh0, _hh1}, _fp8x4_0;
+        cvt.rn.f16x2.e4m3x2  _raw_bf16x2, _hh0;
+        mov.b32         {_b0, _b1}, _raw_bf16x2;
+        cvt.f32.f16     _fa, _b0;
+        cvt.f32.f16     _fb, _b1;
+        mul.f32         _fa, _fa, %f64;
+        mul.f32         _fb, _fb, %f64;
+        cvt.rn.bf16x2.f32    _bf16x2, _fb, _fa;
+        st.shared.b32   [_bf16_dst], _bf16x2;
+        cvt.rn.f16x2.e4m3x2  _raw_bf16x2, _hh1;
+        mov.b32         {_b0, _b1}, _raw_bf16x2;
+        cvt.f32.f16     _fc, _b0;
+        cvt.f32.f16     _fd, _b1;
+        mul.f32         _fc, _fc, %f64;
+        mul.f32         _fd, _fd, %f64;
+        cvt.rn.bf16x2.f32    _bf16x2, _fd, _fc;
+        st.shared.b32   [_bf16_dst + 4], _bf16x2;
+
+        mov.b32         {_hh0, _hh1}, _fp8x4_1;
+        cvt.rn.f16x2.e4m3x2  _raw_bf16x2, _hh0;
+        mov.b32         {_b0, _b1}, _raw_bf16x2;
+        cvt.f32.f16     _fa, _b0;
+        cvt.f32.f16     _fb, _b1;
+        mul.f32         _fa, _fa, %f64;
+        mul.f32         _fb, _fb, %f64;
+        cvt.rn.bf16x2.f32    _bf16x2, _fb, _fa;
+        st.shared.b32   [_bf16_dst + 8], _bf16x2;
+        cvt.rn.f16x2.e4m3x2  _raw_bf16x2, _hh1;
+        mov.b32         {_b0, _b1}, _raw_bf16x2;
+        cvt.f32.f16     _fc, _b0;
+        cvt.f32.f16     _fd, _b1;
+        mul.f32         _fc, _fc, %f64;
+        mul.f32         _fd, _fd, %f64;
+        cvt.rn.bf16x2.f32    _bf16x2, _fd, _fc;
+        st.shared.b32   [_bf16_dst + 12], _bf16x2;
+
+        mov.b32         {_hh0, _hh1}, _fp8x4_2;
+        cvt.rn.f16x2.e4m3x2  _raw_bf16x2, _hh0;
+        mov.b32         {_b0, _b1}, _raw_bf16x2;
+        cvt.f32.f16     _fa, _b0;
+        cvt.f32.f16     _fb, _b1;
+        mul.f32         _fa, _fa, %f64;
+        mul.f32         _fb, _fb, %f64;
+        cvt.rn.bf16x2.f32    _bf16x2, _fb, _fa;
+        st.shared.b32   [_bf16_dst + 16], _bf16x2;
+        cvt.rn.f16x2.e4m3x2  _raw_bf16x2, _hh1;
+        mov.b32         {_b0, _b1}, _raw_bf16x2;
+        cvt.f32.f16     _fc, _b0;
+        cvt.f32.f16     _fd, _b1;
+        mul.f32         _fc, _fc, %f64;
+        mul.f32         _fd, _fd, %f64;
+        cvt.rn.bf16x2.f32    _bf16x2, _fd, _fc;
+        st.shared.b32   [_bf16_dst + 20], _bf16x2;
+
+        mov.b32         {_hh0, _hh1}, _fp8x4_3;
+        cvt.rn.f16x2.e4m3x2  _raw_bf16x2, _hh0;
+        mov.b32         {_b0, _b1}, _raw_bf16x2;
+        cvt.f32.f16     _fa, _b0;
+        cvt.f32.f16     _fb, _b1;
+        mul.f32         _fa, _fa, %f64;
+        mul.f32         _fb, _fb, %f64;
+        cvt.rn.bf16x2.f32    _bf16x2, _fb, _fa;
+        st.shared.b32   [_bf16_dst + 24], _bf16x2;
+        cvt.rn.f16x2.e4m3x2  _raw_bf16x2, _hh1;
+        mov.b32         {_b0, _b1}, _raw_bf16x2;
+        cvt.f32.f16     _fc, _b0;
+        cvt.f32.f16     _fd, _b1;
+        mul.f32         _fc, _fc, %f64;
+        mul.f32         _fd, _fd, %f64;
+        cvt.rn.bf16x2.f32    _bf16x2, _fd, _fc;
+        st.shared.b32   [_bf16_dst + 28], _bf16x2;
+    }
+
+    bar.sync 0;
+
+    xor.b32         %r59, %r59, STAGE_BYTES;
+    xor.b32         %r78, %r78, STAGE_BYTES;
+    add.u32         %r58, %r58, 32;
+    bra             k_loop;
+
+k_done:
+    // ==================== STORE RESULTS ====================
+    setp.ge.u32     %p4, %r30, %r25;
+    setp.ge.u32     %p5, %r31, %r26;
+    or.pred         %p6, %p4, %p5;
+    @%p6 ret;
+
+    // Identical to BF16 v3's store path — 64 f32 accumulators → 32 b32 stores.
+
+    // --- mg=0, ng=0: f0..f3 ---
+    mul.lo.u32      %r68, %r50, %r26;
+    add.u32         %r69, %r68, %r53;
+    mul.wide.u32    %rd9, %r69, 2;
+    add.u64         %rd10, %rd2, %rd9;
+    CVT_F32_BF16(%h0, %f0)
+    CVT_F32_BF16(%h1, %f1)
+    mov.b32         %r70, {%h0, %h1};
+    st.global.b32   [%rd10], %r70;
+    mul.lo.u32      %r68, %r51, %r26;
+    add.u32         %r69, %r68, %r53;
+    mul.wide.u32    %rd9, %r69, 2;
+    add.u64         %rd10, %rd2, %rd9;
+    CVT_F32_BF16(%h0, %f2)
+    CVT_F32_BF16(%h1, %f3)
+    mov.b32         %r70, {%h0, %h1};
+    st.global.b32   [%rd10], %r70;
+
+    add.u32         %r71, %r53, 8;
+    mul.lo.u32      %r68, %r50, %r26;
+    add.u32         %r69, %r68, %r71;
+    mul.wide.u32    %rd9, %r69, 2;
+    add.u64         %rd10, %rd2, %rd9;
+    CVT_F32_BF16(%h0, %f4)
+    CVT_F32_BF16(%h1, %f5)
+    mov.b32         %r70, {%h0, %h1};
+    st.global.b32   [%rd10], %r70;
+    mul.lo.u32      %r68, %r51, %r26;
+    add.u32         %r69, %r68, %r71;
+    mul.wide.u32    %rd9, %r69, 2;
+    add.u64         %rd10, %rd2, %rd9;
+    CVT_F32_BF16(%h0, %f6)
+    CVT_F32_BF16(%h1, %f7)
+    mov.b32         %r70, {%h0, %h1};
+    st.global.b32   [%rd10], %r70;
+
+    add.u32         %r71, %r53, 16;
+    mul.lo.u32      %r68, %r50, %r26;
+    add.u32         %r69, %r68, %r71;
+    mul.wide.u32    %rd9, %r69, 2;
+    add.u64         %rd10, %rd2, %rd9;
+    CVT_F32_BF16(%h0, %f8)
+    CVT_F32_BF16(%h1, %f9)
+    mov.b32         %r70, {%h0, %h1};
+    st.global.b32   [%rd10], %r70;
+    mul.lo.u32      %r68, %r51, %r26;
+    add.u32         %r69, %r68, %r71;
+    mul.wide.u32    %rd9, %r69, 2;
+    add.u64         %rd10, %rd2, %rd9;
+    CVT_F32_BF16(%h0, %f10)
+    CVT_F32_BF16(%h1, %f11)
+    mov.b32         %r70, {%h0, %h1};
+    st.global.b32   [%rd10], %r70;
+
+    add.u32         %r71, %r53, 24;
+    mul.lo.u32      %r68, %r50, %r26;
+    add.u32         %r69, %r68, %r71;
+    mul.wide.u32    %rd9, %r69, 2;
+    add.u64         %rd10, %rd2, %rd9;
+    CVT_F32_BF16(%h0, %f12)
+    CVT_F32_BF16(%h1, %f13)
+    mov.b32         %r70, {%h0, %h1};
+    st.global.b32   [%rd10], %r70;
+    mul.lo.u32      %r68, %r51, %r26;
+    add.u32         %r69, %r68, %r71;
+    mul.wide.u32    %rd9, %r69, 2;
+    add.u64         %rd10, %rd2, %rd9;
+    CVT_F32_BF16(%h0, %f14)
+    CVT_F32_BF16(%h1, %f15)
+    mov.b32         %r70, {%h0, %h1};
+    st.global.b32   [%rd10], %r70;
+
+    // mg=1 (rows +16)
+    add.u32         %r72, %r50, 16;
+    add.u32         %r73, %r51, 16;
+
+    mul.lo.u32      %r68, %r72, %r26;
+    add.u32         %r69, %r68, %r53;
+    mul.wide.u32    %rd9, %r69, 2;
+    add.u64         %rd10, %rd2, %rd9;
+    CVT_F32_BF16(%h0, %f16)
+    CVT_F32_BF16(%h1, %f17)
+    mov.b32         %r70, {%h0, %h1};
+    st.global.b32   [%rd10], %r70;
+    mul.lo.u32      %r68, %r73, %r26;
+    add.u32         %r69, %r68, %r53;
+    mul.wide.u32    %rd9, %r69, 2;
+    add.u64         %rd10, %rd2, %rd9;
+    CVT_F32_BF16(%h0, %f18)
+    CVT_F32_BF16(%h1, %f19)
+    mov.b32         %r70, {%h0, %h1};
+    st.global.b32   [%rd10], %r70;
+
+    add.u32         %r71, %r53, 8;
+    mul.lo.u32      %r68, %r72, %r26;
+    add.u32         %r69, %r68, %r71;
+    mul.wide.u32    %rd9, %r69, 2;
+    add.u64         %rd10, %rd2, %rd9;
+    CVT_F32_BF16(%h0, %f20)
+    CVT_F32_BF16(%h1, %f21)
+    mov.b32         %r70, {%h0, %h1};
+    st.global.b32   [%rd10], %r70;
+    mul.lo.u32      %r68, %r73, %r26;
+    add.u32         %r69, %r68, %r71;
+    mul.wide.u32    %rd9, %r69, 2;
+    add.u64         %rd10, %rd2, %rd9;
+    CVT_F32_BF16(%h0, %f22)
+    CVT_F32_BF16(%h1, %f23)
+    mov.b32         %r70, {%h0, %h1};
+    st.global.b32   [%rd10], %r70;
+
+    add.u32         %r71, %r53, 16;
+    mul.lo.u32      %r68, %r72, %r26;
+    add.u32         %r69, %r68, %r71;
+    mul.wide.u32    %rd9, %r69, 2;
+    add.u64         %rd10, %rd2, %rd9;
+    CVT_F32_BF16(%h0, %f24)
+    CVT_F32_BF16(%h1, %f25)
+    mov.b32         %r70, {%h0, %h1};
+    st.global.b32   [%rd10], %r70;
+    mul.lo.u32      %r68, %r73, %r26;
+    add.u32         %r69, %r68, %r71;
+    mul.wide.u32    %rd9, %r69, 2;
+    add.u64         %rd10, %rd2, %rd9;
+    CVT_F32_BF16(%h0, %f26)
+    CVT_F32_BF16(%h1, %f27)
+    mov.b32         %r70, {%h0, %h1};
+    st.global.b32   [%rd10], %r70;
+
+    add.u32         %r71, %r53, 24;
+    mul.lo.u32      %r68, %r72, %r26;
+    add.u32         %r69, %r68, %r71;
+    mul.wide.u32    %rd9, %r69, 2;
+    add.u64         %rd10, %rd2, %rd9;
+    CVT_F32_BF16(%h0, %f28)
+    CVT_F32_BF16(%h1, %f29)
+    mov.b32         %r70, {%h0, %h1};
+    st.global.b32   [%rd10], %r70;
+    mul.lo.u32      %r68, %r73, %r26;
+    add.u32         %r69, %r68, %r71;
+    mul.wide.u32    %rd9, %r69, 2;
+    add.u64         %rd10, %rd2, %rd9;
+    CVT_F32_BF16(%h0, %f30)
+    CVT_F32_BF16(%h1, %f31)
+    mov.b32         %r70, {%h0, %h1};
+    st.global.b32   [%rd10], %r70;
+
+    // mg=2 (rows +32)
+    add.u32         %r72, %r50, 32;
+    add.u32         %r73, %r51, 32;
+    mul.lo.u32      %r68, %r72, %r26; add.u32 %r69, %r68, %r53;
+    mul.wide.u32    %rd9, %r69, 2; add.u64 %rd10, %rd2, %rd9;
+    CVT_F32_BF16(%h0, %f32) CVT_F32_BF16(%h1, %f33)
+    mov.b32 %r70, {%h0, %h1}; st.global.b32 [%rd10], %r70;
+    mul.lo.u32 %r68, %r73, %r26; add.u32 %r69, %r68, %r53;
+    mul.wide.u32 %rd9, %r69, 2; add.u64 %rd10, %rd2, %rd9;
+    CVT_F32_BF16(%h0, %f34) CVT_F32_BF16(%h1, %f35)
+    mov.b32 %r70, {%h0, %h1}; st.global.b32 [%rd10], %r70;
+    add.u32 %r71, %r53, 8;
+    mul.lo.u32 %r68, %r72, %r26; add.u32 %r69, %r68, %r71;
+    mul.wide.u32 %rd9, %r69, 2; add.u64 %rd10, %rd2, %rd9;
+    CVT_F32_BF16(%h0, %f36) CVT_F32_BF16(%h1, %f37)
+    mov.b32 %r70, {%h0, %h1}; st.global.b32 [%rd10], %r70;
+    mul.lo.u32 %r68, %r73, %r26; add.u32 %r69, %r68, %r71;
+    mul.wide.u32 %rd9, %r69, 2; add.u64 %rd10, %rd2, %rd9;
+    CVT_F32_BF16(%h0, %f38) CVT_F32_BF16(%h1, %f39)
+    mov.b32 %r70, {%h0, %h1}; st.global.b32 [%rd10], %r70;
+    add.u32 %r71, %r53, 16;
+    mul.lo.u32 %r68, %r72, %r26; add.u32 %r69, %r68, %r71;
+    mul.wide.u32 %rd9, %r69, 2; add.u64 %rd10, %rd2, %rd9;
+    CVT_F32_BF16(%h0, %f40) CVT_F32_BF16(%h1, %f41)
+    mov.b32 %r70, {%h0, %h1}; st.global.b32 [%rd10], %r70;
+    mul.lo.u32 %r68, %r73, %r26; add.u32 %r69, %r68, %r71;
+    mul.wide.u32 %rd9, %r69, 2; add.u64 %rd10, %rd2, %rd9;
+    CVT_F32_BF16(%h0, %f42) CVT_F32_BF16(%h1, %f43)
+    mov.b32 %r70, {%h0, %h1}; st.global.b32 [%rd10], %r70;
+    add.u32 %r71, %r53, 24;
+    mul.lo.u32 %r68, %r72, %r26; add.u32 %r69, %r68, %r71;
+    mul.wide.u32 %rd9, %r69, 2; add.u64 %rd10, %rd2, %rd9;
+    CVT_F32_BF16(%h0, %f44) CVT_F32_BF16(%h1, %f45)
+    mov.b32 %r70, {%h0, %h1}; st.global.b32 [%rd10], %r70;
+    mul.lo.u32 %r68, %r73, %r26; add.u32 %r69, %r68, %r71;
+    mul.wide.u32 %rd9, %r69, 2; add.u64 %rd10, %rd2, %rd9;
+    CVT_F32_BF16(%h0, %f46) CVT_F32_BF16(%h1, %f47)
+    mov.b32 %r70, {%h0, %h1}; st.global.b32 [%rd10], %r70;
+
+    // mg=3 (rows +48)
+    add.u32         %r72, %r50, 48;
+    add.u32         %r73, %r51, 48;
+    mul.lo.u32 %r68, %r72, %r26; add.u32 %r69, %r68, %r53;
+    mul.wide.u32 %rd9, %r69, 2; add.u64 %rd10, %rd2, %rd9;
+    CVT_F32_BF16(%h0, %f48) CVT_F32_BF16(%h1, %f49)
+    mov.b32 %r70, {%h0, %h1}; st.global.b32 [%rd10], %r70;
+    mul.lo.u32 %r68, %r73, %r26; add.u32 %r69, %r68, %r53;
+    mul.wide.u32 %rd9, %r69, 2; add.u64 %rd10, %rd2, %rd9;
+    CVT_F32_BF16(%h0, %f50) CVT_F32_BF16(%h1, %f51)
+    mov.b32 %r70, {%h0, %h1}; st.global.b32 [%rd10], %r70;
+    add.u32 %r71, %r53, 8;
+    mul.lo.u32 %r68, %r72, %r26; add.u32 %r69, %r68, %r71;
+    mul.wide.u32 %rd9, %r69, 2; add.u64 %rd10, %rd2, %rd9;
+    CVT_F32_BF16(%h0, %f52) CVT_F32_BF16(%h1, %f53)
+    mov.b32 %r70, {%h0, %h1}; st.global.b32 [%rd10], %r70;
+    mul.lo.u32 %r68, %r73, %r26; add.u32 %r69, %r68, %r71;
+    mul.wide.u32 %rd9, %r69, 2; add.u64 %rd10, %rd2, %rd9;
+    CVT_F32_BF16(%h0, %f54) CVT_F32_BF16(%h1, %f55)
+    mov.b32 %r70, {%h0, %h1}; st.global.b32 [%rd10], %r70;
+    add.u32 %r71, %r53, 16;
+    mul.lo.u32 %r68, %r72, %r26; add.u32 %r69, %r68, %r71;
+    mul.wide.u32 %rd9, %r69, 2; add.u64 %rd10, %rd2, %rd9;
+    CVT_F32_BF16(%h0, %f56) CVT_F32_BF16(%h1, %f57)
+    mov.b32 %r70, {%h0, %h1}; st.global.b32 [%rd10], %r70;
+    mul.lo.u32 %r68, %r73, %r26; add.u32 %r69, %r68, %r71;
+    mul.wide.u32 %rd9, %r69, 2; add.u64 %rd10, %rd2, %rd9;
+    CVT_F32_BF16(%h0, %f58) CVT_F32_BF16(%h1, %f59)
+    mov.b32 %r70, {%h0, %h1}; st.global.b32 [%rd10], %r70;
+    add.u32 %r71, %r53, 24;
+    mul.lo.u32 %r68, %r72, %r26; add.u32 %r69, %r68, %r71;
+    mul.wide.u32 %rd9, %r69, 2; add.u64 %rd10, %rd2, %rd9;
+    CVT_F32_BF16(%h0, %f60) CVT_F32_BF16(%h1, %f61)
+    mov.b32 %r70, {%h0, %h1}; st.global.b32 [%rd10], %r70;
+    mul.lo.u32 %r68, %r73, %r26; add.u32 %r69, %r68, %r71;
+    mul.wide.u32 %rd9, %r69, 2; add.u64 %rd10, %rd2, %rd9;
+    CVT_F32_BF16(%h0, %f62) CVT_F32_BF16(%h1, %f63)
+    mov.b32 %r70, {%h0, %h1}; st.global.b32 [%rd10], %r70;
+
+    ret;
+}

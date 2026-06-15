@@ -1,0 +1,202 @@
+// gemv_w8a16_grouped_split_k.ptx
+//
+// Batched M=1 split-K W8A16 GEMV for MoE decode:
+//   For each active_idx in [0, num_active):
+//     eid = active_eids[active_idx]
+//     out_f32[active_idx, :] += x @ dequant(B[eid, :, :])
+// where B is FP8 e4m3 stored as `[n_routed, K, N]` and dequant uses a single
+// per-tensor scale (`scale * f32(b)`), shared across all experts in the stack.
+//
+// Drop-in replacement for `gemv_bf16_grouped_split_k` for MoE expert weight
+// matrices. Halves HBM bandwidth on the heavy expert weight reads (gate/up/
+// down stacks: ~5.7 GB/token at top_k=8 across 40 layers).
+//
+// Block: 128 threads, 8 cols/thread → 1024 cols/block.
+// Grid: (ceil(N / 1024), num_k_shards, num_active)
+// SMEM: k_shard * 2 bytes for the X-shard tile.
+// Constraints: N must be a multiple of 8.
+// Caller MUST zero `out_f32[num_active * N]` before launch.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+.extern .shared .align 16 .b8 smem_xsh_w8a16_grp[];
+
+.visible .entry gemv_w8a16_grouped_split_k(
+    .param .u64 param_x,             // [K] bf16 (or [num_active, x_stride] when x_stride>0)
+    .param .u64 param_b_fp8,         // [n_routed, K, N] fp8 e4m3
+    .param .u64 param_active_eids,   // [num_active] u32
+    .param .u64 param_out_f32,       // [num_active, N] f32 (caller-zeroed accumulator)
+    .param .f32 param_scale,         // per-tensor dequant scale
+    .param .u32 param_n,
+    .param .u32 param_k,
+    .param .u32 param_k_shard,
+    .param .u32 param_x_stride       // 0 = broadcast x across experts, else per-expert stride in bf16 elems
+)
+{
+    .reg .b32 %r<40>;
+    .reg .b64 %rd<20>;
+    .reg .f32 %f<32>;
+    .reg .b16 %h<16>;
+    .reg .pred %p<8>;
+
+    mov.u32         %r0, %ctaid.x;
+    mov.u32         %r1, %ctaid.y;
+    mov.u32         %r30, %ctaid.z;            // active_idx
+    mov.u32         %r2, %tid.x;
+    mov.u32         %r3, %ntid.x;
+
+    // col_start = col_block * 1024 + tid * 8
+    shl.b32         %r4, %r0, 10;
+    shl.b32         %r5, %r2, 3;
+    add.u32         %r6, %r4, %r5;
+
+    ld.param.u64    %rd0, [param_x];
+    ld.param.u64    %rd1, [param_b_fp8];
+    ld.param.u64    %rd10, [param_active_eids];
+    ld.param.u64    %rd2, [param_out_f32];
+    ld.param.f32    %f30, [param_scale];
+    ld.param.u32    %r7, [param_n];
+    ld.param.u32    %r8, [param_k];
+    ld.param.u32    %r9, [param_k_shard];
+    ld.param.u32    %r35, [param_x_stride];
+
+    // Read eid for this active_idx
+    mul.wide.u32    %rd11, %r30, 4;
+    add.u64         %rd12, %rd10, %rd11;
+    ld.global.u32   %r31, [%rd12];             // eid
+
+    // B base for this expert: param_b_fp8 + eid * K * N (one byte per FP8 elem)
+    mul.lo.u32      %r32, %r8, %r7;            // K * N (elements)
+    mul.lo.u32      %r33, %r32, %r31;          // eid * K * N
+    cvt.u64.u32     %rd13, %r33;               // bytes (1 byte/elem)
+    add.u64         %rd1, %rd1, %rd13;
+
+    // X base: param_x + active_idx * x_stride * 2 (BF16 → 2 bytes per elem)
+    mul.lo.u32      %r36, %r30, %r35;
+    mul.wide.u32    %rd15, %r36, 2;
+    add.u64         %rd0, %rd0, %rd15;
+
+    // Output base: out + active_idx * N * 4
+    mul.lo.u32      %r34, %r30, %r7;
+    mul.wide.u32    %rd14, %r34, 4;
+    add.u64         %rd2, %rd2, %rd14;
+
+    // K range for this shard
+    mul.lo.u32      %r10, %r1, %r9;
+    add.u32         %r11, %r10, %r9;
+    min.u32         %r11, %r11, %r8;
+    sub.u32         %r13, %r11, %r10;
+
+    // Cooperative load X[k_start..k_end] into smem
+    mov.u32         %r12, smem_xsh_w8a16_grp;
+    mov.u32         %r14, %r2;
+load_x:
+    setp.ge.u32     %p0, %r14, %r13;
+    @%p0 bra        load_done;
+    add.u32         %r15, %r14, %r10;
+    mul.wide.u32    %rd3, %r15, 2;
+    add.u64         %rd4, %rd0, %rd3;
+    ld.global.b16   %h0, [%rd4];
+    shl.b32         %r16, %r14, 1;
+    add.u32         %r17, %r12, %r16;
+    st.shared.b16   [%r17], %h0;
+    add.u32         %r14, %r14, %r3;
+    bra             load_x;
+load_done:
+    bar.sync        0;
+
+    // Bounds: skip whole thread if its 8-col group beyond N
+    setp.ge.u32     %p1, %r6, %r7;
+    @%p1 bra        ret;
+
+    // 8 accumulators
+    mov.f32         %f0, 0.0;
+    mov.f32         %f1, 0.0;
+    mov.f32         %f2, 0.0;
+    mov.f32         %f3, 0.0;
+    mov.f32         %f4, 0.0;
+    mov.f32         %f5, 0.0;
+    mov.f32         %f6, 0.0;
+    mov.f32         %f7, 0.0;
+
+    // K-shard loop
+    mov.u32         %r18, 0;
+k_loop:
+    setp.ge.u32     %p2, %r18, %r13;
+    @%p2 bra        k_done;
+
+    // X[k_in_shard] from smem, scaled (fold scale into X to save 8 muls per K)
+    shl.b32         %r19, %r18, 1;
+    add.u32         %r20, %r12, %r19;
+    ld.shared.b16   %h0, [%r20];
+    CVT_BF16_F32(%f8, %h0)
+    mul.f32         %f8, %f8, %f30;            // x_scaled = x * scale
+
+    // B_e[k_global, col_start..col_start+8] = 8 FP8 = 8 bytes = v2.b32 load
+    add.u32         %r21, %r18, %r10;          // k_global
+    mul.lo.u32      %r22, %r21, %r7;
+    add.u32         %r22, %r22, %r6;
+    cvt.u64.u32     %rd5, %r22;                // 1 byte per FP8
+    add.u64         %rd6, %rd1, %rd5;
+
+    ld.global.v2.b32 {%r23, %r24}, [%rd6];
+
+    // Decode: 4 e4m3x2 pairs → 4 f16x2 → 8 f16 → 8 f32
+    mov.b32         {%h0, %h1}, %r23;          // pair (col0,1) ; pair (col2,3)
+    mov.b32         {%h2, %h3}, %r24;          // pair (col4,5) ; pair (col6,7)
+
+    cvt.rn.f16x2.e4m3x2 %r25, %h0;
+    cvt.rn.f16x2.e4m3x2 %r26, %h1;
+    cvt.rn.f16x2.e4m3x2 %r27, %h2;
+    cvt.rn.f16x2.e4m3x2 %r28, %h3;
+
+    mov.b32         {%h4, %h5}, %r25;
+    mov.b32         {%h6, %h7}, %r26;
+    mov.b32         {%h8, %h9}, %r27;
+    mov.b32         {%h10, %h11}, %r28;
+
+    cvt.f32.f16     %f9,  %h4;
+    cvt.f32.f16     %f10, %h5;
+    cvt.f32.f16     %f11, %h6;
+    cvt.f32.f16     %f12, %h7;
+    cvt.f32.f16     %f13, %h8;
+    cvt.f32.f16     %f14, %h9;
+    cvt.f32.f16     %f15, %h10;
+    cvt.f32.f16     %f16, %h11;
+
+    // 8-way ILP FMAs (acc += x_scaled * w_dq)
+    fma.rn.f32      %f0, %f8, %f9,  %f0;
+    fma.rn.f32      %f1, %f8, %f10, %f1;
+    fma.rn.f32      %f2, %f8, %f11, %f2;
+    fma.rn.f32      %f3, %f8, %f12, %f3;
+    fma.rn.f32      %f4, %f8, %f13, %f4;
+    fma.rn.f32      %f5, %f8, %f14, %f5;
+    fma.rn.f32      %f6, %f8, %f15, %f6;
+    fma.rn.f32      %f7, %f8, %f16, %f7;
+
+    add.u32         %r18, %r18, 1;
+    bra             k_loop;
+
+k_done:
+    // Atomic accumulate
+    mul.wide.u32    %rd7, %r6, 4;
+    add.u64         %rd8, %rd2, %rd7;
+
+    .reg .f32 %old;
+    atom.global.add.f32 %old, [%rd8 + 0],  %f0;
+    atom.global.add.f32 %old, [%rd8 + 4],  %f1;
+    atom.global.add.f32 %old, [%rd8 + 8],  %f2;
+    atom.global.add.f32 %old, [%rd8 + 12], %f3;
+    atom.global.add.f32 %old, [%rd8 + 16], %f4;
+    atom.global.add.f32 %old, [%rd8 + 20], %f5;
+    atom.global.add.f32 %old, [%rd8 + 24], %f6;
+    atom.global.add.f32 %old, [%rd8 + 28], %f7;
+
+ret:
+    ret;
+}

@@ -1,0 +1,228 @@
+// gemv_bf16_split_k_v4.ptx
+//
+// v4 of split-K GEMV: same shard structure as v3, but the inner K loop
+// is unrolled by 2. Each outer iteration processes K=2 with 16 independent
+// FMAs in flight (vs v3's 8). Higher ILP = better latency hiding from the
+// register-dependent FMA chains.
+//
+// Block: 128 threads, 8 cols/thread → 1024 cols/block.
+// Grid: (ceil(N / 1024), num_k_shards, 1)
+// SMEM: k_shard * 2 bytes for the X-shard tile.
+// Constraints: N must be a multiple of 8. Caller MUST zero out_f32[N].
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+.extern .shared .align 16 .b8 smem_xsh4[];
+
+.visible .entry gemv_bf16_split_k_v4(
+    .param .u64 param_x,
+    .param .u64 param_b,
+    .param .u64 param_out_f32,
+    .param .u32 param_n,
+    .param .u32 param_k,
+    .param .u32 param_k_shard
+)
+{
+    .reg .b32 %r<32>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<48>;
+    .reg .b16 %h<32>;
+    .reg .pred %p<8>;
+
+    mov.u32         %r0, %ctaid.x;
+    mov.u32         %r1, %ctaid.y;
+    mov.u32         %r2, %tid.x;
+    mov.u32         %r3, %ntid.x;
+
+    shl.b32         %r4, %r0, 10;              // col_block * 1024
+    shl.b32         %r5, %r2, 3;               // tid * 8
+    add.u32         %r6, %r4, %r5;             // col_start
+
+    ld.param.u64    %rd0, [param_x];
+    ld.param.u64    %rd1, [param_b];
+    ld.param.u64    %rd2, [param_out_f32];
+    ld.param.u32    %r7, [param_n];
+    ld.param.u32    %r8, [param_k];
+    ld.param.u32    %r9, [param_k_shard];
+
+    mul.lo.u32      %r10, %r1, %r9;            // k_start
+    add.u32         %r11, %r10, %r9;
+    min.u32         %r11, %r11, %r8;           // k_end clamp
+    sub.u32         %r13, %r11, %r10;          // shard_len
+
+    // Cooperatively load X shard into smem.
+    mov.u32         %r12, smem_xsh4;
+    mov.u32         %r14, %r2;
+load_x:
+    setp.ge.u32     %p0, %r14, %r13;
+    @%p0 bra        load_done;
+    add.u32         %r15, %r14, %r10;
+    mul.wide.u32    %rd3, %r15, 2;
+    add.u64         %rd4, %rd0, %rd3;
+    ld.global.b16   %h0, [%rd4];
+    shl.b32         %r16, %r14, 1;
+    add.u32         %r17, %r12, %r16;
+    st.shared.b16   [%r17], %h0;
+    add.u32         %r14, %r14, %r3;
+    bra             load_x;
+load_done:
+    bar.sync        0;
+
+    setp.ge.u32     %p1, %r6, %r7;
+    @%p1 bra        ret;
+
+    // 8 col accumulators
+    mov.f32         %f0, 0.0;
+    mov.f32         %f1, 0.0;
+    mov.f32         %f2, 0.0;
+    mov.f32         %f3, 0.0;
+    mov.f32         %f4, 0.0;
+    mov.f32         %f5, 0.0;
+    mov.f32         %f6, 0.0;
+    mov.f32         %f7, 0.0;
+
+    // K-shard loop, unrolled by 2.
+    // Compute end_aligned = floor(shard_len / 2) * 2 for the unrolled body;
+    // tail handles odd last K.
+    and.b32         %r25, %r13, 0xFFFFFFFE;    // even = shard_len & ~1
+    mov.u32         %r18, 0;                   // k_in_shard
+
+k_loop_unroll2:
+    setp.ge.u32     %p2, %r18, %r25;
+    @%p2 bra        k_tail;
+
+    // Load X[k] and X[k+1] from smem as b32 (2 packed BF16).
+    shl.b32         %r19, %r18, 1;
+    add.u32         %r20, %r12, %r19;
+    ld.shared.b32   %r21, [%r20];
+    mov.b32         {%h0, %h1}, %r21;
+    CVT_BF16_F32(%f8,  %h0)                    // x_k
+    CVT_BF16_F32(%f17, %h1)                    // x_k+1
+
+    // Load B[k, my_cols] (4 packed b32 = 8 BF16).
+    add.u32         %r22, %r18, %r10;          // k_global
+    mul.lo.u32      %r23, %r22, %r7;
+    add.u32         %r23, %r23, %r6;
+    mul.wide.u32    %rd5, %r23, 2;
+    add.u64         %rd6, %rd1, %rd5;
+    ld.global.b32   %r24, [%rd6 + 0];
+    mov.b32         {%h2, %h3}, %r24;
+    ld.global.b32   %r24, [%rd6 + 4];
+    mov.b32         {%h4, %h5}, %r24;
+    ld.global.b32   %r24, [%rd6 + 8];
+    mov.b32         {%h6, %h7}, %r24;
+    ld.global.b32   %r24, [%rd6 + 12];
+    mov.b32         {%h8, %h9}, %r24;
+    CVT_BF16_F32(%f9,  %h2)
+    CVT_BF16_F32(%f10, %h3)
+    CVT_BF16_F32(%f11, %h4)
+    CVT_BF16_F32(%f12, %h5)
+    CVT_BF16_F32(%f13, %h6)
+    CVT_BF16_F32(%f14, %h7)
+    CVT_BF16_F32(%f15, %h8)
+    CVT_BF16_F32(%f16, %h9)
+
+    // Load B[k+1, my_cols] (next K row, N elements later).
+    add.u64         %rd6, %rd6, 0;             // (placeholder reuse)
+    add.u32         %r23, %r23, %r7;           // advance 1 K row
+    mul.wide.u32    %rd5, %r23, 2;
+    add.u64         %rd6, %rd1, %rd5;
+    ld.global.b32   %r24, [%rd6 + 0];
+    mov.b32         {%h10, %h11}, %r24;
+    ld.global.b32   %r24, [%rd6 + 4];
+    mov.b32         {%h12, %h13}, %r24;
+    ld.global.b32   %r24, [%rd6 + 8];
+    mov.b32         {%h14, %h15}, %r24;
+    ld.global.b32   %r24, [%rd6 + 12];
+    mov.b32         {%h16, %h17}, %r24;
+    CVT_BF16_F32(%f18, %h10)
+    CVT_BF16_F32(%f19, %h11)
+    CVT_BF16_F32(%f20, %h12)
+    CVT_BF16_F32(%f21, %h13)
+    CVT_BF16_F32(%f22, %h14)
+    CVT_BF16_F32(%f23, %h15)
+    CVT_BF16_F32(%f24, %h16)
+    CVT_BF16_F32(%f25, %h17)
+
+    // 16 FMAs in flight (8 per K row, both K rows independent).
+    fma.rn.f32      %f0, %f8,  %f9,  %f0;
+    fma.rn.f32      %f1, %f8,  %f10, %f1;
+    fma.rn.f32      %f2, %f8,  %f11, %f2;
+    fma.rn.f32      %f3, %f8,  %f12, %f3;
+    fma.rn.f32      %f4, %f8,  %f13, %f4;
+    fma.rn.f32      %f5, %f8,  %f14, %f5;
+    fma.rn.f32      %f6, %f8,  %f15, %f6;
+    fma.rn.f32      %f7, %f8,  %f16, %f7;
+    fma.rn.f32      %f0, %f17, %f18, %f0;
+    fma.rn.f32      %f1, %f17, %f19, %f1;
+    fma.rn.f32      %f2, %f17, %f20, %f2;
+    fma.rn.f32      %f3, %f17, %f21, %f3;
+    fma.rn.f32      %f4, %f17, %f22, %f4;
+    fma.rn.f32      %f5, %f17, %f23, %f5;
+    fma.rn.f32      %f6, %f17, %f24, %f6;
+    fma.rn.f32      %f7, %f17, %f25, %f7;
+
+    add.u32         %r18, %r18, 2;
+    bra             k_loop_unroll2;
+
+k_tail:
+    // Single trailing K element if shard_len is odd.
+    setp.ge.u32     %p3, %r18, %r13;
+    @%p3 bra        k_done;
+
+    shl.b32         %r19, %r18, 1;
+    add.u32         %r20, %r12, %r19;
+    ld.shared.b16   %h0, [%r20];
+    CVT_BF16_F32(%f8, %h0)
+
+    add.u32         %r22, %r18, %r10;
+    mul.lo.u32      %r23, %r22, %r7;
+    add.u32         %r23, %r23, %r6;
+    mul.wide.u32    %rd5, %r23, 2;
+    add.u64         %rd6, %rd1, %rd5;
+    ld.global.b32   %r24, [%rd6 + 0];
+    mov.b32         {%h2, %h3}, %r24;
+    ld.global.b32   %r24, [%rd6 + 4];
+    mov.b32         {%h4, %h5}, %r24;
+    ld.global.b32   %r24, [%rd6 + 8];
+    mov.b32         {%h6, %h7}, %r24;
+    ld.global.b32   %r24, [%rd6 + 12];
+    mov.b32         {%h8, %h9}, %r24;
+    CVT_BF16_F32(%f9,  %h2)
+    CVT_BF16_F32(%f10, %h3)
+    CVT_BF16_F32(%f11, %h4)
+    CVT_BF16_F32(%f12, %h5)
+    CVT_BF16_F32(%f13, %h6)
+    CVT_BF16_F32(%f14, %h7)
+    CVT_BF16_F32(%f15, %h8)
+    CVT_BF16_F32(%f16, %h9)
+    fma.rn.f32      %f0, %f8, %f9,  %f0;
+    fma.rn.f32      %f1, %f8, %f10, %f1;
+    fma.rn.f32      %f2, %f8, %f11, %f2;
+    fma.rn.f32      %f3, %f8, %f12, %f3;
+    fma.rn.f32      %f4, %f8, %f13, %f4;
+    fma.rn.f32      %f5, %f8, %f14, %f5;
+    fma.rn.f32      %f6, %f8, %f15, %f6;
+    fma.rn.f32      %f7, %f8, %f16, %f7;
+
+k_done:
+    mul.wide.u32    %rd7, %r6, 4;
+    add.u64         %rd8, %rd2, %rd7;
+    .reg .f32 %old;
+    atom.global.add.f32 %old, [%rd8 + 0],  %f0;
+    atom.global.add.f32 %old, [%rd8 + 4],  %f1;
+    atom.global.add.f32 %old, [%rd8 + 8],  %f2;
+    atom.global.add.f32 %old, [%rd8 + 12], %f3;
+    atom.global.add.f32 %old, [%rd8 + 16], %f4;
+    atom.global.add.f32 %old, [%rd8 + 20], %f5;
+    atom.global.add.f32 %old, [%rd8 + 24], %f6;
+    atom.global.add.f32 %old, [%rd8 + 28], %f7;
+
+ret:
+    ret;
+}

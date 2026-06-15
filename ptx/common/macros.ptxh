@@ -1,0 +1,17 @@
+// macros.ptxh
+// Shared definitions for all sm121-kernels PTX files
+
+#ifndef SPARK_MACROS_PTXH
+#define SPARK_MACROS_PTXH
+
+// Thread indexing
+#define THREAD_ID %tid.x
+#define BLOCK_ID_X %ctaid.x
+#define BLOCK_ID_Y %ctaid.y
+#define BLOCK_ID_Z %ctaid.z
+
+// Warp-level constants
+#define WARP_SIZE 32
+#define FULL_MASK 0xFFFFFFFF
+
+#endif

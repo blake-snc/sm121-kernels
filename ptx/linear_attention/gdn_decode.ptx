@@ -1,0 +1,272 @@
+// gdn_decode.ptx
+//
+// Gated DeltaNet — BF16 decode (single token).
+// Used by Qwen3-Next-80B linear-attention layers (36 of 40 total layers).
+//
+// Recurrent delta-rule update:
+//   S_t = alpha * S_{t-1} + beta * (v - S_{t-1} @ k) * k^T
+//   y_t = S_t @ q
+//
+// where S is a [D, D] matrix per (batch, head), and q, k, v are D-vectors.
+// alpha, beta are scalars per (batch, head).
+//
+// Layouts:
+//   q, k, v, y: [B, H, D=128] BF16
+//   alpha, beta: [B, H] FP32
+//   state: [B, H, D, D] FP16 (in-place update) — Stage 18: storage is FP16
+//          (half the FP32 footprint, ~24 MiB/slot vs 48). Compute stays FP32:
+//          state is widened to FP32 on load into SMEM, the whole delta-rule
+//          update runs in FP32, and only the final row store narrows to FP16.
+//          The alpha decay is self-stabilizing so per-step FP16 rounding does
+//          not accumulate unboundedly. Validated against HF at tol=0.
+//
+// Grid: (num_heads, batch). Block: (128, 1, 1) — one thread per row of S.
+// Each thread owns row t of state in SMEM and computes y[t] in its own register.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+#define D 128
+#define BLOCK_DIM 128
+
+// SMEM layout:
+//   smem_state: [D, D] FP32 = 65536 B
+//   smem_q, smem_k, smem_v: D * 4 B = 512 B each
+//   Total ~67 KB (needs cuFuncSetAttribute)
+#define SMEM_STATE_OFF 0
+#define SMEM_Q_OFF     65536
+#define SMEM_K_OFF     66048
+#define SMEM_V_OFF     66560
+#define SMEM_TOTAL     67072
+
+.extern .shared .align 128 .b8 gdn_smem[];
+
+.visible .entry gdn_decode(
+    .param .u64 param_q,
+    .param .u64 param_k,
+    .param .u64 param_v,
+    .param .u64 param_alpha,      // [B, H] FP32
+    .param .u64 param_beta,       // [B, H] FP32
+    .param .u64 param_state,      // [B, H, D, D] FP32 (in-place)
+    .param .u64 param_y,
+    .param .u32 param_num_heads
+)
+{
+    .reg .b32 %r<48>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<32>;
+    .reg .b16 %h<4>;
+    .reg .pred %p<8>;
+
+    mov.u32     %r0, %tid.x;               // 0..127 = row index in state
+    mov.u32     %r1, %ctaid.x;             // head
+    mov.u32     %r2, %ctaid.y;             // batch
+
+    ld.param.u64 %rd0, [param_q];
+    ld.param.u64 %rd1, [param_k];
+    ld.param.u64 %rd2, [param_v];
+    ld.param.u64 %rd3, [param_alpha];
+    ld.param.u64 %rd4, [param_beta];
+    ld.param.u64 %rd5, [param_state];
+    ld.param.u64 %rd6, [param_y];
+    ld.param.u32 %r3, [param_num_heads];
+
+    // row offset: bh = b*H + h
+    mul.lo.u32  %r4, %r2, %r3;
+    add.u32     %r4, %r4, %r1;
+
+    // q, k, v, y addresses: base + bh * D * 2 + t*2
+    mul.lo.u32  %r5, %r4, D;
+    mul.wide.u32 %rd8, %r5, 2;
+    shl.b32     %r6, %r0, 1;
+    cvt.u64.u32 %rd9, %r6;
+
+    add.u64     %rd10, %rd0, %rd8;
+    add.u64     %rd10, %rd10, %rd9;        // &q[b,h,t]
+    add.u64     %rd11, %rd1, %rd8;
+    add.u64     %rd11, %rd11, %rd9;        // &k[b,h,t]
+    add.u64     %rd12, %rd2, %rd8;
+    add.u64     %rd12, %rd12, %rd9;        // &v[b,h,t]
+
+    // Load q, k, v into SMEM (as FP32)
+    ld.global.b16 %h0, [%rd10];
+    ld.global.b16 %h1, [%rd11];
+    ld.global.b16 %h2, [%rd12];
+    CVT_BF16_F32(%f1, %h0)                 // q[t]
+    CVT_BF16_F32(%f2, %h1)                 // k[t]
+    CVT_BF16_F32(%f3, %h2)                 // v[t]
+
+    mov.u32     %r7, gdn_smem;
+    shl.b32     %r8, %r0, 2;               // t*4 bytes
+    add.u32     %r9, %r7, SMEM_Q_OFF;
+    add.u32     %r9, %r9, %r8;
+    st.shared.f32 [%r9], %f1;
+    add.u32     %r9, %r7, SMEM_K_OFF;
+    add.u32     %r9, %r9, %r8;
+    st.shared.f32 [%r9], %f2;
+    add.u32     %r9, %r7, SMEM_V_OFF;
+    add.u32     %r9, %r9, %r8;
+    st.shared.f32 [%r9], %f3;
+
+    // Load alpha, beta (scalars per bh)
+    mul.wide.u32 %rd8, %r4, 4;
+    add.u64     %rd13, %rd3, %rd8;
+    ld.global.f32 %f4, [%rd13];            // alpha
+    add.u64     %rd13, %rd4, %rd8;
+    ld.global.f32 %f5, [%rd13];            // beta
+
+    // Load state[bh, t, :] into SMEM row t
+    // Stage 18: state is FP16 in global mem → byte stride is *2, not *4.
+    // state base = state + bh * D * D * 2 (FP16)
+    mul.lo.u32  %r10, %r4, D;
+    mul.lo.u32  %r10, %r10, D;
+    mul.wide.u32 %rd8, %r10, 2;
+    add.u64     %rd14, %rd5, %rd8;         // &state[b,h,0,0]
+
+    // Row t start: + t * D * 2
+    mul.lo.u32  %r11, %r0, D;
+    mul.wide.u32 %rd9, %r11, 2;
+    add.u64     %rd14, %rd14, %rd9;        // &state[b,h,t,0]
+
+    // SMEM row t location: smem + SMEM_STATE_OFF + t * D * 4
+    add.u32     %r12, %r7, SMEM_STATE_OFF;
+    shl.b32     %r13, %r11, 2;
+    add.u32     %r12, %r12, %r13;          // smem row t
+
+    // Cooperatively load state row: 128 FP32 = 512 B
+    // Each thread loads 4 FP32 = 16B at col group (t*4 ... t*4+3) of row t
+    // Hmm, that conflates row thread with col. Actually simpler: single thread loads
+    // its full row sequentially. With 128 threads each loading 128 FP32, that's
+    // 128 threads × 128 loads = 16K loads. Slow but correct.
+    //
+    // Optimization: each thread loads 4 cols, so 128/4 = 32 threads per row.
+    // For row t owned by thread t: thread t loads cols t*4 through t*4+3... no
+    // that doesn't cover the row.
+    //
+    // Simplest correct: each thread t loads its ENTIRE row t of state.
+    // 128 FP32 per thread per iteration = 128 scalar loads. For correctness ref only.
+
+    mov.u32     %r14, 0;
+load_row_loop:
+    setp.ge.u32 %p1, %r14, D;
+    @%p1 bra    load_row_done;
+    shl.b32     %r15, %r14, 2;             // col * 4 bytes (FP32 SMEM offset)
+    shl.b32     %r17, %r14, 1;             // col * 2 bytes (FP16 global offset)
+    cvt.u64.u32 %rd15, %r17;
+    add.u64     %rd15, %rd14, %rd15;
+    ld.global.b16 %h3, [%rd15];            // FP16 state element
+    cvt.f32.f16 %f6, %h3;                  // widen to FP32 for SMEM compute
+    add.u32     %r16, %r12, %r15;
+    st.shared.f32 [%r16], %f6;
+    add.u32     %r14, %r14, 1;
+    bra         load_row_loop;
+load_row_done:
+
+    bar.sync 0;
+
+    // Step 1: temp[t] = alpha * sum_j S[t, j] * k[j]   — each thread does its own row dot
+    //
+    // CRITICAL: the dot product must be against the ALPHA-DECAYED state, not
+    // the raw S_{t-1}, to match HF transformers' gdn_hybrid recurrent_gated_delta_rule
+    // (`last_recurrent_state = last_recurrent_state * g_t; kv_mem = ...`).
+    // Equivalently, since alpha is a scalar per (B, H), we accumulate the dot
+    // unscaled then multiply by alpha at the end. Without this, the delta term
+    // (v - kv_mem) is computed from undecayed state and drifts every prefill
+    // position (T3.3 GDN drift root cause, fixed 2026-05-18).
+    mov.f32     %f10, 0.0;
+    mov.u32     %r14, 0;
+step1_loop:
+    setp.ge.u32 %p1, %r14, D;
+    @%p1 bra    step1_done;
+    shl.b32     %r15, %r14, 2;
+    // S[t, j] from SMEM row t, col j
+    add.u32     %r16, %r12, %r15;
+    ld.shared.f32 %f6, [%r16];
+    // k[j] from SMEM
+    add.u32     %r17, %r7, SMEM_K_OFF;
+    add.u32     %r17, %r17, %r15;
+    ld.shared.f32 %f7, [%r17];
+    fma.rn.f32  %f10, %f6, %f7, %f10;
+    add.u32     %r14, %r14, 1;
+    bra         step1_loop;
+step1_done:
+    mul.f32     %f10, %f10, %f4;           // temp *= alpha (apply decay)
+
+    // Step 2: diff[t] = v[t] - temp[t]
+    sub.f32     %f11, %f3, %f10;           // diff[t]
+
+    // Step 3: new_state[t, j] = alpha * S[t, j] + beta * diff[t] * k[j]
+    // Overwrites SMEM row t; no other thread reads this row so no sync needed until step 4.
+    mov.u32     %r14, 0;
+step3_loop:
+    setp.ge.u32 %p1, %r14, D;
+    @%p1 bra    step3_done;
+    shl.b32     %r15, %r14, 2;
+    add.u32     %r16, %r12, %r15;
+    ld.shared.f32 %f6, [%r16];             // old S[t, j]
+    add.u32     %r17, %r7, SMEM_K_OFF;
+    add.u32     %r17, %r17, %r15;
+    ld.shared.f32 %f7, [%r17];             // k[j]
+    // new = alpha * old + beta * diff * k[j]
+    mul.f32     %f8, %f5, %f11;            // beta * diff
+    fma.rn.f32  %f9, %f8, %f7, 0.0;        // beta * diff * k[j]
+    fma.rn.f32  %f12, %f4, %f6, %f9;       // alpha*old + beta*diff*k
+    st.shared.f32 [%r16], %f12;
+    add.u32     %r14, %r14, 1;
+    bra         step3_loop;
+step3_done:
+
+    bar.sync 0;
+
+    // Step 4: y[t] = sum_j new_S[t, j] * q[j]  — each thread independent (reads its own row)
+    mov.f32     %f13, 0.0;
+    mov.u32     %r14, 0;
+step4_loop:
+    setp.ge.u32 %p1, %r14, D;
+    @%p1 bra    step4_done;
+    shl.b32     %r15, %r14, 2;
+    add.u32     %r16, %r12, %r15;
+    ld.shared.f32 %f6, [%r16];
+    add.u32     %r17, %r7, SMEM_Q_OFF;
+    add.u32     %r17, %r17, %r15;
+    ld.shared.f32 %f7, [%r17];
+    fma.rn.f32  %f13, %f6, %f7, %f13;
+    add.u32     %r14, %r14, 1;
+    bra         step4_loop;
+step4_done:
+
+    // Store y[t] as BF16
+    add.u64     %rd15, %rd6, %rd8;          // wrong base; use fresh
+    mul.lo.u32  %r5, %r4, D;
+    mul.wide.u32 %rd8, %r5, 2;
+    add.u64     %rd15, %rd6, %rd8;
+    shl.b32     %r6, %r0, 1;
+    cvt.u64.u32 %rd9, %r6;
+    add.u64     %rd15, %rd15, %rd9;
+    cvt.rn.bf16.f32 %h0, %f13;
+    st.global.b16 [%rd15], %h0;
+
+    // Write new_state back to global (each thread writes its row)
+    // Stage 18: SMEM read stays FP32 (col*4); global write narrows to FP16 (col*2).
+    mov.u32     %r14, 0;
+store_row_loop:
+    setp.ge.u32 %p1, %r14, D;
+    @%p1 bra    store_row_done;
+    shl.b32     %r15, %r14, 2;             // col*4 bytes (FP32 SMEM offset)
+    add.u32     %r16, %r12, %r15;
+    ld.shared.f32 %f6, [%r16];
+    shl.b32     %r17, %r14, 1;             // col*2 bytes (FP16 global offset)
+    cvt.u64.u32 %rd15, %r17;
+    add.u64     %rd15, %rd14, %rd15;
+    cvt.rn.f16.f32 %h3, %f6;
+    st.global.b16 [%rd15], %h3;
+    add.u32     %r14, %r14, 1;
+    bra         store_row_loop;
+store_row_done:
+
+    ret;
+}

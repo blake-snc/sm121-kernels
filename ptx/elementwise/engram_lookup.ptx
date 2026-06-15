@@ -1,0 +1,244 @@
+// engram_lookup.ptx
+//
+// DeepSeek Engram — Conditional Memory lookup + context-aware gate.
+//
+// Engram is a new sparsity axis (paper: "Conditional Memory via Scalable
+// Lookup", arxiv 2601.07372) shipping in DeepSeek V4 (Q2-Q3 2026).
+// It augments the residual stream with a deterministic O(1) table lookup
+// keyed by a hash of the recent N-gram context. The retrieved embedding
+// is gated by the current hidden state before being added back.
+//
+// Design (reference):
+//   1. Multi-head hashing: for each of NUM_HASH_HEADS, hash the N-gram
+//      token IDs to an index into memory_table (size TABLE_ROWS × D).
+//      We use a simple polynomial hash per head with distinct primes.
+//   2. Lookup: retrieved[head] = memory_table[hash_id[head], :]   (D=128 dims)
+//   3. Sum across heads: combined = sum_h retrieved[h]
+//   4. Context gate: gate = sigmoid(dot(W_gate[:, t*4:t*4+4], hidden))
+//      (per-dim gate; W_gate is [D, D] but we just use the diagonal's
+//      dot product — a simplification of full gating.)
+//   5. Output: residual + gate * combined
+//
+// This is a reference implementation illustrating the algorithm. A
+// production version would integrate with the attention output residual
+// path (saves a global memcpy).
+//
+// Layouts:
+//   hidden: [B, D=128] BF16                 (current hidden state)
+//   residual: [B, D] BF16                   (existing residual — modified in place)
+//   ngram_tokens: [B, N_GRAM=4] u32          (last N-gram token IDs)
+//   memory_table: [TABLE_ROWS, D] BF16       (up to TABLE_ROWS=65536 entries)
+//   W_gate_diag: [D] FP32                    (gate's per-dim projection weight)
+//
+// Grid: (batch, 1, 1). Block: (32, 1, 1). Each thread handles 4 of D=128.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+#define D 128
+#define N_GRAM 4
+#define NUM_HASH_HEADS 4
+#define TABLE_ROWS_MASK 0xFFFF    // modulo 65536 → table_rows must be 65536
+
+.shared .align 4 .b8 smem_engram_hash[16];   // 4 hash heads × 4 bytes (u32)
+
+.visible .entry engram_lookup(
+    .param .u64 param_hidden,
+    .param .u64 param_residual,
+    .param .u64 param_ngram_tokens,
+    .param .u64 param_memory_table,
+    .param .u64 param_w_gate_diag,
+    .param .u32 param_num_hash_heads,
+    .param .u32 param_table_rows
+)
+{
+    .reg .b32 %r<32>;
+    .reg .b64 %rd<12>;
+    .reg .f32 %f<12>;
+    .reg .b16 %h<8>;
+    .reg .pred %p<4>;
+
+    mov.u32     %r0, %tid.x;               // 0..31
+    mov.u32     %r1, %ctaid.x;              // batch
+
+    ld.param.u64 %rd0, [param_hidden];
+    ld.param.u64 %rd1, [param_residual];
+    ld.param.u64 %rd2, [param_ngram_tokens];
+    ld.param.u64 %rd3, [param_memory_table];
+    ld.param.u64 %rd4, [param_w_gate_diag];
+    ld.param.u32 %r2, [param_num_hash_heads];
+    ld.param.u32 %r3, [param_table_rows];
+
+    // ---- Step 1: Multi-head hashing (single thread, broadcast via SMEM) ----
+    setp.eq.u32 %p1, %r0, 0;
+    @%p1 mul.wide.u32 %rd5, %r1, 16;       // batch * N_GRAM * 4 bytes
+    @%p1 add.u64 %rd6, %rd2, %rd5;
+    // Load 4 N-gram tokens into registers (only thread 0 needs them for hashing)
+    @%p1 ld.global.v4.u32 {%r10, %r11, %r12, %r13}, [%rd6];
+
+    // Polynomial hash per head: h = t0 + prime * (t1 + prime * (t2 + prime * t3)) mod TABLE_ROWS
+    // Four primes for four heads.
+    @%p1 mad.lo.u32 %r20, %r13, 2654435761, %r12;   // head 0 prime
+    @%p1 mad.lo.u32 %r20, %r20, 2654435761, %r11;
+    @%p1 mad.lo.u32 %r20, %r20, 2654435761, %r10;
+    @%p1 and.b32 %r20, %r20, TABLE_ROWS_MASK;
+
+    @%p1 mad.lo.u32 %r21, %r13, 805306457, %r12;
+    @%p1 mad.lo.u32 %r21, %r21, 805306457, %r11;
+    @%p1 mad.lo.u32 %r21, %r21, 805306457, %r10;
+    @%p1 and.b32 %r21, %r21, TABLE_ROWS_MASK;
+
+    @%p1 mad.lo.u32 %r22, %r13, 402653189, %r12;
+    @%p1 mad.lo.u32 %r22, %r22, 402653189, %r11;
+    @%p1 mad.lo.u32 %r22, %r22, 402653189, %r10;
+    @%p1 and.b32 %r22, %r22, TABLE_ROWS_MASK;
+
+    @%p1 mad.lo.u32 %r23, %r13, 201326611, %r12;
+    @%p1 mad.lo.u32 %r23, %r23, 201326611, %r11;
+    @%p1 mad.lo.u32 %r23, %r23, 201326611, %r10;
+    @%p1 and.b32 %r23, %r23, TABLE_ROWS_MASK;
+
+    // Broadcast hash ids via SMEM
+    @%p1 mov.u32 %r24, smem_engram_hash;
+    @%p1 st.shared.u32 [%r24], %r20;
+    @%p1 st.shared.u32 [%r24 + 4], %r21;
+    @%p1 st.shared.u32 [%r24 + 8], %r22;
+    @%p1 st.shared.u32 [%r24 + 12], %r23;
+    bar.sync 0;
+
+    // All threads load hash IDs
+    mov.u32     %r24, smem_engram_hash;
+    ld.shared.u32 %r20, [%r24];
+    ld.shared.u32 %r21, [%r24 + 4];
+    ld.shared.u32 %r22, [%r24 + 8];
+    ld.shared.u32 %r23, [%r24 + 12];
+
+    // ---- Step 2+3: Lookup + sum across heads ----
+    // Each thread handles 4 dims. Read memory_table[hash, t*4 .. +3] for each head.
+    shl.b32     %r5, %r0, 3;              // t*8 bytes (4 bf16)
+    cvt.u64.u32 %rd7, %r5;
+
+    // Head 0
+    mul.wide.u32 %rd5, %r20, D * 2;       // hash * D * 2 bytes
+    add.u64     %rd8, %rd3, %rd5;
+    add.u64     %rd8, %rd8, %rd7;
+    ld.global.v2.b32 {%r6, %r7}, [%rd8];
+    mov.b32     {%h0, %h1}, %r6;
+    mov.b32     {%h2, %h3}, %r7;
+    CVT_BF16_F32(%f0, %h0)
+    CVT_BF16_F32(%f1, %h1)
+    CVT_BF16_F32(%f2, %h2)
+    CVT_BF16_F32(%f3, %h3)
+
+    // Head 1
+    mul.wide.u32 %rd5, %r21, D * 2;
+    add.u64     %rd8, %rd3, %rd5;
+    add.u64     %rd8, %rd8, %rd7;
+    ld.global.v2.b32 {%r6, %r7}, [%rd8];
+    mov.b32     {%h0, %h1}, %r6;
+    mov.b32     {%h2, %h3}, %r7;
+    .reg .f32 _a0, _a1, _a2, _a3;
+    CVT_BF16_F32(_a0, %h0)
+    CVT_BF16_F32(_a1, %h1)
+    CVT_BF16_F32(_a2, %h2)
+    CVT_BF16_F32(_a3, %h3)
+    add.f32 %f0, %f0, _a0;
+    add.f32 %f1, %f1, _a1;
+    add.f32 %f2, %f2, _a2;
+    add.f32 %f3, %f3, _a3;
+
+    // Head 2
+    mul.wide.u32 %rd5, %r22, D * 2;
+    add.u64     %rd8, %rd3, %rd5;
+    add.u64     %rd8, %rd8, %rd7;
+    ld.global.v2.b32 {%r6, %r7}, [%rd8];
+    mov.b32     {%h0, %h1}, %r6;
+    mov.b32     {%h2, %h3}, %r7;
+    CVT_BF16_F32(_a0, %h0)
+    CVT_BF16_F32(_a1, %h1)
+    CVT_BF16_F32(_a2, %h2)
+    CVT_BF16_F32(_a3, %h3)
+    add.f32 %f0, %f0, _a0;
+    add.f32 %f1, %f1, _a1;
+    add.f32 %f2, %f2, _a2;
+    add.f32 %f3, %f3, _a3;
+
+    // Head 3
+    mul.wide.u32 %rd5, %r23, D * 2;
+    add.u64     %rd8, %rd3, %rd5;
+    add.u64     %rd8, %rd8, %rd7;
+    ld.global.v2.b32 {%r6, %r7}, [%rd8];
+    mov.b32     {%h0, %h1}, %r6;
+    mov.b32     {%h2, %h3}, %r7;
+    CVT_BF16_F32(_a0, %h0)
+    CVT_BF16_F32(_a1, %h1)
+    CVT_BF16_F32(_a2, %h2)
+    CVT_BF16_F32(_a3, %h3)
+    add.f32 %f0, %f0, _a0;
+    add.f32 %f1, %f1, _a1;
+    add.f32 %f2, %f2, _a2;
+    add.f32 %f3, %f3, _a3;
+
+    // ---- Step 4: Context gate ----
+    // Load hidden[b, t*4 .. +3] and W_gate_diag[t*4 .. +3], multiply, per-dim gate via sigmoid.
+    mul.wide.u32 %rd5, %r1, D * 2;
+    add.u64     %rd9, %rd0, %rd5;
+    add.u64     %rd9, %rd9, %rd7;
+    ld.global.v2.b32 {%r6, %r7}, [%rd9];
+    mov.b32     {%h0, %h1}, %r6;
+    mov.b32     {%h2, %h3}, %r7;
+    .reg .f32 _hc0, _hc1, _hc2, _hc3;
+    CVT_BF16_F32(_hc0, %h0)
+    CVT_BF16_F32(_hc1, %h1)
+    CVT_BF16_F32(_hc2, %h2)
+    CVT_BF16_F32(_hc3, %h3)
+
+    // W_gate_diag (FP32)
+    shl.b32     %r8, %r0, 4;              // t*16 bytes (4 f32)
+    cvt.u64.u32 %rd11, %r8;
+    add.u64     %rd11, %rd4, %rd11;
+    ld.global.v4.f32 {_a0, _a1, _a2, _a3}, [%rd11];
+
+    // Per-dim sigmoid gate: g = 1 / (1 + exp(-hc * w))
+    #define SIGMOID(out, x) \
+        { neg.f32 out, x; \
+          mul.f32 out, out, LOG2E; \
+          ex2.approx.ftz.f32 out, out; \
+          add.f32 out, out, 1.0; \
+          rcp.approx.f32 out, out; }
+    .reg .f32 _g0, _g1, _g2, _g3, _xx;
+    mul.f32 _xx, _hc0, _a0; SIGMOID(_g0, _xx)
+    mul.f32 _xx, _hc1, _a1; SIGMOID(_g1, _xx)
+    mul.f32 _xx, _hc2, _a2; SIGMOID(_g2, _xx)
+    mul.f32 _xx, _hc3, _a3; SIGMOID(_g3, _xx)
+
+    // ---- Step 5: residual += gate * combined ----
+    add.u64     %rd10, %rd1, %rd5;
+    add.u64     %rd10, %rd10, %rd7;
+    ld.global.v2.b32 {%r6, %r7}, [%rd10];
+    mov.b32     {%h0, %h1}, %r6;
+    mov.b32     {%h2, %h3}, %r7;
+    .reg .f32 _r0, _r1, _r2, _r3;
+    CVT_BF16_F32(_r0, %h0)
+    CVT_BF16_F32(_r1, %h1)
+    CVT_BF16_F32(_r2, %h2)
+    CVT_BF16_F32(_r3, %h3)
+    fma.rn.f32 _r0, _g0, %f0, _r0;
+    fma.rn.f32 _r1, _g1, %f1, _r1;
+    fma.rn.f32 _r2, _g2, %f2, _r2;
+    fma.rn.f32 _r3, _g3, %f3, _r3;
+
+    cvt.rn.bf16.f32 %h0, _r0;
+    cvt.rn.bf16.f32 %h1, _r1;
+    mov.b32 %r6, {%h0, %h1};
+    cvt.rn.bf16.f32 %h0, _r2;
+    cvt.rn.bf16.f32 %h1, _r3;
+    mov.b32 %r7, {%h0, %h1};
+    st.global.v2.b32 [%rd10], {%r6, %r7};
+
+    ret;
+}

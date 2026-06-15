@@ -1,0 +1,252 @@
+// rmsnorm_bf16_fp8out.ptx
+//
+// RMSNorm with FP8 E4M3 output for quantized inference pipelines:
+//   tmp[i]  = (x[i] / rms) * weight[i]          (computed in F32)
+//   out[i]  = round_to_e4m3(tmp[i] * inv_scale) (saturating)
+// where rms = sqrt(mean(x^2) + eps)
+// and inv_scale is provided by the caller — matches the scale the downstream
+// FP8 GEMM/attention kernel uses to dequantize.
+//
+// Output layout: [num_rows, hidden_dim] fp8_e4m3 stored as u8.
+// hidden_dim must be a multiple of 2 (FP8 packs via the e4m3x2 pair instruction).
+//
+// Grid: (num_rows, 1, 1). Block: (256, 1, 1). Vectorized v2.b32 I/O on input,
+// packed b32 (4 FP8 values) output per 4-element chunk.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "reduction.ptxh"
+#include "convert.ptxh"
+
+.shared .align 128 .b8 smem_reduce[128];
+
+.visible .entry rmsnorm_bf16_fp8out(
+    .param .u64 param_x,         // input: [num_rows, hidden_dim] bf16
+    .param .u64 param_out,       // output: [num_rows, hidden_dim] fp8_e4m3 (u8)
+    .param .u64 param_weight,    // [hidden_dim] bf16
+    .param .u32 param_hidden,    // hidden_dim (must be even)
+    .param .f32 param_eps,       // epsilon for numerical stability
+    .param .f32 param_inv_scale  // multiplies pre-FP8 output to map to FP8 range
+)
+{
+    .reg .b32 %r<36>;
+    .reg .b64 %rd<20>;
+    .reg .f32 %f<20>;
+    .reg .b16 %h<16>;
+    .reg .pred %p<4>;
+
+    mov.u32         %r0, BLOCK_ID_X;
+    mov.u32         %r1, THREAD_ID;
+
+    ld.param.u64    %rd0, [param_x];
+    ld.param.u64    %rd1, [param_out];
+    ld.param.u64    %rd14, [param_weight];
+    ld.param.u32    %r2, [param_hidden];
+    ld.param.f32    %f0, [param_eps];
+    ld.param.f32    %f17, [param_inv_scale];
+
+    // Per-row byte offsets — input is bf16 (2 bytes), output is fp8 (1 byte)
+    mul.lo.u32      %r3, %r0, %r2;
+    mul.wide.u32    %rd3, %r3, 2;
+    mul.wide.u32    %rd19, %r3, 1;
+    add.u64         %rd4, %rd0, %rd3;        // &x[row, 0]
+    add.u64         %rd6, %rd1, %rd19;       // &out[row, 0]
+
+    mov.u32         %r4, %ntid.x;
+    shl.b32         %r20, %r4, 2;            // vec_stride
+    sub.u32         %r21, %r20, 1;
+    not.b32         %r21, %r21;
+    and.b32         %r22, %r2, %r21;         // vec_limit
+
+    // ============ Pass 1: sum_sq ============
+    mov.f32         %f1, 0.0;
+    shl.b32         %r5, %r1, 2;
+
+s_vec:
+    setp.ge.u32     %p0, %r5, %r22;
+    @%p0 bra        s_done;
+    mul.wide.u32    %rd7, %r5, 2;
+    add.u64         %rd8, %rd4, %rd7;
+    ld.global.v2.b32 {%r10, %r11}, [%rd8];
+    mov.b32         {%h0, %h1}, %r10;
+    mov.b32         {%h2, %h3}, %r11;
+    CVT_BF16_F32(%f2, %h0)
+    FMA_F32(%f1, %f2, %f2, %f1)
+    CVT_BF16_F32(%f3, %h1)
+    FMA_F32(%f1, %f3, %f3, %f1)
+    CVT_BF16_F32(%f2, %h2)
+    FMA_F32(%f1, %f2, %f2, %f1)
+    CVT_BF16_F32(%f3, %h3)
+    FMA_F32(%f1, %f3, %f3, %f1)
+    add.u32         %r5, %r5, %r20;
+    bra             s_vec;
+
+s_done:
+    add.u32         %r5, %r22, %r1;
+
+s_tail:
+    setp.ge.u32     %p0, %r5, %r2;
+    @%p0 bra        s_red;
+    mul.wide.u32    %rd7, %r5, 2;
+    add.u64         %rd8, %rd4, %rd7;
+    ld.global.b16   %h0, [%rd8];
+    CVT_BF16_F32(%f2, %h0)
+    FMA_F32(%f1, %f2, %f2, %f1)
+    add.u32         %r5, %r5, %r4;
+    bra             s_tail;
+
+s_red:
+    WARP_REDUCE_SUM_F32(%f1, %f3)
+    WARP_ID(%r6, %r1)
+    LANE_ID(%r7, %r1)
+    setp.eq.u32     %p1, %r7, 0;
+    @%p1 bra        s_ws;
+    bra             s_skip;
+s_ws:
+    mul.wide.u32    %rd10, %r6, 4;
+    mov.u64         %rd11, smem_reduce;
+    add.u64         %rd12, %rd11, %rd10;
+    st.shared.f32   [%rd12], %f1;
+s_skip:
+    bar.sync        0;
+
+    shr.u32         %r8, %r4, 5;
+    setp.lt.u32     %p2, %r6, 1;
+    @%p2 bra        s_w0;
+    bra             s_after;
+s_w0:
+    setp.lt.u32     %p3, %r7, %r8;
+    @%p3 bra        s_load;
+    mov.f32         %f1, 0.0;
+    bra             s_final;
+s_load:
+    mul.wide.u32    %rd10, %r7, 4;
+    mov.u64         %rd11, smem_reduce;
+    add.u64         %rd12, %rd11, %rd10;
+    ld.shared.f32   %f1, [%rd12];
+s_final:
+    WARP_REDUCE_SUM_F32(%f1, %f3)
+    setp.eq.u32     %p1, %r7, 0;
+    @%p1 bra        s_compute;
+    bra             s_after;
+s_compute:
+    cvt.rn.f32.u32  %f4, %r2;
+    div.approx.f32  %f5, %f1, %f4;
+    add.f32         %f5, %f5, %f0;
+    RSQRT_F32(%f6, %f5)
+    mov.u64         %rd11, smem_reduce;
+    st.shared.f32   [%rd11], %f6;
+
+s_after:
+    bar.sync        0;
+    mov.u64         %rd11, smem_reduce;
+    ld.shared.f32   %f6, [%rd11];              // rms_inv
+
+    // Combine rms_inv with inv_scale so we need fewer multiplies per element
+    mul.f32         %f6, %f6, %f17;            // rms_inv * inv_scale
+
+    // ============ Pass 2: (x * rms_inv * inv_scale * weight) → FP8 ============
+    shl.b32         %r5, %r1, 2;               // i = tid * 4
+
+norm_vec:
+    setp.ge.u32     %p0, %r5, %r22;
+    @%p0 bra        norm_done;
+
+    mul.wide.u32    %rd7, %r5, 2;
+    add.u64         %rd8, %rd4, %rd7;
+    add.u64         %rd15, %rd14, %rd7;
+    ld.global.v2.b32 {%r10, %r11}, [%rd8];
+    ld.global.v2.b32 {%r12, %r13}, [%rd15];
+    mov.b32         {%h0, %h1}, %r10;
+    mov.b32         {%h2, %h3}, %r11;
+    mov.b32         {%h4, %h5}, %r12;          // weights
+    mov.b32         {%h6, %h7}, %r13;
+
+    CVT_BF16_F32(%f2, %h0)
+    CVT_BF16_F32(%f7, %h4)
+    mul.f32         %f8, %f2, %f6;             // x * rms_inv * inv_scale
+    mul.f32         %f8, %f8, %f7;             // * weight
+
+    CVT_BF16_F32(%f2, %h1)
+    CVT_BF16_F32(%f7, %h5)
+    mul.f32         %f9, %f2, %f6;
+    mul.f32         %f9, %f9, %f7;
+
+    CVT_BF16_F32(%f2, %h2)
+    CVT_BF16_F32(%f7, %h6)
+    mul.f32         %f10, %f2, %f6;
+    mul.f32         %f10, %f10, %f7;
+
+    CVT_BF16_F32(%f2, %h3)
+    CVT_BF16_F32(%f7, %h7)
+    mul.f32         %f11, %f2, %f6;
+    mul.f32         %f11, %f11, %f7;
+
+    // Pack 4 F32 → 4 FP8 bytes via two e4m3x2 calls (high_src, low_src order)
+    .reg .b16 _b0, _b1;
+    CVT_F32X2_E4M3X2(_b0, %f9, %f8)            // byte 0 = f8 (x0), byte 1 = f9 (x1)
+    CVT_F32X2_E4M3X2(_b1, %f11, %f10)          // byte 2 = f10 (x2), byte 3 = f11 (x3)
+    mov.b32         %r14, {_b0, _b1};          // 4 packed FP8 bytes
+
+    // Output offset: byte offset = row*hidden + i
+    mul.wide.u32    %rd16, %r5, 1;
+    add.u64         %rd17, %rd6, %rd16;
+    st.global.b32   [%rd17], %r14;
+
+    add.u32         %r5, %r5, %r20;
+    bra             norm_vec;
+
+norm_done:
+    add.u32         %r5, %r22, %r1;
+
+// Handle 2-element tail using the pair cvt (hidden must be even → tail is 0 or 2+).
+norm_tail:
+    setp.ge.u32     %p0, %r5, %r2;
+    @%p0 bra        epilogue;
+    mul.wide.u32    %rd7, %r5, 2;
+    add.u64         %rd8, %rd4, %rd7;
+    add.u64         %rd15, %rd14, %rd7;
+    ld.global.b16   %h0, [%rd8];
+    ld.global.b16   %h4, [%rd15];
+    CVT_BF16_F32(%f2, %h0)
+    CVT_BF16_F32(%f7, %h4)
+    mul.f32         %f8, %f2, %f6;
+    mul.f32         %f8, %f8, %f7;
+    // Load next element if available
+    add.u32         %r24, %r5, 1;
+    setp.lt.u32     %p1, %r24, %r2;
+    @!%p1 bra       tail_single;
+    add.u64         %rd8, %rd8, 2;
+    add.u64         %rd15, %rd15, 2;
+    ld.global.b16   %h1, [%rd8];
+    ld.global.b16   %h5, [%rd15];
+    CVT_BF16_F32(%f3, %h1)
+    CVT_BF16_F32(%f12, %h5)
+    mul.f32         %f9, %f3, %f6;
+    mul.f32         %f9, %f9, %f12;
+    .reg .b16 _t0;
+    CVT_F32X2_E4M3X2(_t0, %f9, %f8)
+    mul.wide.u32    %rd16, %r5, 1;
+    add.u64         %rd17, %rd6, %rd16;
+    st.global.b16   [%rd17], _t0;
+    add.u32         %r5, %r5, 2;
+    add.u32         %r5, %r5, %r4;             // advance by stride (plus 2 just written)
+    bra             norm_tail;
+
+tail_single:
+    // Single trailing element (hidden odd — shouldn't happen per kernel contract).
+    // Emit one byte by packing with 0.0 in the high half and storing only the low byte.
+    .reg .b16 _t1;
+    CVT_F32X2_E4M3X2(_t1, 0f00000000, %f8)
+    mul.wide.u32    %rd16, %r5, 1;
+    add.u64         %rd17, %rd6, %rd16;
+    st.global.b8    [%rd17], _t1;
+    add.u32         %r5, %r5, %r4;
+    bra             norm_tail;
+
+epilogue:
+    ret;
+}

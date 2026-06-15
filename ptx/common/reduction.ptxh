@@ -1,0 +1,62 @@
+// reduction.ptxh
+// Warp-level and block-level reduction primitives
+
+#ifndef SPARK_REDUCTION_PTXH
+#define SPARK_REDUCTION_PTXH
+
+#include "macros.ptxh"
+
+// Warp-level butterfly reduction for f32 sum.
+// All lanes get the result due to the butterfly pattern.
+// WARP_REDUCE_SUM_F32(val_reg, tmp_reg)
+#define WARP_REDUCE_SUM_F32(val, tmp) \
+    shfl.sync.bfly.b32 tmp, val, 16, 31, FULL_MASK; \
+    add.f32 val, val, tmp; \
+    shfl.sync.bfly.b32 tmp, val, 8, 31, FULL_MASK; \
+    add.f32 val, val, tmp; \
+    shfl.sync.bfly.b32 tmp, val, 4, 31, FULL_MASK; \
+    add.f32 val, val, tmp; \
+    shfl.sync.bfly.b32 tmp, val, 2, 31, FULL_MASK; \
+    add.f32 val, val, tmp; \
+    shfl.sync.bfly.b32 tmp, val, 1, 31, FULL_MASK; \
+    add.f32 val, val, tmp;
+
+// Warp-level butterfly reduction for f32 max.
+#define WARP_REDUCE_MAX_F32(val, tmp) \
+    shfl.sync.bfly.b32 tmp, val, 16, 31, FULL_MASK; \
+    max.f32 val, val, tmp; \
+    shfl.sync.bfly.b32 tmp, val, 8, 31, FULL_MASK; \
+    max.f32 val, val, tmp; \
+    shfl.sync.bfly.b32 tmp, val, 4, 31, FULL_MASK; \
+    max.f32 val, val, tmp; \
+    shfl.sync.bfly.b32 tmp, val, 2, 31, FULL_MASK; \
+    max.f32 val, val, tmp; \
+    shfl.sync.bfly.b32 tmp, val, 1, 31, FULL_MASK; \
+    max.f32 val, val, tmp;
+
+// Group-of-4 butterfly reduction for f32 max.
+// Reduces within groups of 4 threads (tidInGroup 0..3).
+// Used for per-row softmax max in flash attention (m16n8k16 MMA has 4 threads per row).
+// Clamp = 0x1c1f: segMask=0x1c (bits 12:8) confines to 4-lane segments,
+// maxLaneDelta=0x1f (bits 4:0) allows all exchanges within segment.
+// Equivalent to __shfl_xor_sync(mask, val, delta, /*width=*/4).
+#define GROUP4_REDUCE_MAX_F32(val, tmp) \
+    shfl.sync.bfly.b32 tmp, val, 1, 0x1c1f, FULL_MASK; \
+    max.f32 val, val, tmp; \
+    shfl.sync.bfly.b32 tmp, val, 2, 0x1c1f, FULL_MASK; \
+    max.f32 val, val, tmp;
+
+// Group-of-4 butterfly reduction for f32 sum.
+#define GROUP4_REDUCE_SUM_F32(val, tmp) \
+    shfl.sync.bfly.b32 tmp, val, 1, 0x1c1f, FULL_MASK; \
+    add.f32 val, val, tmp; \
+    shfl.sync.bfly.b32 tmp, val, 2, 0x1c1f, FULL_MASK; \
+    add.f32 val, val, tmp;
+
+// Get warp ID and lane ID from thread ID.
+// WARP_ID(dst, tid) -- dst is .b32, tid is .b32
+#define WARP_ID(dst, tid) shr.u32 dst, tid, 5;
+// LANE_ID(dst, tid) -- dst is .b32, tid is .b32
+#define LANE_ID(dst, tid) and.b32 dst, tid, 31;
+
+#endif

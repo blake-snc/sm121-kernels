@@ -1,0 +1,122 @@
+// topk_block_idx.ptx
+//
+// Given per-block importance scores, select top-K block indices per query.
+// Final piece of the NSA / MoBA block-selection pipeline.
+//
+// Input:  scores: [B, Sq, H, num_blocks] FP32
+// Output: indices: [B, Sq, H, K] u32 (sorted descending by score)
+//
+// Constraint: this reference version handles num_blocks ≤ 32 (single warp).
+// Larger num_blocks requires a block-wide reduction variant — future work.
+//
+// Grid: (Sq, num_heads, batch). Block: (32, 1, 1).
+// Algorithm: iterative top-1 selection via warp-butterfly argmax. After each
+// iteration, the winner is masked to -inf and the next argmax runs.
+// O(K × log 32) steps — fine for K ≤ 16.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+
+.visible .entry topk_block_idx(
+    .param .u64 param_scores,
+    .param .u64 param_indices,
+    .param .u32 param_num_blocks,
+    .param .u32 param_k_top
+)
+{
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<8>;
+    .reg .f32 %f<8>;
+    .reg .pred %p<6>;
+
+    mov.u32     %r0, %tid.x;              // 0..31
+    mov.u32     %r1, %ctaid.x;             // sq
+    mov.u32     %r2, %ctaid.y;             // head
+    mov.u32     %r3, %ctaid.z;             // batch
+
+    ld.param.u64 %rd0, [param_scores];
+    ld.param.u64 %rd1, [param_indices];
+    ld.param.u32 %r4, [param_num_blocks];
+    ld.param.u32 %r5, [param_k_top];
+
+    // Row id: ((b * H + h) * Sq + sq). Use gridDim for H and Sq.
+    mov.u32     %r20, %nctaid.x;           // Sq
+    mov.u32     %r21, %nctaid.y;           // H
+    mul.lo.u32  %r22, %r3, %r21;
+    add.u32     %r22, %r22, %r2;
+    mul.lo.u32  %r22, %r22, %r20;
+    add.u32     %r22, %r22, %r1;           // row_id
+
+    // Scores base for this row
+    mul.lo.u32  %r23, %r22, %r4;
+    mul.wide.u32 %rd2, %r23, 4;
+    add.u64     %rd3, %rd0, %rd2;
+
+    // Indices base for this row
+    mul.lo.u32  %r23, %r22, %r5;
+    mul.wide.u32 %rd2, %r23, 4;
+    add.u64     %rd4, %rd1, %rd2;
+
+    // Load this thread's score (or -inf if out of range)
+    setp.lt.u32 %p1, %r0, %r4;
+    mov.b32     %f1, 0xFF800000;
+    mul.wide.u32 %rd5, %r0, 4;
+    add.u64     %rd6, %rd3, %rd5;
+    @%p1 ld.global.f32 %f1, [%rd6];
+
+    // K iterations
+    mov.u32     %r10, 0;
+kloop:
+    setp.ge.u32 %p2, %r10, %r5;
+    @%p2 bra    kdone;
+
+    // Each thread has score %f1 and idx %r0
+    mov.f32     %f2, %f1;
+    mov.u32     %r11, %r0;
+
+    // Warp butterfly argmax
+    shfl.sync.bfly.b32 %f3|%p5, %f2, 0x10, 0x1f, 0xffffffff;
+    shfl.sync.bfly.b32 %r12|%p5, %r11, 0x10, 0x1f, 0xffffffff;
+    setp.gt.f32 %p4, %f3, %f2;
+    @%p4 mov.f32 %f2, %f3;
+    @%p4 mov.u32 %r11, %r12;
+    shfl.sync.bfly.b32 %f3|%p5, %f2, 0x08, 0x1f, 0xffffffff;
+    shfl.sync.bfly.b32 %r12|%p5, %r11, 0x08, 0x1f, 0xffffffff;
+    setp.gt.f32 %p4, %f3, %f2;
+    @%p4 mov.f32 %f2, %f3;
+    @%p4 mov.u32 %r11, %r12;
+    shfl.sync.bfly.b32 %f3|%p5, %f2, 0x04, 0x1f, 0xffffffff;
+    shfl.sync.bfly.b32 %r12|%p5, %r11, 0x04, 0x1f, 0xffffffff;
+    setp.gt.f32 %p4, %f3, %f2;
+    @%p4 mov.f32 %f2, %f3;
+    @%p4 mov.u32 %r11, %r12;
+    shfl.sync.bfly.b32 %f3|%p5, %f2, 0x02, 0x1f, 0xffffffff;
+    shfl.sync.bfly.b32 %r12|%p5, %r11, 0x02, 0x1f, 0xffffffff;
+    setp.gt.f32 %p4, %f3, %f2;
+    @%p4 mov.f32 %f2, %f3;
+    @%p4 mov.u32 %r11, %r12;
+    shfl.sync.bfly.b32 %f3|%p5, %f2, 0x01, 0x1f, 0xffffffff;
+    shfl.sync.bfly.b32 %r12|%p5, %r11, 0x01, 0x1f, 0xffffffff;
+    setp.gt.f32 %p4, %f3, %f2;
+    @%p4 mov.f32 %f2, %f3;
+    @%p4 mov.u32 %r11, %r12;
+
+    // All lanes hold winner idx in %r11. Thread 0 writes it out.
+    setp.eq.u32 %p4, %r0, 0;
+    mul.wide.u32 %rd5, %r10, 4;
+    add.u64     %rd6, %rd4, %rd5;
+    @%p4 st.global.u32 [%rd6], %r11;
+
+    // Mask this thread's score to -inf if it was the winner
+    setp.eq.u32 %p4, %r0, %r11;
+    mov.b32     %f3, 0xFF800000;
+    @%p4 mov.f32 %f1, %f3;
+
+    add.u32     %r10, %r10, 1;
+    bra         kloop;
+kdone:
+    ret;
+}

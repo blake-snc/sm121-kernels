@@ -1,0 +1,148 @@
+// l2norm_scale_replicate_bf16.ptx
+//
+// Per-head L2 normalization with scale + GQA-style interleave replication:
+//   inv = scale / sqrt(sum(x[h, :]^2) + eps)
+//   y[h*factor + r, d] = x[h, d] * inv     for r in 0..factor, d in 0..head_dim
+//
+// Used by Qwen3-Next / GDN-hybrid GDN to L2-normalize Q (with scale=1/sqrt(D_k))
+// and K (with scale=1.0), then replicate from n_qk heads → n_v heads (factor=n_v/n_qk).
+//
+// Layouts (BF16):
+//   x: [num_heads_in,            head_dim]     in
+//   y: [num_heads_in * factor,   head_dim]     out
+//
+// Grid:  (num_heads_in, 1, 1)
+// Block: (head_dim, 1, 1)         — head_dim must be multiple of 32, ≤ 1024.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "reduction.ptxh"
+#include "convert.ptxh"
+
+.shared .align 128 .b8 smem_reduce[256];
+
+.visible .entry l2norm_scale_replicate_bf16(
+    .param .u64 param_x,          // [num_heads_in, head_dim] BF16
+    .param .u64 param_y,          // [num_heads_in * factor, head_dim] BF16
+    .param .u32 param_head_dim,
+    .param .u32 param_factor,
+    .param .f32 param_scale,
+    .param .f32 param_eps
+)
+{
+    .reg .b32  %r<32>;
+    .reg .b64  %rd<16>;
+    .reg .f32  %f<16>;
+    .reg .b16  %h<4>;
+    .reg .pred %p<4>;
+
+    mov.u32         %r0, %tid.x;
+    mov.u32         %r1, %ctaid.x;            // input head index h
+    mov.u32         %r2, %ntid.x;             // == head_dim
+
+    ld.param.u64    %rd0, [param_x];
+    ld.param.u64    %rd1, [param_y];
+    ld.param.u32    %r3, [param_head_dim];
+    ld.param.u32    %r4, [param_factor];
+    ld.param.f32    %f0, [param_scale];
+    ld.param.f32    %f1, [param_eps];
+
+    // Per-input-head row offset = h * head_dim
+    mul.lo.u32      %r5, %r1, %r3;
+    mul.wide.u32    %rd2, %r5, 2;             // bytes
+    add.u64         %rd3, %rd0, %rd2;         // &x[h, 0]
+
+    // Per-thread offset
+    mul.wide.u32    %rd4, %r0, 2;
+    add.u64         %rd5, %rd3, %rd4;         // &x[h, tid]
+
+    setp.ge.u32     %p0, %r0, %r3;
+
+    // Stage 1: load x[h, tid], compute x*x for sumsq
+    mov.f32         %f2, 0.0;
+    @%p0 bra        skip_load;
+    ld.global.b16   %h0, [%rd5];
+    cvt.f32.bf16    %f3, %h0;
+    mul.f32         %f2, %f3, %f3;
+skip_load:
+
+    // Stage 2: warp reduction
+    WARP_REDUCE_SUM_F32(%f2, %f4)
+
+    // Stage 3: cross-warp reduction
+    WARP_ID(%r6, %r0)
+    LANE_ID(%r7, %r0)
+    setp.eq.u32     %p1, %r7, 0;
+    @!%p1 bra       skip_smem;
+    mul.wide.u32    %rd6, %r6, 4;
+    mov.u64         %rd7, smem_reduce;
+    add.u64         %rd7, %rd7, %rd6;
+    st.shared.f32   [%rd7], %f2;
+skip_smem:
+    bar.sync        0;
+
+    shr.u32         %r8, %r2, 5;              // num_warps
+
+    setp.ne.u32     %p2, %r6, 0;
+    @%p2 bra        post_reduce;
+
+    setp.ge.u32     %p3, %r7, %r8;
+    mov.f32         %f5, 0.0;
+    @%p3 bra        skip_load_partial;
+    mul.wide.u32    %rd6, %r7, 4;
+    mov.u64         %rd7, smem_reduce;
+    add.u64         %rd7, %rd7, %rd6;
+    ld.shared.f32   %f5, [%rd7];
+skip_load_partial:
+    WARP_REDUCE_SUM_F32(%f5, %f6)
+
+    // Lane 0 of warp 0 computes inv = scale / sqrt(sumsq + eps)
+    setp.ne.u32     %p1, %r7, 0;
+    @%p1 bra        post_reduce;
+    add.f32         %f7, %f5, %f1;
+    rsqrt.approx.f32 %f8, %f7;
+    mul.f32         %f9, %f8, %f0;            // inv = scale * rsqrt(sumsq + eps)
+    mov.u64         %rd7, smem_reduce;
+    st.shared.f32   [%rd7], %f9;
+
+post_reduce:
+    bar.sync        0;
+    mov.u64         %rd7, smem_reduce;
+    ld.shared.f32   %f9, [%rd7];              // inv (broadcast)
+
+    // Stage 4: write y[h*factor + r, tid] = x[h, tid] * inv  for r in 0..factor
+    @%p0 bra        done;
+
+    // Reload x[h, tid] (read-once value)
+    ld.global.b16   %h0, [%rd5];
+    cvt.f32.bf16    %f10, %h0;
+    mul.f32         %f11, %f10, %f9;
+    cvt.rn.bf16.f32 %h1, %f11;
+
+    // y row stride per dst head = head_dim * 2 bytes
+    mul.lo.u32      %r9, %r3, 2;              // bytes per head row
+    cvt.u64.u32     %rd8, %r9;
+
+    // Base of y for first replicated head = h * factor * head_dim
+    mul.lo.u32      %r10, %r1, %r4;           // first dst head index
+    mul.lo.u32      %r11, %r10, %r3;          // first dst flat element index
+    mul.wide.u32    %rd9, %r11, 2;            // bytes
+    add.u64         %rd10, %rd1, %rd9;        // &y[first_dst_h, 0]
+    add.u64         %rd11, %rd10, %rd4;       // &y[first_dst_h, tid]
+
+    mov.u32         %r12, 0;                  // r counter
+replicate_loop:
+    setp.ge.u32     %p2, %r12, %r4;
+    @%p2 bra        done;
+
+    st.global.b16   [%rd11], %h1;
+    add.u64         %rd11, %rd11, %rd8;       // advance one head row
+    add.u32         %r12, %r12, 1;
+    bra             replicate_loop;
+
+done:
+    ret;
+}

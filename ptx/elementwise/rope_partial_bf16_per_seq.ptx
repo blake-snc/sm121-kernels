@@ -1,0 +1,109 @@
+// rope_partial_bf16_per_seq.ptx
+//
+// Per-sequence in-place partial RoPE. Variant of rope_partial_bf16_pos_dev
+// that reads a different position per sequence (instead of broadcasting one
+// position across all heads).
+//
+// Layout:
+//   buf: [M, heads_per_seq, head_dim] BF16, in-place
+//   pos_per_seq: [M] u32 device -- per-sequence current decode position
+//   heads_per_seq: number of heads per sequence (caller's nh or nkv)
+//
+// For global head h_global (= ctaid.x), the owning sequence is
+//   seq_idx = h_global / heads_per_seq
+//
+// Grid:  (M * heads_per_seq, 1, 1)
+// Block: (rotary_dim / 2, 1, 1)
+//
+// Used by the M-batched decode forward to support mixed-arrival
+// continuous batching where each of the M=128 active slots is at a
+// different position.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+.visible .entry rope_partial_bf16_per_seq(
+    .param .u64 param_buf,
+    .param .u64 param_pos_per_seq,
+    .param .f32 param_theta,
+    .param .u32 param_head_dim,
+    .param .u32 param_rotary_dim,
+    .param .u32 param_heads_per_seq
+)
+{
+    .reg .b32  %r<20>;
+    .reg .b64  %rd<8>;
+    .reg .f32  %f<16>;
+    .reg .b16  %h<4>;
+    .reg .pred %p<2>;
+
+    mov.u32         %r0, %tid.x;            // i (rotation-pair index, in 0..rotary_dim/2)
+    mov.u32         %r1, %ctaid.x;          // global head index = seq_idx * heads_per_seq + head_in_seq
+    ld.param.u32    %r2, [param_head_dim];
+    ld.param.u32    %r3, [param_rotary_dim];
+    ld.param.u32    %r10, [param_heads_per_seq];
+
+    // half = rotary_dim / 2; bail if thread out of range
+    shr.u32         %r4, %r3, 1;
+    setp.ge.u32     %p0, %r0, %r4;
+    @%p0 bra        done;
+
+    ld.param.u64    %rd0, [param_buf];
+    ld.param.u64    %rd1, [param_pos_per_seq];
+    ld.param.f32    %f0, [param_theta];
+
+    // seq_idx = h_global / heads_per_seq
+    div.u32         %r11, %r1, %r10;        // seq_idx
+    // load pos[seq_idx]
+    mul.wide.u32    %rd6, %r11, 4;          // seq_idx * sizeof(u32)
+    add.u64         %rd7, %rd1, %rd6;       // &pos_per_seq[seq_idx]
+    ld.global.u32   %r5, [%rd7];
+    cvt.rn.f32.u32  %f1, %r5;               // pos as f32
+
+    // inv_freq[i] = ex2(-2i / rotary_dim * log2(theta))
+    lg2.approx.f32  %f2, %f0;               // log2(theta)
+    cvt.rn.f32.u32  %f3, %r0;               // i as f32
+    mul.f32         %f4, %f3, %f2;          // i * log2(theta)
+    cvt.rn.f32.u32  %f5, %r3;               // rotary_dim as f32
+    div.approx.f32  %f6, %f4, %f5;          // (i * log2(theta)) / rotary_dim
+    add.f32         %f6, %f6, %f6;          // 2 * (...)
+    neg.f32         %f6, %f6;
+    ex2.approx.f32  %f7, %f6;               // inv_freq[i]
+    mul.f32         %f8, %f1, %f7;          // angle = pos * inv_freq[i]
+
+    cos.approx.ftz.f32  %f9, %f8;
+    sin.approx.ftz.f32  %f10, %f8;
+
+    // Pointers: head_off = h_global * head_dim
+    mul.lo.u32      %r6, %r1, %r2;          // h_global * head_dim
+    add.u32         %r7, %r6, %r0;          // h_global*head_dim + i  (x0 index)
+    add.u32         %r8, %r7, %r4;          // h_global*head_dim + i + half  (x1 index)
+
+    mul.wide.u32    %rd2, %r7, 2;
+    add.u64         %rd3, %rd0, %rd2;       // &buf[h_global, i]
+    mul.wide.u32    %rd4, %r8, 2;
+    add.u64         %rd5, %rd0, %rd4;       // &buf[h_global, i + half]
+
+    ld.global.b16   %h0, [%rd3];
+    cvt.f32.bf16    %f11, %h0;              // x0
+    ld.global.b16   %h1, [%rd5];
+    cvt.f32.bf16    %f12, %h1;              // x1
+
+    // out0 = x0 * c - x1 * s
+    neg.f32         %f15, %f10;
+    mul.f32         %f13, %f11, %f9;
+    fma.rn.f32      %f13, %f12, %f15, %f13;
+
+    // out1 = x0 * s + x1 * c
+    mul.f32         %f14, %f11, %f10;
+    fma.rn.f32      %f14, %f12, %f9, %f14;
+
+    cvt.rn.bf16.f32 %h2, %f13;
+    st.global.b16   [%rd3], %h2;
+    cvt.rn.bf16.f32 %h3, %f14;
+    st.global.b16   [%rd5], %h3;
+
+done:
+    ret;
+}

@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---- No-GPU gate: runs on free GitHub runners, gives PRs fast feedback. ----
+  # ptxas is a cross-assembler, so it validates sm_121a PTX without an SM121a GPU;
+  # `cargo build` runs build.rs which assembles every kernel (the PTX gate), and
+  # clippy/fmt/doc need no device. This catches the bulk of regressions pre-merge.
+  lint-build-ptx:
+    name: Lint · Build · PTX (no GPU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Install CUDA Toolkit (ptxas for sm_121a — requires CUDA 13.0+)
+        uses: Jimver/cuda-toolkit@v0.2.21
+        with:
+          cuda: '13.0.0'
+          method: network
+          sub-packages: '["nvcc"]'   # ptxas ships with nvcc; full toolkit not needed
+      - name: rustfmt
+        run: cargo fmt --check
+      - name: PTX syntax check (sm_121a, cross-assembled)
+        run: bash scripts/ptx_syntax_check.sh sm_121a
+      - name: Codegen cubin-identity (templated FA variants == hand-written)
+        run: |
+          bash scripts/gen_ptx_variants.sh
+          bash scripts/check_codegen_identity.sh
+      - name: Build (assembles all kernels)
+        run: cargo build --release
+      - name: Build (c-api)
+        run: cargo build --release --features c-api
+      - name: Build (experimental — superseded FA generations stay compiled)
+        run: cargo build --release --features experimental
+      - name: Clippy (deny warnings)
+        run: cargo clippy --release -- -D warnings
+      - name: Docs
+        run: cargo doc --no-deps --release
+
+  # ---- Public API surface guard (no GPU, non-blocking). ----
+  # cargo-public-api needs nightly. This job is intentionally non-blocking
+  # (continue-on-error) so it does not fail PRs until a baseline exists.
+  # On the first green run, commit the generated public-api.txt baseline
+  # (`make api-snapshot`); after that, swap the step to `make api-check` and
+  # drop continue-on-error to enforce the diff. See STABILITY.md.
+  public-api:
+    name: Public API surface (no GPU, non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-public-api
+        run: cargo install cargo-public-api --locked
+      - name: API surface (snapshot if no baseline, else diff)
+        run: |
+          if [ -f public-api.txt ]; then
+            make api-check
+          else
+            echo "no public-api.txt baseline yet — generating for inspection"
+            make api-snapshot
+            cat public-api.txt
+          fi
+
+  # ---- GPU gate: self-hosted SM121a; correctness + sanitizer + perf. ----
+  # Gated so fork PRs never run code on the self-hosted runner.
+  gpu-test:
+    name: Test · Sanitizer (SM121a)
+    runs-on: [self-hosted, sm121a]
+    needs: lint-build-ptx
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Generate golden vectors (PyTorch reference oracle)
+        run: |
+          pip install -r tests/reference/requirements.txt
+          python tests/reference/generate_golden.py
+      - name: Tests (kernel correctness vs golden)
+        run: cargo test --release -- --test-threads=1
+      - name: Tests (experimental FA generations)
+        run: cargo test --release --features experimental -- --test-threads=1
+      - name: compute-sanitizer (memcheck) on a core kernel test binary
+        run: |
+          BIN=$(ls -t target/release/deps/test_attention-* 2>/dev/null | grep -v '\.d$' | head -1)
+          if [ -n "$BIN" ]; then compute-sanitizer --tool memcheck --error-exitcode 1 "$BIN"; else echo "no test binary; skipping"; fi
+      - name: Benchmark (smoke)
+        run: cargo run --release --example benchmark

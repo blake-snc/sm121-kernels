@@ -1,0 +1,66 @@
+// split_q_gate_bf16.ptx
+//
+// De-interleave GDN-hybrid gated-attention Q-projection output:
+//   q_full[h, 0..hd]      → q_only[h, :]
+//   q_full[h, hd..2*hd]   → gate[h, :]
+// where q_full is laid out [num_heads, 2*head_dim] with Q and output_gate
+// interleaved per head.
+//
+// Replaces a dtoh + host split + 2×htod sequence per Full-Attention layer
+// (10 layers/token in GDN-hybrid). Required for graph-capturing the pre-rope
+// portion of the attention forward.
+//
+// Grid:  (num_heads, 1, 1)
+// Block: (head_dim, 1, 1)   — head_dim ≤ 1024.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+.visible .entry split_q_gate_bf16(
+    .param .u64 param_q_full,    // [num_heads, 2*head_dim] BF16
+    .param .u64 param_q_only,    // [num_heads, head_dim]   BF16
+    .param .u64 param_gate,      // [num_heads, head_dim]   BF16
+    .param .u32 param_head_dim
+)
+{
+    .reg .b32  %r<8>;
+    .reg .b64  %rd<8>;
+    .reg .b16  %h<4>;
+    .reg .pred %p<2>;
+
+    mov.u32         %r0, %tid.x;          // d
+    mov.u32         %r1, %ctaid.x;        // head index h
+    ld.param.u32    %r2, [param_head_dim];
+
+    setp.ge.u32     %p0, %r0, %r2;
+    @%p0 bra        done;
+
+    ld.param.u64    %rd0, [param_q_full];
+    ld.param.u64    %rd1, [param_q_only];
+    ld.param.u64    %rd2, [param_gate];
+
+    // src offset: h * 2*hd + d  for Q;  h * 2*hd + hd + d  for gate
+    mul.lo.u32      %r3, %r1, %r2;        // h * hd
+    shl.b32         %r4, %r3, 1;          // h * 2 * hd  (in elements)
+    add.u32         %r5, %r4, %r0;        // h*2*hd + d  (Q index)
+    add.u32         %r6, %r5, %r2;        // h*2*hd + hd + d  (gate index)
+    add.u32         %r7, %r3, %r0;        // h * hd + d  (dst index)
+
+    mul.wide.u32    %rd3, %r5, 2;
+    add.u64         %rd4, %rd0, %rd3;     // &q_full[h, d]
+    ld.global.b16   %h0, [%rd4];
+
+    mul.wide.u32    %rd5, %r6, 2;
+    add.u64         %rd6, %rd0, %rd5;     // &q_full[h, hd+d]
+    ld.global.b16   %h1, [%rd6];
+
+    mul.wide.u32    %rd7, %r7, 2;
+    add.u64         %rd4, %rd1, %rd7;     // &q_only[h, d]
+    st.global.b16   [%rd4], %h0;
+    add.u64         %rd6, %rd2, %rd7;     // &gate[h, d]
+    st.global.b16   [%rd6], %h1;
+
+done:
+    ret;
+}

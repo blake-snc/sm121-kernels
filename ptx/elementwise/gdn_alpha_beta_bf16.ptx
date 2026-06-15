@@ -1,0 +1,111 @@
+// gdn_alpha_beta_bf16.ptx
+//
+// Compute Qwen3-Next / Mamba2 GatedDeltaNet decay scalars for one decode token:
+//   dt[i]    = softplus(a_logits[i] + dt_bias[i])
+//   A_pos[i] = exp(a_log[i])                          // a_log is per-head log
+//   alpha[i] = exp(-A_pos * dt)                        // ∈ (0, 1) decay
+//   beta[i]  = sigmoid(b_logits[i])                    // ∈ (0, 1) input gate
+//
+// Inputs (BF16 stored as u16):
+//   a_logits, b_logits: [n] BF16 (one element per V head)
+//   dt_bias:            [n] BF16
+//   a_log:              [n] BF16
+// Outputs:
+//   alpha, beta:        [n] FP32
+//
+// Launch: one block, n threads (n ≤ 1024, typically 32).
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#define LOG2E_F32       0f3FB8AA3B    // 1.4426950409
+#define MINUS_LOG2E_F32 0fBFB8AA3B
+#define ONE_F32         0f3F800000
+#define LN2_F32         0f3F317218    // 0.6931472
+
+.visible .entry gdn_alpha_beta_bf16(
+    .param .u64 param_a_logits,   // [n] BF16
+    .param .u64 param_b_logits,   // [n] BF16
+    .param .u64 param_dt_bias,    // [n] BF16
+    .param .u64 param_a_log,      // [n] BF16
+    .param .u64 param_alpha,      // [n] FP32
+    .param .u64 param_beta,       // [n] FP32
+    .param .u32 param_n
+)
+{
+    .reg .b32  %r<8>;
+    .reg .b64  %rd<16>;
+    .reg .f32  %f<24>;
+    .reg .b16  %h<4>;
+    .reg .pred %p<4>;
+
+    mov.u32         %r0, %tid.x;
+    ld.param.u32    %r1, [param_n];
+    setp.ge.u32     %p0, %r0, %r1;
+    @%p0 bra        done;
+
+    ld.param.u64    %rd0, [param_a_logits];
+    ld.param.u64    %rd1, [param_b_logits];
+    ld.param.u64    %rd2, [param_dt_bias];
+    ld.param.u64    %rd3, [param_a_log];
+    ld.param.u64    %rd4, [param_alpha];
+    ld.param.u64    %rd5, [param_beta];
+
+    mul.wide.u32    %rd6, %r0, 2;             // BF16 byte offset
+    mul.wide.u32    %rd7, %r0, 4;             // FP32 byte offset
+
+    add.u64         %rd8,  %rd0, %rd6;
+    add.u64         %rd9,  %rd1, %rd6;
+    add.u64         %rd10, %rd2, %rd6;
+    add.u64         %rd11, %rd3, %rd6;
+
+    ld.global.b16   %h0, [%rd8];
+    cvt.f32.bf16    %f0, %h0;                 // a_logits
+    ld.global.b16   %h0, [%rd9];
+    cvt.f32.bf16    %f1, %h0;                 // b_logits
+    ld.global.b16   %h0, [%rd10];
+    cvt.f32.bf16    %f2, %h0;                 // dt_bias
+    ld.global.b16   %h0, [%rd11];
+    cvt.f32.bf16    %f3, %h0;                 // a_log
+
+    // dt = softplus(a_logits + dt_bias). Saturate linearly above 20.
+    add.f32         %f4, %f0, %f2;
+    setp.gt.f32     %p1, %f4, 0f41A00000;     // > 20.0
+    @%p1 bra        dt_linear;
+
+    // Compute log(1 + exp(x)) = ln2 * log2(1 + 2^(x*log2(e)))
+    // Easier: use ex2.approx then ln. PTX has no log; use lg2 instead.
+    // softplus(x) = (1/log2(e)) * lg2(1 + 2^(x * log2(e)))
+    mul.f32         %f5, %f4, LOG2E_F32;      // x * log2(e)
+    ex2.approx.f32  %f6, %f5;                 // 2^(x*log2e) = e^x
+    add.f32         %f7, %f6, ONE_F32;        // 1 + e^x
+    lg2.approx.f32  %f8, %f7;                 // log2(1 + e^x)
+    mul.f32         %f4, %f8, LN2_F32;        // ln(1 + e^x) = softplus
+dt_linear:
+    // %f4 now contains dt (linear-saturated above 20).
+
+    // A_pos = exp(a_log)
+    mul.f32         %f9, %f3, LOG2E_F32;
+    ex2.approx.f32  %f10, %f9;                // exp(a_log)
+
+    // alpha = exp(-A_pos * dt) = 2^(-A_pos * dt * log2(e))
+    mul.f32         %f11, %f10, %f4;
+    mul.f32         %f12, %f11, MINUS_LOG2E_F32;
+    ex2.approx.f32  %f13, %f12;               // alpha
+
+    // beta = sigmoid(b_logits) = 1 / (1 + 2^(-b_logits * log2(e)))
+    mul.f32         %f14, %f1, MINUS_LOG2E_F32;
+    ex2.approx.f32  %f15, %f14;
+    add.f32         %f16, %f15, ONE_F32;
+    rcp.approx.f32  %f17, %f16;               // beta
+
+    // Store
+    add.u64         %rd12, %rd4, %rd7;
+    add.u64         %rd13, %rd5, %rd7;
+    st.global.f32   [%rd12], %f13;
+    st.global.f32   [%rd13], %f17;
+
+done:
+    ret;
+}

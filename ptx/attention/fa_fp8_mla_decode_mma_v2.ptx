@@ -1,0 +1,823 @@
+// fa_fp8_mla_decode_mma_v2.ptx
+//
+// Single-warp FP8 MMA m16n8k32 MLA decode. Pure FP8 path (vs the BF16-MMA-on-FP8-KV
+// hybrid in fa_fp8kv_mla_decode_mma). QK uses validated FP8 MMA pattern from the
+// `fp8_mma_qk_microkernel`. PV uses BF16 MMA m16n8k8 with V dequanted in-place
+// (P from softmax stays BF16).
+//
+// Layouts:
+//   Q_c    : [B, H, 512] FP8 E4M3   (was BF16 in v1)
+//   Q_r    : [B, H, 64 ] FP8 E4M3
+//   c_kv   : [B, Skv, 512] FP8 E4M3
+//   k_rope : [B, Skv, 64 ] FP8 E4M3
+//   O      : [B, H, 512] BF16 output
+//   q_scale, kv_scale, scale: f32 — combined post-MMA
+//
+// Grid: (num_heads / 16, batch). Block: (32, 1, 1) — single warp.
+// SMEM (~26 KB):
+//   smem_Q_c_fp8   : 16 × 512 FP8 = 8 KB
+//   smem_Q_r_fp8   : 16 × 64  FP8 = 1 KB
+//   smem_KV_c_fp8  :  8 × 512 FP8 = 4 KB    (FP8 for QK MMA)
+//   smem_KV_c_bf16 :  8 × 512 BF16 = 8 KB   (BF16 for PV MMA, dequanted)
+//   smem_KV_r_fp8  :  8 × 64 FP8  = 0.5 KB
+//   smem_P         : 16 × 8 BF16  = 256 B
+//   smem_red       : 32 × 4 B     = 128 B
+//   total          : ~22 KB
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+#include "mma.ptxh"
+
+#define D_C            512
+#define D_R            64
+#define HEADS_PER_CTA  16
+#define KV_CHUNK       8
+
+#define SMEM_Q_C_FP8       0
+#define SMEM_Q_R_FP8       8192
+#define SMEM_KV_C_FP8      9216
+#define SMEM_KV_C_BF16     13312
+#define SMEM_KV_R_FP8      21504
+#define SMEM_P             22016    /* P [16, 8] BF16 = 256 B for PV */
+#define SMEM_RED           22272    /* warp reduction scratch 128 B */
+#define SMEM_O_ACC         22400    /* O accumulator [16 heads × 512 D_C] FP32 = 32 KB */
+#define SMEM_TOTAL         55168
+
+.shared .align 128 .b8 fp8mla_smem[55168];
+
+.visible .entry fa_fp8_mla_decode_mma_v2(
+    .param .u64 param_Q_c,        // [B, H, 512] FP8
+    .param .u64 param_Q_r,        // [B, H, 64]  FP8
+    .param .u64 param_c_kv,       // [B, Skv, 512] FP8
+    .param .u64 param_k_rope,     // [B, Skv, 64]  FP8
+    .param .u64 param_O,          // [B, H, 512] BF16
+    .param .u32 param_num_heads,
+    .param .u32 param_seq_kv,
+    .param .f32 param_scale,
+    .param .f32 param_q_scale,
+    .param .f32 param_kv_scale
+)
+{
+    .reg .b32  %r<160>;
+    .reg .b64  %rd<24>;
+    .reg .f32  %f<160>;
+    .reg .b16  %h<16>;
+    .reg .pred %p<16>;
+
+    mov.u32      %r0, %tid.x;            // lane (0..31)
+    mov.u32      %r1, %ctaid.x;          // head_group (16 heads/CTA)
+    mov.u32      %r2, %ctaid.y;          // batch
+    shl.b32      %r3, %r1, 4;            // head_off = head_group * 16
+
+    ld.param.u64 %rd0, [param_Q_c];
+    ld.param.u64 %rd1, [param_Q_r];
+    ld.param.u64 %rd2, [param_c_kv];
+    ld.param.u64 %rd3, [param_k_rope];
+    ld.param.u64 %rd4, [param_O];
+    ld.param.u32 %r4, [param_num_heads];
+    ld.param.u32 %r5, [param_seq_kv];
+    ld.param.f32 %f0, [param_scale];
+    ld.param.f32 %f1, [param_q_scale];
+    ld.param.f32 %f2, [param_kv_scale];
+
+    // Combined QK scale: scale * q_scale * kv_scale
+    mul.f32      %f3, %f0, %f1;
+    mul.f32      %f3, %f3, %f2;
+
+    // Combined PV scale: 1 (P is in [0,1], V is BF16 already scaled by kv_scale during dequant)
+
+    mov.u32      %r10, fp8mla_smem;
+
+    // === Load Q_c [16, 512] FP8 = 8 KB ===
+    // Per CTA: 16 heads (= rows) × 512 D_C bytes. Q_c base = &Q_c[batch, head_off, 0].
+    mul.lo.u32   %r11, %r2, %r4;          // batch * num_heads
+    mul.lo.u32   %r11, %r11, D_C;
+    mul.lo.u32   %r12, %r3, D_C;
+    add.u32      %r11, %r11, %r12;
+    cvt.u64.u32  %rd6, %r11;
+    add.u64      %rd6, %rd0, %rd6;        // &Q_c[batch, head_off, 0]
+
+    // Cooperative load: 32 lanes, 16 rows × 512 bytes = 8192 B.
+    // 2 lanes per row, each loads 256 bytes (= 4 v4.b32).
+    shr.b32      %r13, %r0, 1;            // q_row = lane / 2
+    and.b32      %r14, %r0, 1;            // half = lane % 2
+    shl.b32      %r15, %r14, 8;           // half * 256
+    mul.lo.u32   %r16, %r13, D_C;
+    add.u32      %r16, %r16, %r15;
+    cvt.u64.u32  %rd7, %r16;
+    add.u64      %rd7, %rd6, %rd7;
+    add.u32      %r17, %r10, SMEM_Q_C_FP8;
+    add.u32      %r17, %r17, %r16;        // smem dst (same offset as global)
+
+    .reg .b32 _q0, _q1, _q2, _q3, _q4, _q5, _q6, _q7, _q8, _q9, _q10, _q11, _q12, _q13, _q14, _q15;
+    ld.global.v4.b32 {_q0, _q1, _q2, _q3},     [%rd7];
+    ld.global.v4.b32 {_q4, _q5, _q6, _q7},     [%rd7 + 16];
+    ld.global.v4.b32 {_q8, _q9, _q10, _q11},   [%rd7 + 32];
+    ld.global.v4.b32 {_q12, _q13, _q14, _q15}, [%rd7 + 48];
+    st.shared.v4.b32 [%r17],      {_q0, _q1, _q2, _q3};
+    st.shared.v4.b32 [%r17 + 16], {_q4, _q5, _q6, _q7};
+    st.shared.v4.b32 [%r17 + 32], {_q8, _q9, _q10, _q11};
+    st.shared.v4.b32 [%r17 + 48], {_q12, _q13, _q14, _q15};
+    ld.global.v4.b32 {_q0, _q1, _q2, _q3},     [%rd7 + 64];
+    ld.global.v4.b32 {_q4, _q5, _q6, _q7},     [%rd7 + 80];
+    ld.global.v4.b32 {_q8, _q9, _q10, _q11},   [%rd7 + 96];
+    ld.global.v4.b32 {_q12, _q13, _q14, _q15}, [%rd7 + 112];
+    st.shared.v4.b32 [%r17 + 64],  {_q0, _q1, _q2, _q3};
+    st.shared.v4.b32 [%r17 + 80],  {_q4, _q5, _q6, _q7};
+    st.shared.v4.b32 [%r17 + 96],  {_q8, _q9, _q10, _q11};
+    st.shared.v4.b32 [%r17 + 112], {_q12, _q13, _q14, _q15};
+    ld.global.v4.b32 {_q0, _q1, _q2, _q3},     [%rd7 + 128];
+    ld.global.v4.b32 {_q4, _q5, _q6, _q7},     [%rd7 + 144];
+    ld.global.v4.b32 {_q8, _q9, _q10, _q11},   [%rd7 + 160];
+    ld.global.v4.b32 {_q12, _q13, _q14, _q15}, [%rd7 + 176];
+    st.shared.v4.b32 [%r17 + 128], {_q0, _q1, _q2, _q3};
+    st.shared.v4.b32 [%r17 + 144], {_q4, _q5, _q6, _q7};
+    st.shared.v4.b32 [%r17 + 160], {_q8, _q9, _q10, _q11};
+    st.shared.v4.b32 [%r17 + 176], {_q12, _q13, _q14, _q15};
+    ld.global.v4.b32 {_q0, _q1, _q2, _q3},     [%rd7 + 192];
+    ld.global.v4.b32 {_q4, _q5, _q6, _q7},     [%rd7 + 208];
+    ld.global.v4.b32 {_q8, _q9, _q10, _q11},   [%rd7 + 224];
+    ld.global.v4.b32 {_q12, _q13, _q14, _q15}, [%rd7 + 240];
+    st.shared.v4.b32 [%r17 + 192], {_q0, _q1, _q2, _q3};
+    st.shared.v4.b32 [%r17 + 208], {_q4, _q5, _q6, _q7};
+    st.shared.v4.b32 [%r17 + 224], {_q8, _q9, _q10, _q11};
+    st.shared.v4.b32 [%r17 + 240], {_q12, _q13, _q14, _q15};
+
+    // === Load Q_r [16, 64] FP8 = 1 KB ===
+    // 32 lanes, 16 rows × 64 bytes = 1024 B. 2 lanes per row × 32 bytes = 1 v4.b32 + ?
+    // Simpler: 16 lanes load 1 row × 64 bytes = 4 v4.b32. Then 16 lanes idle.
+    mul.lo.u32   %r18, %r2, %r4;
+    mul.lo.u32   %r18, %r18, D_R;
+    mul.lo.u32   %r19, %r3, D_R;
+    add.u32      %r18, %r18, %r19;
+    cvt.u64.u32  %rd8, %r18;
+    add.u64      %rd8, %rd1, %rd8;        // &Q_r[batch, head_off, 0]
+
+    setp.lt.u32  %p0, %r0, 16;
+    mul.lo.u32   %r20, %r0, D_R;
+    cvt.u64.u32  %rd9, %r20;
+    add.u64      %rd9, %rd8, %rd9;
+    add.u32      %r21, %r10, SMEM_Q_R_FP8;
+    add.u32      %r21, %r21, %r20;
+
+    @%p0 ld.global.v4.b32 {_q0, _q1, _q2, _q3},     [%rd9];
+    @%p0 ld.global.v4.b32 {_q4, _q5, _q6, _q7},     [%rd9 + 16];
+    @%p0 ld.global.v4.b32 {_q8, _q9, _q10, _q11},   [%rd9 + 32];
+    @%p0 ld.global.v4.b32 {_q12, _q13, _q14, _q15}, [%rd9 + 48];
+    @%p0 st.shared.v4.b32 [%r21],      {_q0, _q1, _q2, _q3};
+    @%p0 st.shared.v4.b32 [%r21 + 16], {_q4, _q5, _q6, _q7};
+    @%p0 st.shared.v4.b32 [%r21 + 32], {_q8, _q9, _q10, _q11};
+    @%p0 st.shared.v4.b32 [%r21 + 48], {_q12, _q13, _q14, _q15};
+
+    // === Init online softmax state per lane ===
+    // Output [16, 512] split across 32 lanes = 256 FP32 per lane.
+    // Per m16n8k32 output layout: each MMA produces [16, 8] = 4 FP32 per lane.
+    // We iterate N=64 tiles for D_C=512 → that's 512/8 = 64 PV output tiles per chunk loop.
+    //
+    // PV uses BF16 MMA m16n8k8: M=16, N=8, K=8. For D_C=512 PV output, that's 64 N-tiles per chunk.
+    // We accumulate ALL 64 N-tiles' worth of output, so 64 × 4 = 256 FP32 per lane.
+    //
+    // To keep this simple v1: accumulate output in registers — 256 per lane is too many.
+    // Alternative: keep output in SMEM, update each PV iter.
+    //
+    // Pragmatic approach: limit this v1 to 16 N-tiles (D_C output covered = 128 cols).
+    // For full D_C=512 we'd need either output-in-SMEM or 4 separate kernel launches.
+    //
+    // For NOW (v1 PoC): just stop after QK + softmax, write QK scores to output as proof
+    // that the FP8 QK MMA path works in MLA structure. PV integration is follow-on.
+
+    // === Per-lane softmax state ===
+    // Each lane owns 2 rows: gid (= lane/4) and gid+8.
+    // %f100 = m_i for row gid, %f101 = m_i for row gid+8
+    // %f102 = l_i for row gid, %f103 = l_i for row gid+8
+    mov.f32      %f100, 0fFF800000;
+    mov.f32      %f101, 0fFF800000;
+    mov.f32      %f102, 0.0;
+    mov.f32      %f103, 0.0;
+
+    // === Initialize O_acc SMEM region to 0 ===
+    // 32 KB / 32 lanes = 1 KB per lane = 256 FP32 = 64 v4.b32 (16-byte) writes per lane.
+    add.u32      %r80, %r10, SMEM_O_ACC;
+    shl.b32      %r81, %r0, 4;     // lane * 16 bytes
+    add.u32      %r80, %r80, %r81;
+    .reg .b32 _z0, _z1, _z2, _z3;
+    mov.b32 _z0, 0; mov.b32 _z1, 0; mov.b32 _z2, 0; mov.b32 _z3, 0;
+    mov.u32      %r82, 0;
+oacc_init_loop:
+    setp.ge.u32  %p10, %r82, 64;
+    @%p10 bra oacc_init_done;
+    shl.b32      %r83, %r82, 9;  // idx * 512 (32 lanes × 16 B)
+    add.u32      %r84, %r80, %r83;
+    st.shared.v4.b32 [%r84], {_z0, _z1, _z2, _z3};
+    add.u32      %r82, %r82, 1;
+    bra          oacc_init_loop;
+oacc_init_done:
+
+    bar.sync 0;
+
+    // === MAIN LOOP: chunks of 8 KV positions ===
+    mov.u32      %r30, 0;                // chunk_start (KV pos)
+chunk_loop:
+    setp.ge.u32  %p1, %r30, %r5;
+    @%p1 bra     chunk_done;
+
+    // --- Load c_kv chunk [8, 512] FP8 → smem_KV_c_fp8 (4 KB) AND dequant → smem_KV_c_bf16 (8 KB) ---
+    // Per chunk: 8 KV positions × 512 bytes = 4 KB FP8.
+    // Cooperative load: 32 lanes, 8 rows × 512 bytes = 4096 B. 4 lanes per row, 128 bytes each.
+    shr.b32      %r31, %r0, 2;           // kv_row = lane / 4
+    and.b32      %r32, %r0, 3;           // sub = lane % 4
+    shl.b32      %r33, %r32, 7;          // sub * 128
+
+    // Global addr: &c_kv[batch, chunk_start + kv_row, sub*128]
+    add.u32      %r34, %r30, %r31;       // global_pos = chunk_start + kv_row
+    setp.lt.u32  %p2, %r34, %r5;         // valid pos?
+
+    mul.lo.u32   %r35, %r2, %r5;         // batch * Skv
+    mul.lo.u32   %r35, %r35, D_C;
+    mul.lo.u32   %r36, %r34, D_C;
+    add.u32      %r35, %r35, %r36;
+    add.u32      %r35, %r35, %r33;
+    cvt.u64.u32  %rd10, %r35;
+    add.u64      %rd10, %rd2, %rd10;     // &c_kv[batch, global_pos, sub*128]
+
+    // SMEM dst FP8: smem_KV_c_fp8 + kv_row*512 + sub*128
+    mul.lo.u32   %r37, %r31, D_C;
+    add.u32      %r37, %r37, %r33;
+    add.u32      %r38, %r10, SMEM_KV_C_FP8;
+    add.u32      %r38, %r38, %r37;
+
+    // SMEM dst BF16: smem_KV_c_bf16 + kv_row*1024 + sub*256 (BF16 stride 2x)
+    shl.b32      %r39, %r37, 1;          // *2 for BF16
+    add.u32      %r40, %r10, SMEM_KV_C_BF16;
+    add.u32      %r40, %r40, %r39;
+
+    // Load 128 bytes (= 8 v4.b32 of FP8 packed in b32, but actually we want 32 v4.b8...)
+    // Simpler: 4 × v4.b32 = 64 bytes? No, v4.b32 is 16 bytes. So 8 × v4.b32 = 128 bytes.
+    @%p2 ld.global.v4.b32 {_q0, _q1, _q2, _q3},     [%rd10];
+    @%p2 ld.global.v4.b32 {_q4, _q5, _q6, _q7},     [%rd10 + 16];
+    @%p2 ld.global.v4.b32 {_q8, _q9, _q10, _q11},   [%rd10 + 32];
+    @%p2 ld.global.v4.b32 {_q12, _q13, _q14, _q15}, [%rd10 + 48];
+    @!%p2 mov.b32 _q0, 0; @!%p2 mov.b32 _q1, 0; @!%p2 mov.b32 _q2, 0; @!%p2 mov.b32 _q3, 0;
+    @!%p2 mov.b32 _q4, 0; @!%p2 mov.b32 _q5, 0; @!%p2 mov.b32 _q6, 0; @!%p2 mov.b32 _q7, 0;
+    @!%p2 mov.b32 _q8, 0; @!%p2 mov.b32 _q9, 0; @!%p2 mov.b32 _q10, 0; @!%p2 mov.b32 _q11, 0;
+    @!%p2 mov.b32 _q12, 0; @!%p2 mov.b32 _q13, 0; @!%p2 mov.b32 _q14, 0; @!%p2 mov.b32 _q15, 0;
+
+    // Store FP8 first half (first 64 bytes) to FP8 SMEM region
+    st.shared.v4.b32 [%r38],      {_q0, _q1, _q2, _q3};
+    st.shared.v4.b32 [%r38 + 16], {_q4, _q5, _q6, _q7};
+    st.shared.v4.b32 [%r38 + 32], {_q8, _q9, _q10, _q11};
+    st.shared.v4.b32 [%r38 + 48], {_q12, _q13, _q14, _q15};
+
+    // Dequant first half (64 FP8 → 64 BF16 = 128 bytes) into BF16 SMEM (for PV).
+    // Per b32 (4 FP8): 2 × cvt.rn.f16x2.e4m3x2 → 4 FP16 → mul by kv_scale → cvt.rn.bf16x2.f32
+#define DEQUANT_FP8_TO_BF16_PAIR(fp8_b32, bf16_b32_lo, bf16_b32_hi) \
+    { .reg .b16 _fp8a, _fp8b; \
+      .reg .b32 _f16x2; \
+      .reg .b16 _h0, _h1; \
+      .reg .f32 _v0, _v1, _v2, _v3; \
+      mov.b32 {_fp8a, _fp8b}, fp8_b32; \
+      cvt.rn.f16x2.e4m3x2 _f16x2, _fp8a; \
+      mov.b32 {_h0, _h1}, _f16x2; \
+      cvt.f32.f16 _v0, _h0; \
+      cvt.f32.f16 _v1, _h1; \
+      cvt.rn.f16x2.e4m3x2 _f16x2, _fp8b; \
+      mov.b32 {_h0, _h1}, _f16x2; \
+      cvt.f32.f16 _v2, _h0; \
+      cvt.f32.f16 _v3, _h1; \
+      mul.f32 _v0, _v0, %f2; \
+      mul.f32 _v1, _v1, %f2; \
+      mul.f32 _v2, _v2, %f2; \
+      mul.f32 _v3, _v3, %f2; \
+      cvt.rn.bf16x2.f32 bf16_b32_lo, _v1, _v0; \
+      cvt.rn.bf16x2.f32 bf16_b32_hi, _v3, _v2; \
+    }
+
+    .reg .b32 _bf0, _bf1, _bf2, _bf3, _bf4, _bf5, _bf6, _bf7;
+    DEQUANT_FP8_TO_BF16_PAIR(_q0, _bf0, _bf1)
+    DEQUANT_FP8_TO_BF16_PAIR(_q1, _bf2, _bf3)
+    DEQUANT_FP8_TO_BF16_PAIR(_q2, _bf4, _bf5)
+    DEQUANT_FP8_TO_BF16_PAIR(_q3, _bf6, _bf7)
+    st.shared.v4.b32 [%r40],      {_bf0, _bf1, _bf2, _bf3};
+    st.shared.v4.b32 [%r40 + 16], {_bf4, _bf5, _bf6, _bf7};
+    DEQUANT_FP8_TO_BF16_PAIR(_q4, _bf0, _bf1)
+    DEQUANT_FP8_TO_BF16_PAIR(_q5, _bf2, _bf3)
+    DEQUANT_FP8_TO_BF16_PAIR(_q6, _bf4, _bf5)
+    DEQUANT_FP8_TO_BF16_PAIR(_q7, _bf6, _bf7)
+    st.shared.v4.b32 [%r40 + 32], {_bf0, _bf1, _bf2, _bf3};
+    st.shared.v4.b32 [%r40 + 48], {_bf4, _bf5, _bf6, _bf7};
+    DEQUANT_FP8_TO_BF16_PAIR(_q8,  _bf0, _bf1)
+    DEQUANT_FP8_TO_BF16_PAIR(_q9,  _bf2, _bf3)
+    DEQUANT_FP8_TO_BF16_PAIR(_q10, _bf4, _bf5)
+    DEQUANT_FP8_TO_BF16_PAIR(_q11, _bf6, _bf7)
+    st.shared.v4.b32 [%r40 + 64], {_bf0, _bf1, _bf2, _bf3};
+    st.shared.v4.b32 [%r40 + 80], {_bf4, _bf5, _bf6, _bf7};
+    DEQUANT_FP8_TO_BF16_PAIR(_q12, _bf0, _bf1)
+    DEQUANT_FP8_TO_BF16_PAIR(_q13, _bf2, _bf3)
+    DEQUANT_FP8_TO_BF16_PAIR(_q14, _bf4, _bf5)
+    DEQUANT_FP8_TO_BF16_PAIR(_q15, _bf6, _bf7)
+    st.shared.v4.b32 [%r40 + 96],  {_bf0, _bf1, _bf2, _bf3};
+    st.shared.v4.b32 [%r40 + 112], {_bf4, _bf5, _bf6, _bf7};
+
+    // Load + store second half (next 64 FP8 bytes / 128 BF16)
+    @%p2 ld.global.v4.b32 {_q0, _q1, _q2, _q3},     [%rd10 + 64];
+    @%p2 ld.global.v4.b32 {_q4, _q5, _q6, _q7},     [%rd10 + 80];
+    @%p2 ld.global.v4.b32 {_q8, _q9, _q10, _q11},   [%rd10 + 96];
+    @%p2 ld.global.v4.b32 {_q12, _q13, _q14, _q15}, [%rd10 + 112];
+    @!%p2 mov.b32 _q0, 0; @!%p2 mov.b32 _q1, 0; @!%p2 mov.b32 _q2, 0; @!%p2 mov.b32 _q3, 0;
+    @!%p2 mov.b32 _q4, 0; @!%p2 mov.b32 _q5, 0; @!%p2 mov.b32 _q6, 0; @!%p2 mov.b32 _q7, 0;
+    @!%p2 mov.b32 _q8, 0; @!%p2 mov.b32 _q9, 0; @!%p2 mov.b32 _q10, 0; @!%p2 mov.b32 _q11, 0;
+    @!%p2 mov.b32 _q12, 0; @!%p2 mov.b32 _q13, 0; @!%p2 mov.b32 _q14, 0; @!%p2 mov.b32 _q15, 0;
+    st.shared.v4.b32 [%r38 + 64],  {_q0, _q1, _q2, _q3};
+    st.shared.v4.b32 [%r38 + 80],  {_q4, _q5, _q6, _q7};
+    st.shared.v4.b32 [%r38 + 96],  {_q8, _q9, _q10, _q11};
+    st.shared.v4.b32 [%r38 + 112], {_q12, _q13, _q14, _q15};
+
+    DEQUANT_FP8_TO_BF16_PAIR(_q0, _bf0, _bf1)
+    DEQUANT_FP8_TO_BF16_PAIR(_q1, _bf2, _bf3)
+    DEQUANT_FP8_TO_BF16_PAIR(_q2, _bf4, _bf5)
+    DEQUANT_FP8_TO_BF16_PAIR(_q3, _bf6, _bf7)
+    st.shared.v4.b32 [%r40 + 128], {_bf0, _bf1, _bf2, _bf3};
+    st.shared.v4.b32 [%r40 + 144], {_bf4, _bf5, _bf6, _bf7};
+    DEQUANT_FP8_TO_BF16_PAIR(_q4, _bf0, _bf1)
+    DEQUANT_FP8_TO_BF16_PAIR(_q5, _bf2, _bf3)
+    DEQUANT_FP8_TO_BF16_PAIR(_q6, _bf4, _bf5)
+    DEQUANT_FP8_TO_BF16_PAIR(_q7, _bf6, _bf7)
+    st.shared.v4.b32 [%r40 + 160], {_bf0, _bf1, _bf2, _bf3};
+    st.shared.v4.b32 [%r40 + 176], {_bf4, _bf5, _bf6, _bf7};
+    DEQUANT_FP8_TO_BF16_PAIR(_q8,  _bf0, _bf1)
+    DEQUANT_FP8_TO_BF16_PAIR(_q9,  _bf2, _bf3)
+    DEQUANT_FP8_TO_BF16_PAIR(_q10, _bf4, _bf5)
+    DEQUANT_FP8_TO_BF16_PAIR(_q11, _bf6, _bf7)
+    st.shared.v4.b32 [%r40 + 192], {_bf0, _bf1, _bf2, _bf3};
+    st.shared.v4.b32 [%r40 + 208], {_bf4, _bf5, _bf6, _bf7};
+    DEQUANT_FP8_TO_BF16_PAIR(_q12, _bf0, _bf1)
+    DEQUANT_FP8_TO_BF16_PAIR(_q13, _bf2, _bf3)
+    DEQUANT_FP8_TO_BF16_PAIR(_q14, _bf4, _bf5)
+    DEQUANT_FP8_TO_BF16_PAIR(_q15, _bf6, _bf7)
+    st.shared.v4.b32 [%r40 + 224], {_bf0, _bf1, _bf2, _bf3};
+    st.shared.v4.b32 [%r40 + 240], {_bf4, _bf5, _bf6, _bf7};
+#undef DEQUANT_FP8_TO_BF16_PAIR
+
+    // --- Load k_rope chunk [8, 64] FP8 → smem_KV_r_fp8 (512 B) ---
+    // 8 rows × 64 bytes = 512 B. 8 lanes load 1 row × 64 bytes = 4 v4.b32. 24 lanes idle.
+    setp.lt.u32  %p3, %r0, 8;
+    mul.lo.u32   %r41, %r2, %r5;
+    mul.lo.u32   %r41, %r41, D_R;
+    add.u32      %r42, %r30, %r0;
+    setp.lt.u32  %p4, %r42, %r5;
+    and.pred     %p3, %p3, %p4;
+    mul.lo.u32   %r43, %r42, D_R;
+    add.u32      %r41, %r41, %r43;
+    cvt.u64.u32  %rd11, %r41;
+    add.u64      %rd11, %rd3, %rd11;
+    mul.lo.u32   %r44, %r0, D_R;
+    add.u32      %r45, %r10, SMEM_KV_R_FP8;
+    add.u32      %r45, %r45, %r44;
+    @%p3 ld.global.v4.b32 {_q0, _q1, _q2, _q3},     [%rd11];
+    @%p3 ld.global.v4.b32 {_q4, _q5, _q6, _q7},     [%rd11 + 16];
+    @%p3 ld.global.v4.b32 {_q8, _q9, _q10, _q11},   [%rd11 + 32];
+    @%p3 ld.global.v4.b32 {_q12, _q13, _q14, _q15}, [%rd11 + 48];
+    @%p3 st.shared.v4.b32 [%r45],      {_q0, _q1, _q2, _q3};
+    @%p3 st.shared.v4.b32 [%r45 + 16], {_q4, _q5, _q6, _q7};
+    @%p3 st.shared.v4.b32 [%r45 + 32], {_q8, _q9, _q10, _q11};
+    @%p3 st.shared.v4.b32 [%r45 + 48], {_q12, _q13, _q14, _q15};
+
+    bar.sync 0;
+
+    // ====================================================================
+    // QK MMA: compute QK = Q @ K^T using FP8 MMA m16n8k32.
+    // Q = [16 heads, 512 D_C] FP8, K = [8 KV pos, 512 D_C] FP8.
+    // QK = [16, 8] FP32, accumulated over 16 K=32 chunks (D_C/32).
+    // Plus Q_r @ k_rope: 2 more K=32 chunks (D_R=64).
+    // Total: 18 FP8 MMAs per chunk-loop iteration.
+    //
+    // Output [16, 8] = 4 FP32 per lane (per m16n8k* convention).
+    // ====================================================================
+
+    .reg .f32 _qk0, _qk1, _qk2, _qk3;
+    mov.f32 _qk0, 0.0;
+    mov.f32 _qk1, 0.0;
+    mov.f32 _qk2, 0.0;
+    mov.f32 _qk3, 0.0;
+
+    // ldmatrix base for Q (validated pattern from microkernel)
+    setp.lt.u32  %p4, %r0, 16;
+    @%p4 mul.lo.u32 %r50, %r0, D_C;
+    @!%p4 sub.u32   %r50, %r0, 16;
+    @!%p4 mad.lo.u32 %r50, %r50, D_C, 16;
+    add.u32      %r51, %r10, SMEM_Q_C_FP8;
+    add.u32      %r51, %r51, %r50;       // ldm_Q_C base (k=0)
+
+    // K (B operand) base: K-split layout, per-lane addressing per microkernel
+    shr.b32      %r52, %r0, 2;            // gid (0..7) — N-position
+    and.b32      %r53, %r0, 3;            // tip (0..3)
+    shl.b32      %r54, %r53, 2;           // tip * 4
+    mul.lo.u32   %r55, %r52, D_C;         // gid * 512
+    add.u32      %r56, %r10, SMEM_KV_C_FP8;
+    add.u32      %r56, %r56, %r55;
+    add.u32      %r56, %r56, %r54;       // ldm_KV_C base (k_chunk=0)
+
+    // QK MMA loop: 16 K-chunks × K=32 each
+    mov.u32      %r60, 0;
+qk_mma_loop:
+    setp.ge.u32  %p5, %r60, 16;
+    @%p5 bra     qk_mma_done;
+
+    shl.b32      %r61, %r60, 5;           // chunk * 32
+
+    // Load A fragment
+    .reg .b32 _a0, _a1, _a2, _a3;
+    add.u32      %r62, %r51, %r61;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {_a0, _a1, _a2, _a3}, [%r62];
+
+    // Load B fragment (K-split)
+    .reg .b32 _b0, _b1;
+    .reg .b32 _t0, _t1, _t2, _t3, _kbase;
+    add.u32      _kbase, %r56, %r61;
+    ld.shared.u8 _t0, [_kbase];
+    ld.shared.u8 _t1, [_kbase + 1];
+    ld.shared.u8 _t2, [_kbase + 2];
+    ld.shared.u8 _t3, [_kbase + 3];
+    bfi.b32      _b0, _t1, _t0, 8, 8;
+    bfi.b32      _b0, _t2, _b0, 16, 8;
+    bfi.b32      _b0, _t3, _b0, 24, 8;
+    ld.shared.u8 _t0, [_kbase + 16];
+    ld.shared.u8 _t1, [_kbase + 17];
+    ld.shared.u8 _t2, [_kbase + 18];
+    ld.shared.u8 _t3, [_kbase + 19];
+    bfi.b32      _b1, _t1, _t0, 8, 8;
+    bfi.b32      _b1, _t2, _b1, 16, 8;
+    bfi.b32      _b1, _t3, _b1, 24, 8;
+
+    MMA_FP8_M16N8K32(_qk0, _qk1, _qk2, _qk3, _a0, _a1, _a2, _a3, _b0, _b1)
+
+    add.u32      %r60, %r60, 1;
+    bra          qk_mma_loop;
+qk_mma_done:
+
+    // Q_r @ k_rope^T: 2 more K=32 chunks for D_R=64
+    add.u32      %r63, %r10, SMEM_Q_R_FP8;
+    @%p4 mul.lo.u32 %r64, %r0, D_R;
+    @!%p4 sub.u32   %r64, %r0, 16;
+    @!%p4 mad.lo.u32 %r64, %r64, D_R, 16;
+    add.u32      %r63, %r63, %r64;       // ldm_Q_R base
+
+    add.u32      %r65, %r10, SMEM_KV_R_FP8;
+    mul.lo.u32   %r66, %r52, D_R;        // gid * 64
+    add.u32      %r65, %r65, %r66;
+    add.u32      %r65, %r65, %r54;       // ldm_KV_R base + tip*4
+
+    // Chunk 0 (K=0..31)
+    add.u32      %r67, %r63, 0;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {_a0, _a1, _a2, _a3}, [%r67];
+    add.u32      _kbase, %r65, 0;
+    ld.shared.u8 _t0, [_kbase];
+    ld.shared.u8 _t1, [_kbase + 1];
+    ld.shared.u8 _t2, [_kbase + 2];
+    ld.shared.u8 _t3, [_kbase + 3];
+    bfi.b32      _b0, _t1, _t0, 8, 8;
+    bfi.b32      _b0, _t2, _b0, 16, 8;
+    bfi.b32      _b0, _t3, _b0, 24, 8;
+    ld.shared.u8 _t0, [_kbase + 16];
+    ld.shared.u8 _t1, [_kbase + 17];
+    ld.shared.u8 _t2, [_kbase + 18];
+    ld.shared.u8 _t3, [_kbase + 19];
+    bfi.b32      _b1, _t1, _t0, 8, 8;
+    bfi.b32      _b1, _t2, _b1, 16, 8;
+    bfi.b32      _b1, _t3, _b1, 24, 8;
+    MMA_FP8_M16N8K32(_qk0, _qk1, _qk2, _qk3, _a0, _a1, _a2, _a3, _b0, _b1)
+
+    // Chunk 1 (K=32..63)
+    add.u32      %r67, %r63, 32;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {_a0, _a1, _a2, _a3}, [%r67];
+    add.u32      _kbase, %r65, 32;
+    ld.shared.u8 _t0, [_kbase];
+    ld.shared.u8 _t1, [_kbase + 1];
+    ld.shared.u8 _t2, [_kbase + 2];
+    ld.shared.u8 _t3, [_kbase + 3];
+    bfi.b32      _b0, _t1, _t0, 8, 8;
+    bfi.b32      _b0, _t2, _b0, 16, 8;
+    bfi.b32      _b0, _t3, _b0, 24, 8;
+    ld.shared.u8 _t0, [_kbase + 16];
+    ld.shared.u8 _t1, [_kbase + 17];
+    ld.shared.u8 _t2, [_kbase + 18];
+    ld.shared.u8 _t3, [_kbase + 19];
+    bfi.b32      _b1, _t1, _t0, 8, 8;
+    bfi.b32      _b1, _t2, _b1, 16, 8;
+    bfi.b32      _b1, _t3, _b1, 24, 8;
+    MMA_FP8_M16N8K32(_qk0, _qk1, _qk2, _qk3, _a0, _a1, _a2, _a3, _b0, _b1)
+
+    // Apply combined scale: scale * q_scale * kv_scale
+    mul.f32      _qk0, _qk0, %f3;
+    mul.f32      _qk1, _qk1, %f3;
+    mul.f32      _qk2, _qk2, %f3;
+    mul.f32      _qk3, _qk3, %f3;
+
+    // === ONLINE SOFTMAX ===
+    // Per lane owns: row=gid (qk0,qk1) and row=gid+8 (qk2,qk3).
+    // Each row has 4 lanes (4 tips); butterfly across tip dim for full row reduce.
+    // %f110/%f111 = row max (gid/g+8), %f112 = scratch, %f113/%f114 = m_new,
+    // %f115/%f116 = alpha, %f117..%f120 = p0..p3, %f121/%f122 = row sum
+
+    max.f32      %f110, _qk0, _qk1;
+    max.f32      %f111, _qk2, _qk3;
+
+    shfl.sync.bfly.b32 %f112|%p4, %f110, 0x1, 0x1f, 0xffffffff;
+    max.f32      %f110, %f110, %f112;
+    shfl.sync.bfly.b32 %f112|%p4, %f110, 0x2, 0x1f, 0xffffffff;
+    max.f32      %f110, %f110, %f112;
+    shfl.sync.bfly.b32 %f112|%p4, %f111, 0x1, 0x1f, 0xffffffff;
+    max.f32      %f111, %f111, %f112;
+    shfl.sync.bfly.b32 %f112|%p4, %f111, 0x2, 0x1f, 0xffffffff;
+    max.f32      %f111, %f111, %f112;
+
+    max.f32      %f113, %f100, %f110;
+    max.f32      %f114, %f101, %f111;
+
+    sub.f32      %f115, %f100, %f113;
+    sub.f32      %f116, %f101, %f114;
+    ex2.approx.f32 %f115, %f115;
+    ex2.approx.f32 %f116, %f116;
+
+    sub.f32      %f117, _qk0, %f113;
+    sub.f32      %f118, _qk1, %f113;
+    sub.f32      %f119, _qk2, %f114;
+    sub.f32      %f120, _qk3, %f114;
+    ex2.approx.f32 %f117, %f117;
+    ex2.approx.f32 %f118, %f118;
+    ex2.approx.f32 %f119, %f119;
+    ex2.approx.f32 %f120, %f120;
+
+    add.f32      %f121, %f117, %f118;
+    add.f32      %f122, %f119, %f120;
+
+    shfl.sync.bfly.b32 %f112|%p4, %f121, 0x1, 0x1f, 0xffffffff;
+    add.f32      %f121, %f121, %f112;
+    shfl.sync.bfly.b32 %f112|%p4, %f121, 0x2, 0x1f, 0xffffffff;
+    add.f32      %f121, %f121, %f112;
+    shfl.sync.bfly.b32 %f112|%p4, %f122, 0x1, 0x1f, 0xffffffff;
+    add.f32      %f122, %f122, %f112;
+    shfl.sync.bfly.b32 %f112|%p4, %f122, 0x2, 0x1f, 0xffffffff;
+    add.f32      %f122, %f122, %f112;
+
+    // Update l_i: l_i_new = l_i * alpha + row_sum
+    fma.rn.f32   %f102, %f102, %f115, %f121;
+    fma.rn.f32   %f103, %f103, %f116, %f122;
+
+    // Commit m_i
+    mov.f32      %f100, %f113;
+    mov.f32      %f101, %f114;
+
+    // === Store P [16, 8] to SMEM as BF16 (for PV ldmatrix.x2 reads) ===
+    // Per lane (gid, tip): p0 @ (gid, 2*tip), p1 @ (gid, 2*tip+1),
+    //                      p2 @ (gid+8, 2*tip), p3 @ (gid+8, 2*tip+1).
+    // SMEM_P row stride = 16 bytes (8 BF16). Address: SMEM_P + row*16 + col*2.
+    .reg .b16 _bp0, _bp1, _bp2, _bp3;
+    .reg .b32 _bp01, _bp23;
+    CVT_F32_BF16(_bp0, %f117)
+    CVT_F32_BF16(_bp1, %f118)
+    CVT_F32_BF16(_bp2, %f119)
+    CVT_F32_BF16(_bp3, %f120)
+    mov.b32      _bp01, {_bp0, _bp1};
+    mov.b32      _bp23, {_bp2, _bp3};
+
+    // Lane (gid, tip) writes to SMEM_P + gid*16 + tip*4 (for row gid)
+    //                  and SMEM_P + (gid+8)*16 + tip*4 (for row gid+8)
+    shr.b32      %r130, %r0, 2;            // gid
+    and.b32      %r131, %r0, 3;            // tip
+    shl.b32      %r132, %r130, 4;          // gid * 16
+    shl.b32      %r133, %r131, 2;          // tip * 4
+    add.u32      %r134, %r10, SMEM_P;
+    add.u32      %r135, %r134, %r132;
+    add.u32      %r135, %r135, %r133;      // SMEM_P + gid*16 + tip*4
+    st.shared.b32 [%r135], _bp01;
+    add.u32      %r136, %r135, 128;        // SMEM_P + (gid+8)*16 + tip*4
+    st.shared.b32 [%r136], _bp23;
+
+    bar.sync 0;
+
+    // ====================================================================
+    // PV: O_acc += P @ V_BF16. Per N-tile (8 cols of D_C): 1 BF16 m16n8k8 MMA.
+    // 64 N-tiles total for D_C=512.
+    // For each N-tile:
+    //   1. Load O_acc[16 rows × 8 cols] from SMEM (4 FP32 per lane)
+    //   2. Rescale by alpha (per-row): %f115 (row gid), %f116 (row gid+8)
+    //   3. ldmatrix.x1.trans for V slice (8 KV pos × 8 D_C cols) BF16
+    //   4. MMA: D = P @ V_slice + rescaled_O_acc → 4 FP32 D regs
+    //   5. Store D back to O_acc SMEM
+    // ====================================================================
+
+    // Precompute per-lane O_acc base addrs (within first N-tile, c=0):
+    //   base_g  = SMEM_O_ACC + gid*2048 + tip*8     (row gid, cols 2*tip..2*tip+1)
+    //   base_g8 = base_g + 16384 (= +8 rows * 2048 = +16384)
+    shr.b32      %r140, %r0, 2;            // gid
+    and.b32      %r141, %r0, 3;            // tip
+    mul.lo.u32   %r142, %r140, 2048;       // gid * 2048 bytes
+    shl.b32      %r143, %r141, 3;          // tip * 8 bytes (col-pair offset)
+    add.u32      %r144, %r142, %r143;
+    add.u32      %r144, %r10, %r144;
+    add.u32      %r144, %r144, SMEM_O_ACC; // base_g (c=0)
+    add.u32      %r145, %r144, 16384;      // base_g8 (= base_g + 8 rows × 2048)
+
+    // ldmatrix.x2 base for P (M=16, K=8 BF16, row stride 16 bytes):
+    //   addr per lane = SMEM_P + (lane%16)*16
+    and.b32      %r146, %r0, 15;
+    shl.b32      %r147, %r146, 4;
+    add.u32      %r148, %r10, SMEM_P;
+    add.u32      %r148, %r148, %r147;
+
+    // Load P fragments via ldmatrix.x2 — only need to do this ONCE per chunk
+    .reg .b32 _pa0, _pa1;
+    ldmatrix.sync.aligned.m8n8.x2.shared.b16 {_pa0, _pa1}, [%r148];
+
+    // V SMEM base for PV reads (BF16). Per lane: row addr (lane%8 → KV pos 0..7).
+    // V row stride = 1024 bytes (512 BF16 × 2).
+    and.b32      %r149, %r0, 7;            // sub_lane (KV pos 0..7)
+    mul.lo.u32   %r150, %r149, 1024;       // row offset
+    add.u32      %r151, %r10, SMEM_KV_C_BF16;
+    add.u32      %r151, %r151, %r150;      // V base for this lane (c=0)
+
+    // PV inner loop over 64 N-tiles
+    mov.u32      %r152, 0;                 // N-tile index (0..63)
+pv_ntile_loop:
+    setp.ge.u32  %p6, %r152, 64;
+    @%p6 bra     pv_ntile_done;
+
+    shl.b32      %r153, %r152, 3;          // N-tile c = ntile_idx * 8 (D_C col)
+    shl.b32      %r154, %r153, 2;          // c * 4 (FP32 byte offset for O_acc)
+
+    // Load O_acc[gid, c+2*tip..c+2*tip+1] and O_acc[gid+8, ...] (4 FP32)
+    add.u32      %r155, %r144, %r154;      // O_acc addr (row gid, c+2*tip)
+    add.u32      %r156, %r145, %r154;      // O_acc addr (row gid+8, c+2*tip)
+    .reg .f32 _o0, _o1, _o2, _o3;
+    ld.shared.f32 _o0, [%r155];
+    ld.shared.f32 _o1, [%r155 + 4];
+    ld.shared.f32 _o2, [%r156];
+    ld.shared.f32 _o3, [%r156 + 4];
+
+    // Rescale by alpha (per row owned)
+    mul.f32      _o0, _o0, %f115;
+    mul.f32      _o1, _o1, %f115;
+    mul.f32      _o2, _o2, %f116;
+    mul.f32      _o3, _o3, %f116;
+
+    // Load V slice for cols c..c+7
+    shl.b32      %r157, %r153, 1;          // c * 2 (BF16 byte offset within row)
+    add.u32      %r158, %r151, %r157;      // V slice addr
+    .reg .b32 _vb;
+    ldmatrix.sync.aligned.m8n8.x1.trans.shared.b16 {_vb}, [%r158];
+
+    // BF16 MMA m16n8k8: D = P @ V_slice + rescaled_O
+    mma.sync.aligned.m16n8k8.row.col.f32.bf16.bf16.f32
+        {_o0, _o1, _o2, _o3}, {_pa0, _pa1}, {_vb}, {_o0, _o1, _o2, _o3};
+
+    // Store updated O_acc back
+    st.shared.f32 [%r155],     _o0;
+    st.shared.f32 [%r155 + 4], _o1;
+    st.shared.f32 [%r156],     _o2;
+    st.shared.f32 [%r156 + 4], _o3;
+
+    add.u32      %r152, %r152, 1;
+    bra          pv_ntile_loop;
+pv_ntile_done:
+
+    bar.sync 0;
+
+    // === v1 PoC: write QK scores to output (no PV yet) ===
+    // For this iteration, we just verify FP8 MMA QK works in MLA context.
+    // Output O[batch, head_off..head_off+15, 0..7] gets the QK scores (BF16).
+    // Per m16n8k* output layout:
+    //   gid = lane / 4, tip = lane % 4
+    //   qk0 @ (row=gid,    col=2*tip)
+    //   qk1 @ (row=gid,    col=2*tip+1)
+    //   qk2 @ (row=gid+8,  col=2*tip)
+    //   qk3 @ (row=gid+8,  col=2*tip+1)
+
+    shr.b32      %r70, %r0, 2;            // gid
+    and.b32      %r71, %r0, 3;            // tip
+    shl.b32      %r72, %r71, 1;           // 2*tip
+
+    // O[batch, head_off + row, col] = bf16(qk_value)
+    // For PoC: chunk's QK scores go to first 8 cols of output. Skip writing for chunks > 0
+    // (would overwrite). Just write chunk 0 for now.
+    setp.eq.u32  %p6, %r30, 0;
+    @!%p6 bra    skip_write;
+
+    .reg .b16 _bf;
+    .reg .b32 _row, _col, _off;
+    .reg .b64 _p;
+
+    // Row gid (0..7)
+    add.u32      _row, %r3, %r70;
+    add.u32      _col, %r72, 0;
+    mul.lo.u32   _off, %r2, %r4;
+    add.u32      _off, _off, _row;
+    mul.lo.u32   _off, _off, D_C;
+    add.u32      _off, _off, _col;
+    mul.wide.u32 _p, _off, 2;
+    add.u64      _p, %rd4, _p;
+    CVT_F32_BF16(_bf, _qk0)
+    st.global.b16 [_p], _bf;
+    CVT_F32_BF16(_bf, _qk1)
+    st.global.b16 [_p + 2], _bf;
+
+    // Row gid+8
+    add.u32      _row, _row, 8;
+    mul.lo.u32   _off, %r2, %r4;
+    add.u32      _off, _off, _row;
+    mul.lo.u32   _off, _off, D_C;
+    add.u32      _off, _off, %r72;
+    mul.wide.u32 _p, _off, 2;
+    add.u64      _p, %rd4, _p;
+    CVT_F32_BF16(_bf, _qk2)
+    st.global.b16 [_p], _bf;
+    CVT_F32_BF16(_bf, _qk3)
+    st.global.b16 [_p + 2], _bf;
+
+skip_write:
+    bar.sync 0;
+
+    add.u32      %r30, %r30, KV_CHUNK;
+    bra          chunk_loop;
+chunk_done:
+
+    // ================================================================
+    // FINAL NORMALIZE: O[batch, head, c] = O_acc[head, c] / l_i[head]
+    // Lane (gid, tip) owns rows gid (l_i = %f102) and gid+8 (l_i = %f103).
+    // Distribute 512 D_C cols across 4 lanes per gid: each lane handles 128 cols.
+    // ================================================================
+
+    // Reciprocal l_i (avoid divide-by-zero — if no chunks, l_i = 0)
+    setp.eq.f32  %p12, %f102, 0f00000000;
+    mov.f32      %f131, 0f00000000;
+    @!%p12 rcp.approx.f32 %f131, %f102;
+    setp.eq.f32  %p12, %f103, 0f00000000;
+    mov.f32      %f132, 0f00000000;
+    @!%p12 rcp.approx.f32 %f132, %f103;
+
+    // Per-lane work setup
+    shr.b32      %r85, %r0, 2;        // gid (0..7)
+    and.b32      %r86, %r0, 3;        // tip (0..3)
+    shl.b32      %r87, %r86, 7;  // col_start = tip * 128
+
+    // O_acc base addrs for this lane's rows (col_start applied per iter)
+    mul.lo.u32   %r88, %r85, 2048;     // gid * 2048
+    add.u32      %r88, %r10, %r88;
+    add.u32      %r88, %r88, SMEM_O_ACC;
+    add.u32      %r89, %r88, 16384;  // +8 rows × 2048
+
+    // Global O base addrs for this lane's rows.
+    // O[batch, head_off + row, col]: offset = (batch*num_heads + head_off + row) * D_C + col
+    add.u32      %r90, %r3, %r85;        // global head index for row gid
+    mul.lo.u32   %r91, %r2, %r4;                  // batch * num_heads
+    add.u32      %r91, %r91, %r90;
+    mul.lo.u32   %r91, %r91, D_C;
+    mul.wide.u32 %rd20, %r91, 2;
+    add.u64      %rd20, %rd4, %rd20;        // &O[batch, head, 0] for row gid
+
+    add.u32      %r92, %r90, 8;
+    mul.lo.u32   %r93, %r2, %r4;
+    add.u32      %r93, %r93, %r92;
+    mul.lo.u32   %r93, %r93, D_C;
+    mul.wide.u32 %rd21, %r93, 2;
+    add.u64      %rd21, %rd4, %rd21;
+
+    // Loop 128 cols per lane
+    mov.u32      %r94, 0;
+fnorm_loop:
+    setp.ge.u32  %p11, %r94, 128;
+    @%p11 bra fnorm_done;
+
+    add.u32      %r95, %r87, %r94;
+    shl.b32      %r96, %r95, 2;           // col * 4 (FP32 byte)
+
+    // Row gid: load, divide, BF16 store
+    add.u32      %r97, %r88, %r96;
+    .reg .f32 _ov;
+    .reg .b16 _bv;
+    ld.shared.f32 _ov, [%r97];
+    mul.f32      _ov, _ov, %f131;
+    CVT_F32_BF16(_bv, _ov)
+    shl.b32      %r99, %r95, 1;
+    cvt.u64.u32  %rd22, %r99;
+    add.u64      %rd23, %rd20, %rd22;
+    st.global.b16 [%rd23], _bv;
+
+    // Row gid+8
+    add.u32      %r98, %r89, %r96;
+    ld.shared.f32 _ov, [%r98];
+    mul.f32      _ov, _ov, %f132;
+    CVT_F32_BF16(_bv, _ov)
+    add.u64      %rd23, %rd21, %rd22;
+    st.global.b16 [%rd23], _bv;
+
+    add.u32      %r94, %r94, 1;
+    bra          fnorm_loop;
+fnorm_done:
+
+    ret;
+}

@@ -1,0 +1,109 @@
+// conv1d_backward_dx_bf16.ptx
+//
+// Backward (dx) for depthwise causal conv1d with kernel_size=4 (the GDN /
+// Qwen3-Next / GDN-hybrid conv layer). Computes the gradient flowing back into
+// the input sequence.
+//
+// Forward (per channel c, time t):
+//   y[t, c] = sum_{j=0..K-1} W[c, j] * x[t - (K-1-j), c]    (causal, zero-padded left)
+//
+// Backward (this kernel):
+//   dx[t, c] = sum_{t'=t..min(t+K-1, T-1)} W[c, K-1-(t'-t)] * dy[t', c]
+//
+// Layouts:
+//   dy: [T, C] BF16 — upstream gradient
+//   W:  [C, K] BF16 — depthwise conv weights (K = kernel_size, hard-coded to 4)
+//   dx: [T, C] BF16 — output
+//
+// Grid:  (T, ceil(C / 128))
+// Block: (128, 1, 1) — each thread handles one (t, c) position.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "convert.ptxh"
+
+#define K 4
+
+.visible .entry conv1d_backward_dx_bf16(
+    .param .u64 param_dy,
+    .param .u64 param_w,
+    .param .u64 param_dx,
+    .param .u32 param_T,
+    .param .u32 param_C
+)
+{
+    .reg .b32  %r<24>;
+    .reg .b64  %rd<16>;
+    .reg .f32  %f<16>;
+    .reg .b16  %h<8>;
+    .reg .pred %p<4>;
+
+    // Per-thread (t, c)
+    mov.u32     %r0, %ctaid.x;          // t
+    mov.u32     %r1, %ctaid.y;          // c_block
+    mov.u32     %r2, %tid.x;            // c_local
+    shl.b32     %r3, %r1, 7;            // c_block * 128
+    add.u32     %r4, %r3, %r2;          // c = c_block*128 + c_local
+
+    ld.param.u32 %r5, [param_T];
+    ld.param.u32 %r6, [param_C];
+    setp.ge.u32  %p0, %r4, %r6;
+    @%p0 bra     done;
+
+    ld.param.u64 %rd0, [param_dy];
+    ld.param.u64 %rd1, [param_w];
+    ld.param.u64 %rd2, [param_dx];
+
+    // dx[t, c] = sum_{tp = t .. min(t+K-1, T-1)} W[c, K-1-(tp-t)] * dy[tp, c]
+    mov.f32     %f0, 0.0;                // accumulator
+
+    // tp_end = min(t + K - 1, T - 1)
+    add.u32     %r7, %r0, K;             // t + K
+    sub.u32     %r7, %r7, 1;             // t + K - 1
+    sub.u32     %r8, %r5, 1;             // T - 1
+    min.u32     %r9, %r7, %r8;           // tp_end
+
+    mov.u32     %r10, %r0;               // tp = t
+loop_tp:
+    setp.gt.u32 %p1, %r10, %r9;
+    @%p1 bra    loop_done;
+
+    // dy[tp, c] address
+    mul.lo.u32  %r11, %r10, %r6;         // tp * C
+    add.u32     %r11, %r11, %r4;         // tp*C + c
+    mul.wide.u32 %rd3, %r11, 2;
+    add.u64     %rd4, %rd0, %rd3;
+    ld.global.b16 %h0, [%rd4];
+    cvt.f32.bf16 %f1, %h0;
+
+    // W[c, K-1-(tp-t)] address
+    sub.u32     %r12, %r10, %r0;         // tp - t
+    sub.u32     %r13, K, 1;              // K - 1
+    sub.u32     %r13, %r13, %r12;        // K-1 - (tp-t)
+    mul.lo.u32  %r14, %r4, K;            // c * K
+    add.u32     %r14, %r14, %r13;        // c*K + k_idx
+    mul.wide.u32 %rd5, %r14, 2;
+    add.u64     %rd6, %rd1, %rd5;
+    ld.global.b16 %h1, [%rd6];
+    cvt.f32.bf16 %f2, %h1;
+
+    // accumulate
+    fma.rn.f32  %f0, %f1, %f2, %f0;
+
+    add.u32     %r10, %r10, 1;
+    bra         loop_tp;
+loop_done:
+
+    // Write dx[t, c]
+    mul.lo.u32  %r15, %r0, %r6;          // t * C
+    add.u32     %r15, %r15, %r4;
+    mul.wide.u32 %rd7, %r15, 2;
+    add.u64     %rd8, %rd2, %rd7;
+    cvt.rn.bf16.f32 %h2, %f0;
+    st.global.b16 [%rd8], %h2;
+
+done:
+    ret;
+}

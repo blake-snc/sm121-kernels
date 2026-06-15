@@ -1,0 +1,199 @@
+// moe_route_decode_full.ptx
+//
+// MoE routing for batch=1 decode with FULL-SOFTMAX-OVER-ALL-EXPERTS semantics
+// (norm_topk_prob=False, what DSV2-Lite-Chat uses).
+//
+// Replaces (moe_routing GPU kernel + host dtoh + host softmax + host htod) per
+// MoE layer with a single GPU kernel. Eliminates 26 dtoh syncs per token on
+// DSV2-Lite-Chat decode (one per MoE layer).
+//
+// Inputs:
+//   logits:             [n_routed] BF16
+//   routed_scaling_factor: f32 scalar (parameter)
+// Outputs:
+//   expert_ids:  [top_k] u32 — descending order of softmax probability
+//   weights:     [top_k] f32 — softmax(logits)[expert_ids[i]] * routed_scaling_factor
+//
+// Single block, 256 threads (handles n_routed up to 256, top_k up to 16).
+// Single token.
+// Threads beyond n_routed pad with -inf so the serial argmax over thread 0
+// ignores them.
+//
+// Sized for: DSV2-Lite-Chat (n_routed=64, top_k=6), 35B-A3B MoE
+// (n_routed=256, top_k=8). The serial argmax on one thread costs
+// n_routed × top_k cycles — at 256×8 = 2048 it's still microseconds.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+// Shared memory layout (1152 bytes for n_routed=256, top_k=16):
+//   [0..1023]    smem_probs (256 × f32) — overwritten through phases
+//   [1024..1087] smem_topk_val (16 × f32)
+//   [1088..1151] smem_topk_idx (16 × u32)
+//   [1152..1155] smem_max (1 × f32)
+//   [1156..1159] smem_sum (1 × f32)
+.shared .align 128 .b8 smem_route[1280];
+
+.visible .entry moe_route_decode_full(
+    .param .u64 param_logits,       // [n_routed] bf16
+    .param .u64 param_expert_ids,   // [top_k] u32
+    .param .u64 param_weights,      // [top_k] f32
+    .param .u32 param_n_routed,     // ≤ 256
+    .param .u32 param_top_k,        // ≤ 16
+    .param .f32 param_scale         // routed_scaling_factor
+)
+{
+    .reg .b32 %r<32>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<16>;
+    .reg .b16 %h<4>;
+    .reg .pred %p<8>;
+
+    mov.u32         %r0, THREAD_ID;             // [0..255]
+    ld.param.u64    %rd0, [param_logits];
+    ld.param.u64    %rd1, [param_expert_ids];
+    ld.param.u64    %rd2, [param_weights];
+    ld.param.u32    %r1, [param_n_routed];
+    ld.param.u32    %r2, [param_top_k];
+    ld.param.f32    %f15, [param_scale];
+
+    mov.u32         %r10, smem_route;           // smem_probs base
+    add.u32         %r11, %r10, 1024;           // smem_topk_val base
+    add.u32         %r12, %r10, 1088;           // smem_topk_idx base
+    add.u32         %r13, %r10, 1152;           // smem_max
+    add.u32         %r14, %r10, 1156;           // smem_sum
+
+    // ---- Stage 1: Each thread loads its logit if tid < n_routed ----
+    setp.ge.u32     %p0, %r0, %r1;
+    @%p0 bra        skip_load;
+    mul.wide.u32    %rd3, %r0, 2;
+    add.u64         %rd4, %rd0, %rd3;
+    ld.global.b16   %h0, [%rd4];
+    CVT_BF16_F32(%f0, %h0)
+    shl.b32         %r15, %r0, 2;
+    add.u32         %r16, %r10, %r15;
+    st.shared.f32   [%r16], %f0;
+    bra             load_done;
+skip_load:
+    // Pad with -inf for threads beyond n_routed (so reductions ignore them).
+    mov.f32         %f0, 0fFF800000;            // -inf
+    shl.b32         %r15, %r0, 2;
+    add.u32         %r16, %r10, %r15;
+    st.shared.f32   [%r16], %f0;
+load_done:
+    bar.sync        0;
+
+    // ---- Stage 2: Thread 0 computes max, sum, then probs ----
+    setp.ne.u32     %p1, %r0, 0;
+    @%p1 bra        wait_phase2;
+
+    // max over n_routed
+    mov.f32         %f1, 0fFF800000;            // running max
+    mov.u32         %r17, 0;
+max_loop:
+    setp.ge.u32     %p2, %r17, %r1;
+    @%p2 bra        max_done;
+    shl.b32         %r18, %r17, 2;
+    add.u32         %r19, %r10, %r18;
+    ld.shared.f32   %f2, [%r19];
+    max.f32         %f1, %f1, %f2;
+    add.u32         %r17, %r17, 1;
+    bra             max_loop;
+max_done:
+    st.shared.f32   [%r13], %f1;                // store max
+
+    // sum of exp(x - max), and write probs = exp(x - max) into SMEM (un-normalized)
+    mov.f32         %f3, 0.0;                   // running sum
+    mov.u32         %r17, 0;
+exp_loop:
+    setp.ge.u32     %p2, %r17, %r1;
+    @%p2 bra        exp_done;
+    shl.b32         %r18, %r17, 2;
+    add.u32         %r19, %r10, %r18;
+    ld.shared.f32   %f2, [%r19];
+    sub.f32         %f4, %f2, %f1;
+    // exp(x) = 2^(x * log2(e)) — PTX has ex2.approx but no exp.approx on sm_121a.
+    mul.f32         %f6, %f4, 0f3FB8AA3B;       // log2(e) ≈ 1.442695
+    ex2.approx.f32  %f5, %f6;
+    st.shared.f32   [%r19], %f5;                // store unnormalized prob
+    add.f32         %f3, %f3, %f5;
+    add.u32         %r17, %r17, 1;
+    bra             exp_loop;
+exp_done:
+    st.shared.f32   [%r14], %f3;                // store sum
+
+    // Top-k via serial selection: for k iterations, scan probs, pick max,
+    // record (id, val), set its prob to -inf so next pass picks the next.
+    mov.u32         %r20, 0;                    // k iter
+topk_loop:
+    setp.ge.u32     %p2, %r20, %r2;
+    @%p2 bra        topk_done;
+
+    // Find argmax over current probs.
+    mov.f32         %f7, 0fFF800000;            // best val
+    mov.u32         %r21, 0;                    // best idx
+    mov.u32         %r17, 0;
+argmax_loop:
+    setp.ge.u32     %p3, %r17, %r1;
+    @%p3 bra        argmax_done;
+    shl.b32         %r18, %r17, 2;
+    add.u32         %r19, %r10, %r18;
+    ld.shared.f32   %f2, [%r19];
+    setp.gt.f32     %p4, %f2, %f7;
+    @%p4 mov.f32    %f7, %f2;
+    @%p4 mov.u32    %r21, %r17;
+    add.u32         %r17, %r17, 1;
+    bra             argmax_loop;
+argmax_done:
+    // Record (idx, val) into smem_topk arrays at slot r20.
+    shl.b32         %r22, %r20, 2;
+    add.u32         %r23, %r11, %r22;
+    st.shared.f32   [%r23], %f7;                // smem_topk_val[k]
+    add.u32         %r24, %r12, %r22;
+    st.shared.u32   [%r24], %r21;               // smem_topk_idx[k]
+
+    // Set the chosen prob to -inf so next iter picks the next.
+    shl.b32         %r25, %r21, 2;
+    add.u32         %r26, %r10, %r25;
+    mov.f32         %f8, 0fFF800000;
+    st.shared.f32   [%r26], %f8;
+
+    add.u32         %r20, %r20, 1;
+    bra             topk_loop;
+topk_done:
+
+wait_phase2:
+    bar.sync        0;
+
+    // ---- Stage 3: First top_k threads write outputs ----
+    setp.ge.u32     %p1, %r0, %r2;
+    @%p1 bra        kernel_done;
+
+    // Read sum (was unnormalized; divide stored val by sum to get prob)
+    ld.shared.f32   %f3, [%r14];
+
+    shl.b32         %r22, %r0, 2;
+    add.u32         %r23, %r11, %r22;
+    ld.shared.f32   %f7, [%r23];                // unnormalized chosen val
+    add.u32         %r24, %r12, %r22;
+    ld.shared.u32   %r21, [%r24];               // chosen idx
+
+    rcp.approx.f32  %f9, %f3;
+    mul.f32         %f10, %f7, %f9;             // prob = val / sum
+    mul.f32         %f11, %f10, %f15;           // prob *= scaling_factor
+
+    // Write expert_ids[tid]
+    mul.wide.u32    %rd5, %r0, 4;
+    add.u64         %rd6, %rd1, %rd5;
+    st.global.u32   [%rd6], %r21;
+    // Write weights[tid]
+    add.u64         %rd7, %rd2, %rd5;
+    st.global.f32   [%rd7], %f11;
+
+kernel_done:
+    ret;
+}

@@ -1,0 +1,213 @@
+// gemv_w4a16_nvfp4_split_k.ptx
+//
+// W4A16 NVFP4 GEMV with split-K:
+//   out_f32[N] += x[k_start:k_end] @ dequant(B[k_start:k_end, N])
+// where B is NVFP4 (FP4 e2m1 with 16-elem blocks along N, FP8 e4m3 per-block scales).
+//
+// Each B row k contains:
+//   packed FP4: [N/2] bytes (each byte = 2 packed FP4 values)
+//   scales:     [N/16] bytes (one FP8 e4m3 scale per 16-elem block)
+// Two parallel buffers, indexed independently.
+//
+// Drop-in FP8→FP4 successor for the heaviest single-input weights (GDN
+// in_proj_fused, MoE expert stacks via the grouped variant). Halves HBM
+// bandwidth vs gemv_w8a16_split_k.
+//
+// Block: 128 threads, 8 cols/thread → 1024 cols/block. Each thread is
+// fully within ONE 16-col block (col_offset = tid*8, blocks at 16-col
+// boundaries). One scale per (K-iter, thread).
+//
+// Constraints: N must be a multiple of 16.
+// Caller MUST zero out_f32[N] before launch.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+.extern .shared .align 16 .b8 smem_xsh_w4a16[];
+
+.visible .entry gemv_w4a16_nvfp4_split_k(
+    .param .u64 param_x,            // [K] bf16
+    .param .u64 param_b_packed,     // [K, N/2] u8 (packed FP4)
+    .param .u64 param_b_scales,     // [K, N/16] u8 (FP8 e4m3 per-block scales)
+    .param .u64 param_out_f32,      // [N] f32 (caller-zeroed)
+    .param .u32 param_n,
+    .param .u32 param_k,
+    .param .u32 param_k_shard
+)
+{
+    .reg .b32 %r<32>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<32>;
+    .reg .b16 %h<16>;
+    .reg .pred %p<8>;
+
+    mov.u32         %r0, %ctaid.x;
+    mov.u32         %r1, %ctaid.y;
+    mov.u32         %r2, %tid.x;
+    mov.u32         %r3, %ntid.x;
+
+    // col_start = col_block * 1024 + tid * 8
+    shl.b32         %r4, %r0, 10;
+    shl.b32         %r5, %r2, 3;
+    add.u32         %r6, %r4, %r5;          // col_start (in elements)
+
+    ld.param.u64    %rd0, [param_x];
+    ld.param.u64    %rd1, [param_b_packed];
+    ld.param.u64    %rd2, [param_b_scales];
+    ld.param.u64    %rd3, [param_out_f32];
+    ld.param.u32    %r7, [param_n];
+    ld.param.u32    %r8, [param_k];
+    ld.param.u32    %r9, [param_k_shard];
+
+    // Strides
+    shr.u32         %r28, %r7, 1;           // N/2 (row stride for packed)
+    shr.u32         %r29, %r7, 4;           // N/16 (row stride for scales)
+
+    // K range
+    mul.lo.u32      %r10, %r1, %r9;
+    add.u32         %r11, %r10, %r9;
+    min.u32         %r11, %r11, %r8;
+    sub.u32         %r13, %r11, %r10;
+
+    // Load X[k_start..k_end] into smem
+    mov.u32         %r12, smem_xsh_w4a16;
+    mov.u32         %r14, %r2;
+load_x:
+    setp.ge.u32     %p0, %r14, %r13;
+    @%p0 bra        load_done;
+    add.u32         %r15, %r14, %r10;
+    mul.wide.u32    %rd4, %r15, 2;
+    add.u64         %rd5, %rd0, %rd4;
+    ld.global.b16   %h0, [%rd5];
+    shl.b32         %r16, %r14, 1;
+    add.u32         %r17, %r12, %r16;
+    st.shared.b16   [%r17], %h0;
+    add.u32         %r14, %r14, %r3;
+    bra             load_x;
+load_done:
+    bar.sync        0;
+
+    setp.ge.u32     %p1, %r6, %r7;
+    @%p1 bra        ret;
+
+    // Compute byte offsets for this thread's column block
+    // packed: col_start * 0.5 bytes → col_start >> 1
+    shr.u32         %r19, %r6, 1;           // packed col offset
+    // scale: col_start >> 4 (one scale per 16 cols)
+    shr.u32         %r20, %r6, 4;           // scale col offset
+
+    // 8 accumulators
+    mov.f32         %f0, 0.0;
+    mov.f32         %f1, 0.0;
+    mov.f32         %f2, 0.0;
+    mov.f32         %f3, 0.0;
+    mov.f32         %f4, 0.0;
+    mov.f32         %f5, 0.0;
+    mov.f32         %f6, 0.0;
+    mov.f32         %f7, 0.0;
+
+    // K-shard loop
+    mov.u32         %r18, 0;
+k_loop:
+    setp.ge.u32     %p2, %r18, %r13;
+    @%p2 bra        k_done;
+
+    // X[k_in_shard] from smem
+    shl.b32         %r21, %r18, 1;
+    add.u32         %r22, %r12, %r21;
+    ld.shared.b16   %h0, [%r22];
+    CVT_BF16_F32(%f8, %h0)
+
+    // k_global = k_start + k_in_shard
+    add.u32         %r23, %r18, %r10;
+
+    // Load this thread's scale: scales[k_global, col_block_idx]
+    // Address = base + k_global * (N/16) + (col_start/16)
+    mul.lo.u32      %r24, %r23, %r29;
+    add.u32         %r24, %r24, %r20;
+    cvt.u64.u32     %rd6, %r24;
+    add.u64         %rd7, %rd2, %rd6;
+    .reg .b8 _scale_byte;
+    ld.global.u8    _scale_byte, [%rd7];
+
+    // Decode FP8 e4m3 scale → f32 (via cvt to f16x2 with the upper byte zeroed)
+    cvt.u16.u8      %h1, _scale_byte;
+    .reg .b32 _sf16x2;
+    cvt.rn.f16x2.e4m3x2 _sf16x2, %h1;
+    mov.b32         {%h2, %h3}, _sf16x2;
+    cvt.f32.f16     %f9, %h2;               // dequant scale
+
+    // Fold scale into x once per K iter
+    mul.f32         %f8, %f8, %f9;          // x * scale
+
+    // Load 4 bytes (8 packed FP4) at packed[k_global, col_offset/2]
+    mul.lo.u32      %r25, %r23, %r28;       // k_global * (N/2)
+    add.u32         %r25, %r25, %r19;       // + packed col offset
+    cvt.u64.u32     %rd8, %r25;
+    add.u64         %rd9, %rd1, %rd8;
+    .reg .b32 _b32;
+    ld.global.b32   _b32, [%rd9];
+
+    // _b32 = 4 bytes = 8 packed FP4 values
+    // Each byte holds 2 FP4 (low nibble = element 2i, high nibble = element 2i+1).
+    // Extract 4 bytes from the b32 (via b16 halves then mov.b16 → b8 pair).
+    .reg .b16 _half_lo, _half_hi;
+    mov.b32         {_half_lo, _half_hi}, _b32;  // bytes 0,1 ; bytes 2,3
+    .reg .b8 _byte0, _byte1, _byte2, _byte3;
+    mov.b16         {_byte0, _byte1}, _half_lo;  // byte0 = bits 0-7 ; byte1 = bits 8-15
+    mov.b16         {_byte2, _byte3}, _half_hi;
+
+    .reg .b32 _df16_0, _df16_1, _df16_2, _df16_3;
+    cvt.rn.f16x2.e2m1x2 _df16_0, _byte0;     // f16 (cols 0, 1)
+    cvt.rn.f16x2.e2m1x2 _df16_1, _byte1;     // (cols 2, 3)
+    cvt.rn.f16x2.e2m1x2 _df16_2, _byte2;     // (cols 4, 5)
+    cvt.rn.f16x2.e2m1x2 _df16_3, _byte3;     // (cols 6, 7)
+
+    mov.b32         {%h4,  %h5},  _df16_0;
+    mov.b32         {%h6,  %h7},  _df16_1;
+    mov.b32         {%h8,  %h9},  _df16_2;
+    mov.b32         {%h10, %h11}, _df16_3;
+
+    cvt.f32.f16     %f10, %h4;
+    cvt.f32.f16     %f11, %h5;
+    cvt.f32.f16     %f12, %h6;
+    cvt.f32.f16     %f13, %h7;
+    cvt.f32.f16     %f14, %h8;
+    cvt.f32.f16     %f15, %h9;
+    cvt.f32.f16     %f16, %h10;
+    cvt.f32.f16     %f17, %h11;
+
+    // 8-way ILP FMAs (acc += (x * scale) * w_dq)
+    fma.rn.f32      %f0, %f8, %f10, %f0;
+    fma.rn.f32      %f1, %f8, %f11, %f1;
+    fma.rn.f32      %f2, %f8, %f12, %f2;
+    fma.rn.f32      %f3, %f8, %f13, %f3;
+    fma.rn.f32      %f4, %f8, %f14, %f4;
+    fma.rn.f32      %f5, %f8, %f15, %f5;
+    fma.rn.f32      %f6, %f8, %f16, %f6;
+    fma.rn.f32      %f7, %f8, %f17, %f7;
+
+    add.u32         %r18, %r18, 1;
+    bra             k_loop;
+
+k_done:
+    mul.wide.u32    %rd10, %r6, 4;
+    add.u64         %rd11, %rd3, %rd10;
+
+    .reg .f32 %old;
+    atom.global.add.f32 %old, [%rd11 + 0],  %f0;
+    atom.global.add.f32 %old, [%rd11 + 4],  %f1;
+    atom.global.add.f32 %old, [%rd11 + 8],  %f2;
+    atom.global.add.f32 %old, [%rd11 + 12], %f3;
+    atom.global.add.f32 %old, [%rd11 + 16], %f4;
+    atom.global.add.f32 %old, [%rd11 + 20], %f5;
+    atom.global.add.f32 %old, [%rd11 + 24], %f6;
+    atom.global.add.f32 %old, [%rd11 + 28], %f7;
+
+ret:
+    ret;
+}

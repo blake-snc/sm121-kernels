@@ -1,0 +1,324 @@
+// gemm_bf16_split_k_det.ptx
+//
+// Batched (M-row) deterministic split-K GEMM, bit-identical PER ROW to
+// gemv_bf16_split_k_det. This is the MTP self-spec VERIFY kernel: it verifies
+// M = k+1 candidate tokens in ONE weight-stream while producing, for each row,
+// the EXACT same f32 partial sums the M=1 decode GEMV would produce — so the
+// argmax of each row matches the production decode path bit-for-bit (the
+// byte-identity gate). The win: the weight tile B[k, col..] is loaded ONCE per
+// (col_block, shard) block and reused across all M rows, amortizing weight
+// bandwidth over k+1 tokens instead of paying k+1 separate weight-streams.
+//
+// Reduction-order invariant (why it's bit-identical to M=1):
+//   - Each output (m, col) accumulates over the shard's K range in the SAME
+//     order (k_in_shard = 0..shard_len) with the SAME fma.rn.f32 ops as the
+//     M=1 kernel. Accumulators are per-(row, col) independent.
+//   - Partial sums are written to stage[shard, m, col] (NO atomics). The
+//     existing f32_shard_reduce_to_bf16 reducer, called with N' = M*N, sums
+//     shards in fixed order for each (m, col) — identical to the M=1 reduce.
+//   So out[m, :] is byte-identical to feeding row m alone through the M=1 path,
+//   PROVIDED the caller uses the same num_shards the decode path uses for that
+//   projection (num_shards determines the shard boundaries).
+//
+// Layout:
+//   x:           [M, K] bf16   (row-major; row m = activation for token m)
+//   b:           [K, N] bf16   (the projection weight, same as M=1)
+//   stage_f32:   [num_shards, M, N] f32   (offset = shard*(M*N) + m*N + col)
+//   Block: 128 threads, 8 cols/thread -> 1024 cols/block.
+//   Grid:  (ceil(N/1024), num_shards, 1)  — identical to gemv_bf16_split_k_det.
+//   SMEM:  MAX_M * k_shard * 2 bytes (X tile for all rows, zero-padded > M).
+//   Constraints: N % 8 == 0, M <= MAX_M (8). Last shard may be shorter.
+//   Caller does NOT need to zero staging — every (shard,m,col) slot written once.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+#define MAX_M 8
+
+.extern .shared .align 16 .b8 smem_xsh[];
+
+// One row's 8-way FMA: acc[c] += xreg * w[c], for the 8 weights in %f64..%f71.
+#define DOROW(XREG, A0, A1, A2, A3, A4, A5, A6, A7) \
+    fma.rn.f32 A0, XREG, %f64, A0; \
+    fma.rn.f32 A1, XREG, %f65, A1; \
+    fma.rn.f32 A2, XREG, %f66, A2; \
+    fma.rn.f32 A3, XREG, %f67, A3; \
+    fma.rn.f32 A4, XREG, %f68, A4; \
+    fma.rn.f32 A5, XREG, %f69, A5; \
+    fma.rn.f32 A6, XREG, %f70, A6; \
+    fma.rn.f32 A7, XREG, %f71, A7;
+
+.visible .entry gemm_bf16_split_k_det(
+    .param .u64 param_x,         // [M, K] bf16
+    .param .u64 param_b,         // [K, N] bf16
+    .param .u64 param_stage_f32, // [num_shards, M, N] f32 staging
+    .param .u32 param_n,
+    .param .u32 param_k,
+    .param .u32 param_k_shard,   // nominal shard size (last shard may be smaller)
+    .param .u32 param_m          // actual number of rows (<= MAX_M)
+)
+{
+    .reg .b32 %r<48>;
+    .reg .b64 %rd<24>;
+    .reg .f32 %f<80>;            // %f0..63 accumulators, %f64..71 weights, %f72 x
+    .reg .b16 %h<16>;
+    .reg .pred %p<16>;
+
+    mov.u32         %r0, %ctaid.x;             // col_block idx
+    mov.u32         %r1, %ctaid.y;             // shard idx
+    mov.u32         %r2, %tid.x;               // tid in [0..127]
+    mov.u32         %r3, %ntid.x;              // 128
+
+    // col_start = col_block * 1024 + tid * 8
+    shl.b32         %r4, %r0, 10;
+    shl.b32         %r5, %r2, 3;
+    add.u32         %r6, %r4, %r5;             // col_start
+
+    ld.param.u64    %rd0, [param_x];
+    ld.param.u64    %rd1, [param_b];
+    ld.param.u64    %rd2, [param_stage_f32];
+    ld.param.u32    %r7, [param_n];            // N
+    ld.param.u32    %r8, [param_k];            // K
+    ld.param.u32    %r9, [param_k_shard];      // nominal shard size
+    ld.param.u32    %r30, [param_m];           // M (actual rows)
+
+    // K range for this shard: [k_start, min(k_start + k_shard, K))
+    mul.lo.u32      %r10, %r1, %r9;            // k_start
+    add.u32         %r11, %r10, %r9;           // tentative k_end
+    min.u32         %r11, %r11, %r8;           // clamp to K
+    sub.u32         %r13, %r11, %r10;          // shard_len (<= k_shard)
+
+    // ----- Cooperatively load X[m, k_start..k_end] into smem, rows 0..M-1.
+    //       SMEM holds exactly M rows (caller sizes it M*k_shard*2); the k-loop
+    //       below skips rows >= M, so no row beyond M-1 is ever read.
+    mov.u32         %r12, smem_xsh;            // smem base
+    mov.u32         %r31, 0;                   // m (row counter)
+row_loop:
+    setp.ge.u32     %p3, %r31, %r30;           // m >= M -> done
+    @%p3 bra        rows_done;
+    // smem row base (elements): m * shard_len
+    mul.lo.u32      %r32, %r31, %r13;
+    // global X row base (elements): m*K + k_start
+    mul.lo.u32      %r33, %r31, %r8;
+    add.u32         %r33, %r33, %r10;
+    mov.u32         %r14, %r2;                 // i = tid
+elem_loop:
+    setp.ge.u32     %p0, %r14, %r13;
+    @%p0 bra        row_done;
+    add.u32         %r15, %r33, %r14;          // global elem idx = row_base + i
+    mul.wide.u32    %rd3, %r15, 2;
+    add.u64         %rd4, %rd0, %rd3;
+    ld.global.b16   %h0, [%rd4];
+    add.u32         %r16, %r32, %r14;          // smem elem idx = srow_base + i
+    shl.b32         %r16, %r16, 1;             // *2 bytes
+    add.u32         %r17, %r12, %r16;
+    st.shared.b16   [%r17], %h0;
+    add.u32         %r14, %r14, %r3;           // i += 128
+    bra             elem_loop;
+row_done:
+    add.u32         %r31, %r31, 1;
+    bra             row_loop;
+rows_done:
+    bar.sync        0;
+
+    // ----- Bounds: skip whole thread if its 8-col group beyond N -----
+    setp.ge.u32     %p1, %r6, %r7;
+    @%p1 bra        ret;
+
+    // ----- 64 accumulators (8 rows x 8 cols) = %f0..%f63, zeroed -----
+    mov.f32 %f0,0.0;  mov.f32 %f1,0.0;  mov.f32 %f2,0.0;  mov.f32 %f3,0.0;
+    mov.f32 %f4,0.0;  mov.f32 %f5,0.0;  mov.f32 %f6,0.0;  mov.f32 %f7,0.0;
+    mov.f32 %f8,0.0;  mov.f32 %f9,0.0;  mov.f32 %f10,0.0; mov.f32 %f11,0.0;
+    mov.f32 %f12,0.0; mov.f32 %f13,0.0; mov.f32 %f14,0.0; mov.f32 %f15,0.0;
+    mov.f32 %f16,0.0; mov.f32 %f17,0.0; mov.f32 %f18,0.0; mov.f32 %f19,0.0;
+    mov.f32 %f20,0.0; mov.f32 %f21,0.0; mov.f32 %f22,0.0; mov.f32 %f23,0.0;
+    mov.f32 %f24,0.0; mov.f32 %f25,0.0; mov.f32 %f26,0.0; mov.f32 %f27,0.0;
+    mov.f32 %f28,0.0; mov.f32 %f29,0.0; mov.f32 %f30,0.0; mov.f32 %f31,0.0;
+    mov.f32 %f32,0.0; mov.f32 %f33,0.0; mov.f32 %f34,0.0; mov.f32 %f35,0.0;
+    mov.f32 %f36,0.0; mov.f32 %f37,0.0; mov.f32 %f38,0.0; mov.f32 %f39,0.0;
+    mov.f32 %f40,0.0; mov.f32 %f41,0.0; mov.f32 %f42,0.0; mov.f32 %f43,0.0;
+    mov.f32 %f44,0.0; mov.f32 %f45,0.0; mov.f32 %f46,0.0; mov.f32 %f47,0.0;
+    mov.f32 %f48,0.0; mov.f32 %f49,0.0; mov.f32 %f50,0.0; mov.f32 %f51,0.0;
+    mov.f32 %f52,0.0; mov.f32 %f53,0.0; mov.f32 %f54,0.0; mov.f32 %f55,0.0;
+    mov.f32 %f56,0.0; mov.f32 %f57,0.0; mov.f32 %f58,0.0; mov.f32 %f59,0.0;
+    mov.f32 %f60,0.0; mov.f32 %f61,0.0; mov.f32 %f62,0.0; mov.f32 %f63,0.0;
+
+    // ----- K-shard loop: load weight tile once, reuse across all MAX_M rows ---
+    mov.u32         %r18, 0;                   // k_in_shard
+k_loop:
+    setp.ge.u32     %p2, %r18, %r13;
+    @%p2 bra        k_done;
+
+    // B[k_global, col_start..col_start+8] = 4 packed b32 loads (8 bf16)
+    add.u32         %r21, %r18, %r10;          // k_global = k_start + k_in_shard
+    mul.lo.u32      %r22, %r21, %r7;           // k_global * N
+    add.u32         %r22, %r22, %r6;           // + col_start
+    mul.wide.u32    %rd5, %r22, 2;
+    add.u64         %rd6, %rd1, %rd5;
+
+    ld.global.b32   %r23, [%rd6 + 0];
+    ld.global.b32   %r24, [%rd6 + 4];
+    ld.global.b32   %r25, [%rd6 + 8];
+    ld.global.b32   %r26, [%rd6 + 12];
+
+    mov.b32         {%h0, %h1}, %r23;
+    mov.b32         {%h2, %h3}, %r24;
+    mov.b32         {%h4, %h5}, %r25;
+    mov.b32         {%h6, %h7}, %r26;
+
+    CVT_BF16_F32(%f64, %h0)
+    CVT_BF16_F32(%f65, %h1)
+    CVT_BF16_F32(%f66, %h2)
+    CVT_BF16_F32(%f67, %h3)
+    CVT_BF16_F32(%f68, %h4)
+    CVT_BF16_F32(%f69, %h5)
+    CVT_BF16_F32(%f70, %h6)
+    CVT_BF16_F32(%f71, %h7)
+
+    // smem column offset for this k (in elements): k_in_shard; row stride = shard_len
+    // row m x value at smem[(m*shard_len + k_in_shard) * 2 bytes]
+    // base byte offset for row 0 = (k_in_shard)*2 ; add m*shard_len*2 per row.
+    shl.b32         %r19, %r18, 1;             // k_in_shard * 2 (byte offset within row)
+    shl.b32         %r34, %r13, 1;             // shard_len * 2 (row byte stride)
+    add.u32         %r20, %r12, %r19;          // smem addr for row 0, this k
+
+    // Rows processed in order 0..M-1; once a row index >= M, all later rows in
+    // this k-iteration are invalid too -> branch to k_advance. Row 0 is always
+    // valid (M >= 1). Each processed row advances the smem pointer by one row.
+    // Row 0
+    ld.shared.b16   %h8, [%r20];
+    CVT_BF16_F32(%f72, %h8)
+    DOROW(%f72, %f0, %f1, %f2, %f3, %f4, %f5, %f6, %f7)
+    add.u32         %r20, %r20, %r34;
+    // Row 1
+    setp.lt.u32     %p5, 1, %r30; @!%p5 bra k_advance;
+    ld.shared.b16   %h8, [%r20];
+    CVT_BF16_F32(%f72, %h8)
+    DOROW(%f72, %f8, %f9, %f10, %f11, %f12, %f13, %f14, %f15)
+    add.u32         %r20, %r20, %r34;
+    // Row 2
+    setp.lt.u32     %p6, 2, %r30; @!%p6 bra k_advance;
+    ld.shared.b16   %h8, [%r20];
+    CVT_BF16_F32(%f72, %h8)
+    DOROW(%f72, %f16, %f17, %f18, %f19, %f20, %f21, %f22, %f23)
+    add.u32         %r20, %r20, %r34;
+    // Row 3
+    setp.lt.u32     %p7, 3, %r30; @!%p7 bra k_advance;
+    ld.shared.b16   %h8, [%r20];
+    CVT_BF16_F32(%f72, %h8)
+    DOROW(%f72, %f24, %f25, %f26, %f27, %f28, %f29, %f30, %f31)
+    add.u32         %r20, %r20, %r34;
+    // Row 4
+    setp.lt.u32     %p8, 4, %r30; @!%p8 bra k_advance;
+    ld.shared.b16   %h8, [%r20];
+    CVT_BF16_F32(%f72, %h8)
+    DOROW(%f72, %f32, %f33, %f34, %f35, %f36, %f37, %f38, %f39)
+    add.u32         %r20, %r20, %r34;
+    // Row 5
+    setp.lt.u32     %p9, 5, %r30; @!%p9 bra k_advance;
+    ld.shared.b16   %h8, [%r20];
+    CVT_BF16_F32(%f72, %h8)
+    DOROW(%f72, %f40, %f41, %f42, %f43, %f44, %f45, %f46, %f47)
+    add.u32         %r20, %r20, %r34;
+    // Row 6
+    setp.lt.u32     %p10, 6, %r30; @!%p10 bra k_advance;
+    ld.shared.b16   %h8, [%r20];
+    CVT_BF16_F32(%f72, %h8)
+    DOROW(%f72, %f48, %f49, %f50, %f51, %f52, %f53, %f54, %f55)
+    add.u32         %r20, %r20, %r34;
+    // Row 7
+    setp.lt.u32     %p11, 7, %r30; @!%p11 bra k_advance;
+    ld.shared.b16   %h8, [%r20];
+    CVT_BF16_F32(%f72, %h8)
+    DOROW(%f72, %f56, %f57, %f58, %f59, %f60, %f61, %f62, %f63)
+
+k_advance:
+    add.u32         %r18, %r18, 1;
+    bra             k_loop;
+
+k_done:
+    // ----- Store partial sums to stage[shard, m, col..col+8], rows 0..M-1 -----
+    // stage offset (elements) = shard*(M*N) + m*N + col_start
+    mul.lo.u32      %r35, %r7, %r30;           // N * M  (per-shard stride)
+    mul.lo.u32      %r36, %r1, %r35;           // shard * (M*N)
+    // per-row base = r36 + m*N + col_start ; we iterate m with += N
+    add.u32         %r37, %r36, %r6;           // shard*(M*N) + col_start  (m=0)
+
+    // Row 0 (m always >= 1 since M >= 1)
+    mul.wide.u32    %rd7, %r37, 4;
+    add.u64         %rd8, %rd2, %rd7;
+    st.global.f32   [%rd8 + 0],  %f0;  st.global.f32 [%rd8 + 4],  %f1;
+    st.global.f32   [%rd8 + 8],  %f2;  st.global.f32 [%rd8 + 12], %f3;
+    st.global.f32   [%rd8 + 16], %f4;  st.global.f32 [%rd8 + 20], %f5;
+    st.global.f32   [%rd8 + 24], %f6;  st.global.f32 [%rd8 + 28], %f7;
+
+    // Row 1
+    setp.le.u32     %p5, %r30, 1; @%p5 bra ret;
+    add.u32         %r37, %r37, %r7;           // += N
+    mul.wide.u32    %rd7, %r37, 4; add.u64 %rd8, %rd2, %rd7;
+    st.global.f32   [%rd8 + 0],  %f8;  st.global.f32 [%rd8 + 4],  %f9;
+    st.global.f32   [%rd8 + 8],  %f10; st.global.f32 [%rd8 + 12], %f11;
+    st.global.f32   [%rd8 + 16], %f12; st.global.f32 [%rd8 + 20], %f13;
+    st.global.f32   [%rd8 + 24], %f14; st.global.f32 [%rd8 + 28], %f15;
+
+    // Row 2
+    setp.le.u32     %p6, %r30, 2; @%p6 bra ret;
+    add.u32         %r37, %r37, %r7;
+    mul.wide.u32    %rd7, %r37, 4; add.u64 %rd8, %rd2, %rd7;
+    st.global.f32   [%rd8 + 0],  %f16; st.global.f32 [%rd8 + 4],  %f17;
+    st.global.f32   [%rd8 + 8],  %f18; st.global.f32 [%rd8 + 12], %f19;
+    st.global.f32   [%rd8 + 16], %f20; st.global.f32 [%rd8 + 20], %f21;
+    st.global.f32   [%rd8 + 24], %f22; st.global.f32 [%rd8 + 28], %f23;
+
+    // Row 3
+    setp.le.u32     %p7, %r30, 3; @%p7 bra ret;
+    add.u32         %r37, %r37, %r7;
+    mul.wide.u32    %rd7, %r37, 4; add.u64 %rd8, %rd2, %rd7;
+    st.global.f32   [%rd8 + 0],  %f24; st.global.f32 [%rd8 + 4],  %f25;
+    st.global.f32   [%rd8 + 8],  %f26; st.global.f32 [%rd8 + 12], %f27;
+    st.global.f32   [%rd8 + 16], %f28; st.global.f32 [%rd8 + 20], %f29;
+    st.global.f32   [%rd8 + 24], %f30; st.global.f32 [%rd8 + 28], %f31;
+
+    // Row 4
+    setp.le.u32     %p8, %r30, 4; @%p8 bra ret;
+    add.u32         %r37, %r37, %r7;
+    mul.wide.u32    %rd7, %r37, 4; add.u64 %rd8, %rd2, %rd7;
+    st.global.f32   [%rd8 + 0],  %f32; st.global.f32 [%rd8 + 4],  %f33;
+    st.global.f32   [%rd8 + 8],  %f34; st.global.f32 [%rd8 + 12], %f35;
+    st.global.f32   [%rd8 + 16], %f36; st.global.f32 [%rd8 + 20], %f37;
+    st.global.f32   [%rd8 + 24], %f38; st.global.f32 [%rd8 + 28], %f39;
+
+    // Row 5
+    setp.le.u32     %p9, %r30, 5; @%p9 bra ret;
+    add.u32         %r37, %r37, %r7;
+    mul.wide.u32    %rd7, %r37, 4; add.u64 %rd8, %rd2, %rd7;
+    st.global.f32   [%rd8 + 0],  %f40; st.global.f32 [%rd8 + 4],  %f41;
+    st.global.f32   [%rd8 + 8],  %f42; st.global.f32 [%rd8 + 12], %f43;
+    st.global.f32   [%rd8 + 16], %f44; st.global.f32 [%rd8 + 20], %f45;
+    st.global.f32   [%rd8 + 24], %f46; st.global.f32 [%rd8 + 28], %f47;
+
+    // Row 6
+    setp.le.u32     %p10, %r30, 6; @%p10 bra ret;
+    add.u32         %r37, %r37, %r7;
+    mul.wide.u32    %rd7, %r37, 4; add.u64 %rd8, %rd2, %rd7;
+    st.global.f32   [%rd8 + 0],  %f48; st.global.f32 [%rd8 + 4],  %f49;
+    st.global.f32   [%rd8 + 8],  %f50; st.global.f32 [%rd8 + 12], %f51;
+    st.global.f32   [%rd8 + 16], %f52; st.global.f32 [%rd8 + 20], %f53;
+    st.global.f32   [%rd8 + 24], %f54; st.global.f32 [%rd8 + 28], %f55;
+
+    // Row 7
+    setp.le.u32     %p11, %r30, 7; @%p11 bra ret;
+    add.u32         %r37, %r37, %r7;
+    mul.wide.u32    %rd7, %r37, 4; add.u64 %rd8, %rd2, %rd7;
+    st.global.f32   [%rd8 + 0],  %f56; st.global.f32 [%rd8 + 4],  %f57;
+    st.global.f32   [%rd8 + 8],  %f58; st.global.f32 [%rd8 + 12], %f59;
+    st.global.f32   [%rd8 + 16], %f60; st.global.f32 [%rd8 + 20], %f61;
+    st.global.f32   [%rd8 + 24], %f62; st.global.f32 [%rd8 + 28], %f63;
+
+ret:
+    ret;
+}

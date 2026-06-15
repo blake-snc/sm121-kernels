@@ -1,0 +1,127 @@
+// conv1d_silu_bf16.ptx
+//
+// Depthwise causal conv1d (kernel=4) + SiLU activation, single-token decode.
+// Used by Qwen3-Next / GDN-hybrid GatedDeltaNet for the QKV-stream conv1d.
+//
+// For each channel c independently:
+//   y[c] = w[c, 0]*state[0, c] + w[c, 1]*state[1, c] + w[c, 2]*state[2, c]
+//        + w[c, 3]*current[c]
+//   out[c] = silu(y) = y * sigmoid(y)
+//
+// And the state advances:
+//   state[0, c] = state[1, c]_old
+//   state[1, c] = state[2, c]_old
+//   state[2, c] = current[c]
+//
+// Layouts:
+//   state:   [3, total_qkv] BF16 (3 prior tokens, channel-minor)
+//   current: [total_qkv] BF16
+//   weight:  [total_qkv, 1, 4] BF16 (HF Conv1d depthwise: 4 BF16 per channel contiguous)
+//   out:     [total_qkv] BF16
+//
+// Grid: (ceil(total_qkv / BLOCK), 1, 1).  Block: (128, 1, 1).
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+
+#define LOG2E_F32 0f3FB8AA3B    // 1.4426950409
+#define MINUS_LOG2E_F32 0fBFB8AA3B
+#define ONE_F32   0f3F800000    // 1.0
+
+.visible .entry conv1d_silu_bf16(
+    .param .u64 param_state,      // [3, total_qkv] BF16 in/out
+    .param .u64 param_current,    // [total_qkv] BF16
+    .param .u64 param_weight,     // [total_qkv, 1, 4] BF16
+    .param .u64 param_out,        // [total_qkv] BF16
+    .param .u32 param_total_qkv
+)
+{
+    .reg .b32  %r<32>;
+    .reg .b64  %rd<16>;
+    .reg .f32  %f<24>;
+    .reg .b16  %h<16>;
+    .reg .pred %p<4>;
+
+    // Channel index c = blockIdx.x * blockDim.x + threadIdx.x
+    mov.u32         %r0, %tid.x;
+    mov.u32         %r1, %ctaid.x;
+    mov.u32         %r2, %ntid.x;
+    mad.lo.u32      %r3, %r1, %r2, %r0;
+
+    ld.param.u32    %r4, [param_total_qkv];
+    setp.ge.u32     %p0, %r3, %r4;
+    @%p0 bra        done;
+
+    ld.param.u64    %rd0, [param_state];
+    ld.param.u64    %rd1, [param_current];
+    ld.param.u64    %rd2, [param_weight];
+    ld.param.u64    %rd3, [param_out];
+
+    // current[c] address = base + c*2
+    mul.wide.u32    %rd4, %r3, 2;
+    add.u64         %rd5, %rd1, %rd4;
+    ld.global.b16   %h0, [%rd5];
+    cvt.f32.bf16    %f0, %h0;
+
+    // State row stride = total_qkv * 2 bytes
+    mul.lo.u32      %r5, %r4, 2;
+    cvt.u64.u32     %rd6, %r5;
+
+    // state[0, c] = base + 0*stride + c*2
+    add.u64         %rd7, %rd0, %rd4;
+    ld.global.b16   %h1, [%rd7];
+    cvt.f32.bf16    %f1, %h1;
+
+    // state[1, c] = base + 1*stride + c*2
+    add.u64         %rd8, %rd7, %rd6;
+    ld.global.b16   %h2, [%rd8];
+    cvt.f32.bf16    %f2, %h2;
+
+    // state[2, c] = base + 2*stride + c*2
+    add.u64         %rd9, %rd8, %rd6;
+    ld.global.b16   %h3, [%rd9];
+    cvt.f32.bf16    %f3, %h3;
+
+    // weight[c, 0..3]: 4 contiguous BF16 at c*4*2 = c*8 bytes
+    shl.b32         %r6, %r3, 3;
+    cvt.u64.u32     %rd10, %r6;
+    add.u64         %rd11, %rd2, %rd10;
+    ld.global.b16   %h4, [%rd11];
+    ld.global.b16   %h5, [%rd11 + 2];
+    ld.global.b16   %h6, [%rd11 + 4];
+    ld.global.b16   %h7, [%rd11 + 6];
+    cvt.f32.bf16    %f4, %h4;
+    cvt.f32.bf16    %f5, %h5;
+    cvt.f32.bf16    %f6, %h6;
+    cvt.f32.bf16    %f7, %h7;
+
+    // y = w[0]*s[0] + w[1]*s[1] + w[2]*s[2] + w[3]*current
+    mul.f32         %f8, %f4, %f1;
+    fma.rn.f32      %f8, %f5, %f2, %f8;
+    fma.rn.f32      %f8, %f6, %f3, %f8;
+    fma.rn.f32      %f8, %f7, %f0, %f8;
+
+    // silu(y) = y * sigmoid(y) = y / (1 + exp(-y))
+    // sigmoid(y) computed via:  1 / (1 + 2^(-y * log2(e)))
+    mul.f32         %f9, %f8, MINUS_LOG2E_F32;
+    ex2.approx.f32  %f10, %f9;
+    add.f32         %f11, %f10, ONE_F32;
+    rcp.approx.f32  %f12, %f11;
+    mul.f32         %f13, %f8, %f12;
+
+    // Store output
+    cvt.rn.bf16.f32 %h8, %f13;
+    add.u64         %rd12, %rd3, %rd4;
+    st.global.b16   [%rd12], %h8;
+
+    // Advance state in place. We've read all 3 + current into registers, so no race.
+    st.global.b16   [%rd7], %h2;       // state[0] := old state[1]
+    st.global.b16   [%rd8], %h3;       // state[1] := old state[2]
+    st.global.b16   [%rd9], %h0;       // state[2] := current
+
+done:
+    ret;
+}

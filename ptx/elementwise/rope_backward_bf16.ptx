@@ -1,0 +1,111 @@
+// rope_backward_bf16.ptx
+//
+// Backward pass for `rope_bf16` (interleaved-pairs RoPE).
+//
+// Forward:
+//   y[2i]   = x[2i]*cos - x[2i+1]*sin
+//   y[2i+1] = x[2i]*sin + x[2i+1]*cos
+//
+// Backward (rotation by negated angle):
+//   dx[2i]   = dy[2i]*cos + dy[2i+1]*sin
+//   dx[2i+1] = -dy[2i]*sin + dy[2i+1]*cos
+//
+// Layout matches forward:
+//   dy: [B*S*H*D] BF16   (input upstream gradient)
+//   dx: [B*S*H*D] BF16   (output)
+//   cos/sin: [S*D/2] f32 (same caches the forward used)
+//
+// One thread per (batch, seq, head, pair).
+// Grid: (B*S*H, 1, 1)
+// Block: (D/2, 1, 1)
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+.visible .entry rope_backward_bf16(
+    .param .u64 param_dy,
+    .param .u64 param_dx,
+    .param .u64 param_cos,
+    .param .u64 param_sin,
+    .param .u32 param_seq,
+    .param .u32 param_heads,
+    .param .u32 param_dim,
+    .param .u32 param_half_dim
+)
+{
+    .reg .b32  %r<22>;
+    .reg .b64  %rd<16>;
+    .reg .f32  %f<12>;
+    .reg .b16  %h<4>;
+    .reg .pred %p<2>;
+
+    mov.u32         %r0, BLOCK_ID_X;
+    mov.u32         %r1, THREAD_ID;
+
+    ld.param.u32    %r2, [param_seq];
+    ld.param.u32    %r3, [param_heads];
+    ld.param.u32    %r4, [param_dim];
+    ld.param.u32    %r5, [param_half_dim];
+
+    setp.ge.u32     %p0, %r1, %r5;
+    @%p0 bra        done;
+
+    mul.lo.u32      %r6, %r2, %r3;          // S*H
+    div.u32         %r7, %r0, %r6;          // batch
+    rem.u32         %r8, %r0, %r6;          // seq*H rem
+    div.u32         %r9, %r8, %r3;          // seq_pos
+    rem.u32         %r10, %r8, %r3;         // head
+
+    ld.param.u64    %rd0, [param_dy];
+    ld.param.u64    %rd1, [param_dx];
+    ld.param.u64    %rd2, [param_cos];
+    ld.param.u64    %rd3, [param_sin];
+
+    // Element offset: (batch*S*H + seq*H + head) * D + 2*pair
+    mul.lo.u32      %r11, %r7, %r6;
+    add.u32         %r11, %r11, %r8;
+    mul.lo.u32      %r11, %r11, %r4;
+    shl.b32         %r12, %r1, 1;           // 2*pair
+    add.u32         %r11, %r11, %r12;
+
+    mul.wide.u32    %rd4, %r11, 2;          // bytes
+    add.u64         %rd5, %rd0, %rd4;       // &dy[..., 2*pair]
+    add.u64         %rd6, %rd1, %rd4;       // &dx[..., 2*pair]
+
+    // cos/sin offset
+    mul.lo.u32      %r13, %r9, %r5;
+    add.u32         %r13, %r13, %r1;
+    mul.wide.u32    %rd7, %r13, 4;
+    add.u64         %rd8, %rd2, %rd7;       // &cos
+    add.u64         %rd9, %rd3, %rd7;       // &sin
+
+    // Load packed dy[2i], dy[2i+1]
+    ld.global.b32   %r14, [%rd5];
+    mov.b32         {%h0, %h1}, %r14;
+    CVT_BF16_F32(%f0, %h0)                  // dy_even
+    CVT_BF16_F32(%f1, %h1)                  // dy_odd
+
+    ld.global.f32   %f2, [%rd8];            // cos
+    ld.global.f32   %f3, [%rd9];            // sin
+
+    // dx[2i]   = dy_even*cos + dy_odd*sin
+    mul.f32         %f5, %f1, %f3;          // dy_odd*sin
+    fma.rn.f32      %f6, %f0, %f2, %f5;     // dy_even*cos + dy_odd*sin
+
+    // dx[2i+1] = -dy_even*sin + dy_odd*cos = dy_odd*cos - dy_even*sin
+    mul.f32         %f8, %f0, %f3;          // dy_even*sin
+    neg.f32         %f8, %f8;
+    fma.rn.f32      %f9, %f1, %f2, %f8;     // dy_odd*cos - dy_even*sin
+
+    CVT_F32_BF16(%h2, %f6)
+    CVT_F32_BF16(%h3, %f9)
+    mov.b32         %r15, {%h2, %h3};
+    st.global.b32   [%rd6], %r15;
+
+done:
+    ret;
+}

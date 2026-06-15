@@ -1,0 +1,160 @@
+// flash_decoding_combine.ptx
+//
+// FlashDecoding combine kernel: reduces split-KV partial outputs to final attention.
+//
+// Each split produced:
+//   O_partial[split, batch, head, seq_q, D] in FP32
+//   LSE_partial[split, batch, head, seq_q] in FP32  (log-sum-exp per row)
+//
+// The combine computes for each (b, h, sq):
+//   global_lse = log(sum_s(exp(lse_s)))                     [log-sum-exp across splits]
+//   O_final[d] = sum_s(O_partial[s][d] * exp(lse_s - global_lse)) / sum_s(exp(lse_s - global_lse))
+//   which simplifies to: O_final = sum(O_s * exp(lse_s)) / sum(exp(lse_s))
+//   using the stable formulation with max_lse subtracted first.
+//
+// Grid: (ceil(seq_q * D / 256), num_heads, batch)
+// Block: (256, 1, 1)  — each thread handles one element of D
+//
+// Actually, a better decomposition:
+// Grid: (seq_q, num_heads, batch)
+// Block: (D, 1, 1) = (128, 1, 1)  — one block per (b, h, sq) row
+// Each thread handles one element along D.
+// The reduction across splits is done per-thread (loop over num_splits).
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#define D 128
+
+.visible .entry flash_decoding_combine(
+    .param .u64 param_O_partial,     // [num_splits, B, H, Sq, D] f32
+    .param .u64 param_LSE_partial,   // [num_splits, B, H, Sq] f32
+    .param .u64 param_O,             // [B, H, Sq, D] bf16 (output)
+    .param .u32 param_batch,
+    .param .u32 param_num_heads,
+    .param .u32 param_seq_q,
+    .param .u32 param_num_splits
+)
+{
+    .reg .b32  %r<32>;
+    .reg .b64  %rd<16>;
+    .reg .f32  %f<16>;
+    .reg .b16  %h<4>;
+    .reg .pred %p<4>;
+
+    // Thread = d index within the row
+    mov.u32         %r0, %tid.x;              // d_idx [0..127]
+    mov.u32         %r1, %ctaid.x;            // sq
+    mov.u32         %r2, %ctaid.y;            // head
+    mov.u32         %r3, %ctaid.z;            // batch
+
+    ld.param.u64    %rd0, [param_O_partial];
+    ld.param.u64    %rd1, [param_LSE_partial];
+    ld.param.u64    %rd2, [param_O];
+    ld.param.u32    %r4, [param_batch];
+    ld.param.u32    %r5, [param_num_heads];
+    ld.param.u32    %r6, [param_seq_q];
+    ld.param.u32    %r7, [param_num_splits];
+
+    // Strides for O_partial: [num_splits, B, H, Sq, D]
+    // Element offset for (s, b, h, sq, d):
+    //   = s * B*H*Sq*D + b * H*Sq*D + h * Sq*D + sq * D + d
+    mul.lo.u32      %r10, %r6, D;             // Sq * D
+    mul.lo.u32      %r11, %r5, %r10;          // H * Sq * D
+    mul.lo.u32      %r12, %r4, %r11;          // B * H * Sq * D (split stride)
+
+    // Base offset for (b, h, sq, d) within one split
+    mul.lo.u32      %r13, %r3, %r11;          // b * H*Sq*D
+    mul.lo.u32      %r14, %r2, %r10;          // h * Sq*D
+    add.u32         %r13, %r13, %r14;
+    mul.lo.u32      %r15, %r1, D;             // sq * D
+    add.u32         %r13, %r13, %r15;
+    add.u32         %r13, %r13, %r0;          // + d
+    // %r13 = base element offset for (b, h, sq, d)
+
+    // LSE strides: [num_splits, B, H, Sq]
+    mul.lo.u32      %r20, %r5, %r6;           // H * Sq
+    mul.lo.u32      %r21, %r4, %r20;          // B * H * Sq (split stride for LSE)
+    // LSE base for (b, h, sq)
+    mul.lo.u32      %r22, %r3, %r20;          // b * H*Sq
+    mul.lo.u32      %r23, %r2, %r6;           // h * Sq
+    add.u32         %r22, %r22, %r23;
+    add.u32         %r22, %r22, %r1;          // + sq
+    // %r22 = base element offset for LSE (b, h, sq)
+
+    // Pass 1: find max LSE across splits (for numerical stability)
+    mov.b32         %f0, 0xff800000;          // max_lse = -inf
+    mov.u32         %r8, 0;                   // split = 0
+find_max_loop:
+    setp.ge.u32     %p0, %r8, %r7;
+    @%p0 bra        find_max_done;
+
+    // LSE[split, b, h, sq]
+    mul.lo.u32      %r24, %r8, %r21;          // split * B*H*Sq
+    add.u32         %r24, %r24, %r22;          // + base
+    mul.wide.u32    %rd3, %r24, 4;             // byte offset (f32)
+    add.u64         %rd4, %rd1, %rd3;
+    ld.global.b32   %r25, [%rd4];
+    mov.b32         %f1, %r25;
+    max.f32         %f0, %f0, %f1;
+
+    add.u32         %r8, %r8, 1;
+    bra             find_max_loop;
+find_max_done:
+    // %f0 = max_lse
+
+    // Pass 2: accumulate O_weighted and exp_sum
+    mov.f32         %f2, 0.0;                 // sum_exp = 0
+    mov.f32         %f3, 0.0;                 // O_acc = 0
+    mov.u32         %r8, 0;
+combine_loop:
+    setp.ge.u32     %p0, %r8, %r7;
+    @%p0 bra        combine_done;
+
+    // LSE[split]
+    mul.lo.u32      %r24, %r8, %r21;
+    add.u32         %r24, %r24, %r22;
+    mul.wide.u32    %rd3, %r24, 4;
+    add.u64         %rd4, %rd1, %rd3;
+    ld.global.b32   %r25, [%rd4];
+    mov.b32         %f1, %r25;                // lse_s
+
+    // exp(lse_s - max_lse)
+    sub.f32         %f4, %f1, %f0;
+    // Use exp2 with LOG2E conversion: exp(x) = exp2(x * LOG2E)
+    mul.f32         %f4, %f4, 0f3FB8AA3B;     // * LOG2E
+    ex2.approx.f32  %f4, %f4;                 // exp_weight
+
+    // sum_exp += exp_weight
+    add.f32         %f2, %f2, %f4;
+
+    // O_partial[split, b, h, sq, d]
+    mul.lo.u32      %r24, %r8, %r12;          // split * B*H*Sq*D
+    add.u32         %r24, %r24, %r13;          // + base(b,h,sq,d)
+    mul.wide.u32    %rd3, %r24, 4;
+    add.u64         %rd4, %rd0, %rd3;
+    ld.global.b32   %r25, [%rd4];
+    mov.b32         %f5, %r25;                // O_partial_s[d]
+
+    // O_acc += O_partial_s * exp_weight
+    fma.rn.f32      %f3, %f5, %f4, %f3;
+
+    add.u32         %r8, %r8, 1;
+    bra             combine_loop;
+combine_done:
+
+    // O_final = O_acc / sum_exp
+    rcp.approx.f32  %f6, %f2;
+    mul.f32         %f3, %f3, %f6;
+
+    // Convert to bf16 and store
+    cvt.rn.bf16.f32 %h0, %f3;
+    // O[b, h, sq, d] — same layout as param_O_partial but without split dim
+    // Element offset = b*H*Sq*D + h*Sq*D + sq*D + d = %r13 (same base)
+    mul.wide.u32    %rd5, %r13, 2;            // byte offset (bf16)
+    add.u64         %rd6, %rd2, %rd5;
+    st.global.b16   [%rd6], %h0;
+
+    ret;
+}

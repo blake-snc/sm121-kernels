@@ -1,0 +1,400 @@
+// linear_attn_chunk_prefill.ptx
+//
+// Linear attention chunk-parallel prefill — pure delta-rule-free linear
+// attention (no gating, no decay):
+//   S_t = S_{t-1} + v_t k_t^T
+//   y_t = S_t q_t
+//
+// Chunk-parallel decomposition:
+//   Y_intra = lowerTri(Q @ K^T) @ V    [C, D] (within-chunk attention)
+//   Y_inter = Q @ S_init^T              [C, D] (carry from prior chunks)
+//   Y = Y_intra + Y_inter
+//   S_new = S_init + V^T @ K            [D, D] (state update)
+//
+// The host calls this kernel chunk-by-chunk, threading the state from the
+// previous chunk's output into the next chunk's input. Within a chunk all
+// MMAs are independent → full SM saturation.
+//
+// First iteration: scalar implementation (correct but not yet MMA-accelerated).
+// Establishes the algorithm + correctness; MMA acceleration is the next pass.
+//
+// Layouts:
+//   k, v, q: [B, H, C, D=128] BF16 (one chunk; C=32)
+//   y:       [B, H, C, D]      BF16 (output)
+//   s_in:    [B, H, D, D]      FP16 (state at chunk start; SMEM compute in FP32)
+//   s_out:   [B, H, D, D]      FP16 (state at chunk end; can alias s_in)
+//
+// Grid: (num_heads, batch). Block: (128, 1, 1) — 1 thread per D dim.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+#define D 128
+#define C 32
+#define BLOCK 128
+
+// SMEM layout
+//   sS:  D * D * 4 = 65536 bytes (state, FP32)
+//   sK:  C * D * 4 = 16384 bytes (chunk K, FP32 for ease of computation)
+//   sV:  C * D * 4 = 16384 bytes (chunk V, FP32)
+//   sQ:  C * D * 4 = 16384 bytes (chunk Q, FP32)
+//   total: 114688 bytes
+//
+// Hmm that's > 99 KB. Use BF16 for K/V/Q in SMEM (8 KB each = 24 KB total).
+// Total: 65536 + 24576 = 90112 bytes ≤ 99 KB. ✓
+
+#define SMEM_S      0
+#define SMEM_K      65536
+#define SMEM_V      73728
+#define SMEM_Q      81920
+#define SMEM_TOTAL  90112
+
+.extern .shared .align 128 .b8 lin_attn_smem[];
+
+.visible .entry linear_attn_chunk_prefill(
+    .param .u64 param_k,        // [B, H, C, D]
+    .param .u64 param_v,
+    .param .u64 param_q,
+    .param .u64 param_y,
+    .param .u64 param_s_in,     // [B, H, D, D] FP32
+    .param .u64 param_s_out,    // [B, H, D, D] FP32
+    .param .u32 param_num_heads
+)
+{
+    .reg .b32  %r<48>;
+    .reg .b64  %rd<24>;
+    .reg .f32  %f<32>;
+    .reg .b16  %h<8>;
+    .reg .pred %p<8>;
+
+    mov.u32     %r0, %tid.x;            // tid [0..127]; this thread's D position
+    mov.u32     %r1, %ctaid.x;          // head
+    mov.u32     %r2, %ctaid.y;          // batch
+
+    ld.param.u64 %rd0, [param_k];
+    ld.param.u64 %rd1, [param_v];
+    ld.param.u64 %rd2, [param_q];
+    ld.param.u64 %rd3, [param_y];
+    ld.param.u64 %rd4, [param_s_in];
+    ld.param.u64 %rd5, [param_s_out];
+    ld.param.u32 %r3, [param_num_heads];
+
+    // bh = batch * num_heads + head
+    mul.lo.u32  %r4, %r2, %r3;
+    add.u32     %r4, %r4, %r1;
+
+    mov.u32     %r5, lin_attn_smem;
+
+    // ============================================================
+    // Load K, V, Q chunk (BF16) into SMEM. Each chunk is C*D = 4096 elems = 8 KB.
+    // 128 threads × 32 elems each = 4096 ✓.
+    // Layout: thread t loads element t for each row (D=128 threads = 1 thread per D dim).
+    // For row c (c in 0..C), thread t loads element t.
+    // Linear layout in SMEM: row * D + col.
+    // ============================================================
+
+    // Base addr in global: &K[bh, 0, 0] = bh * C * D * 2 bytes
+    mul.lo.u32  %r6, %r4, C;
+    mul.lo.u32  %r6, %r6, D;
+    mul.wide.u32 %rd10, %r6, 2;        // bytes
+    add.u64     %rd11, %rd0, %rd10;     // K base
+    add.u64     %rd12, %rd1, %rd10;     // V base
+    add.u64     %rd13, %rd2, %rd10;     // Q base
+    add.u64     %rd14, %rd3, %rd10;     // Y base
+
+    // For each row c in [0, C), thread t loads K[c, t], V[c, t], Q[c, t] → SMEM[c, t]
+    // Loop over c
+    mov.u32     %r10, 0;
+load_chunk_loop:
+    setp.ge.u32 %p0, %r10, C;
+    @%p0 bra    load_chunk_done;
+
+    mul.lo.u32  %r11, %r10, D;
+    add.u32     %r11, %r11, %r0;        // c * D + t (element idx)
+    mul.wide.u32 %rd15, %r11, 2;        // bytes
+    shl.b32     %r12, %r11, 1;          // SMEM byte offset for BF16 (2 bytes)
+
+    // K
+    add.u64     %rd16, %rd11, %rd15;
+    ld.global.b16 %h0, [%rd16];
+    add.u32     %r13, %r5, SMEM_K;
+    add.u32     %r13, %r13, %r12;
+    st.shared.b16 [%r13], %h0;
+
+    // V
+    add.u64     %rd16, %rd12, %rd15;
+    ld.global.b16 %h0, [%rd16];
+    add.u32     %r13, %r5, SMEM_V;
+    add.u32     %r13, %r13, %r12;
+    st.shared.b16 [%r13], %h0;
+
+    // Q
+    add.u64     %rd16, %rd13, %rd15;
+    ld.global.b16 %h0, [%rd16];
+    add.u32     %r13, %r5, SMEM_Q;
+    add.u32     %r13, %r13, %r12;
+    st.shared.b16 [%r13], %h0;
+
+    add.u32     %r10, %r10, 1;
+    bra         load_chunk_loop;
+load_chunk_done:
+
+    // ============================================================
+    // Load state S_init from global into SMEM (FP32, D*D = 64 KB).
+    // Each thread loads D rows for column t: S[*, t].
+    // Wait — that's expensive. Actually total = D*D = 16384 fp32. 128 threads × 128 = 16384 ✓.
+    // Thread t loads row (t / 1)... let's say thread t loads ROW t (D elements).
+    // For row r (r = t), load D elements from S[bh, r, 0..D].
+    // ============================================================
+
+    // S_in base in global: &S_in[bh, 0, 0] = bh * D * D * 2 (FP16 state)
+    mul.lo.u32  %r6, %r4, D;
+    mul.lo.u32  %r6, %r6, D;
+    mul.wide.u32 %rd10, %r6, 2;
+    add.u64     %rd17, %rd4, %rd10;     // S_in base (FP16)
+    add.u64     %rd18, %rd5, %rd10;     // S_out base (FP16)
+
+    // Thread t loads S_in[t, 0..D] (one row) into SMEM[t, 0..D]
+    // Global row offset (FP16): t * D * 2 bytes; SMEM row offset (FP32): t * D * 4 bytes
+    mul.lo.u32  %r14, %r0, D;           // t * D (element)
+    shl.b32     %r45, %r14, 1;          // global FP16 bytes = t*D*2
+    shl.b32     %r15, %r14, 2;          // SMEM FP32 bytes  = t*D*4
+    cvt.u64.u32 %rd19, %r45;
+    add.u64     %rd20, %rd17, %rd19;    // global row addr (FP16)
+
+    // SMEM row addr (FP32)
+    add.u32     %r16, %r5, SMEM_S;
+    add.u32     %r16, %r16, %r15;       // SMEM row addr
+
+    // Load 128 FP16 = 32 × (4 packed u16); convert to f32 → SMEM (FP32)
+    mov.u32     %r17, 0;
+load_s_loop:
+    setp.ge.u32 %p0, %r17, 32;
+    @%p0 bra    load_s_done;
+    shl.b32     %r18, %r17, 3;          // global FP16: i * 8 bytes (4 × u16)
+    shl.b32     %r46, %r17, 4;          // SMEM FP32:  i * 16 bytes (4 × f32)
+    cvt.u64.u32 %rd21, %r18;
+    add.u64     %rd21, %rd20, %rd21;
+    .reg .b16 _hz0, _hz1, _hz2, _hz3;
+    .reg .b32 _z0, _z1, _z2, _z3;
+    ld.global.v4.u16 {_hz0, _hz1, _hz2, _hz3}, [%rd21];
+    cvt.f32.f16 _z0, _hz0;
+    cvt.f32.f16 _z1, _hz1;
+    cvt.f32.f16 _z2, _hz2;
+    cvt.f32.f16 _z3, _hz3;
+    add.u32     %r19, %r16, %r46;
+    st.shared.v4.b32 [%r19], {_z0, _z1, _z2, _z3};
+    add.u32     %r17, %r17, 1;
+    bra         load_s_loop;
+load_s_done:
+
+    bar.sync 0;
+
+    // ============================================================
+    // SCALAR per-chunk computation. Each thread t handles dimension t of D.
+    //
+    // For each token c in chunk:
+    //   1. score[c, j] = K[j, :] · Q[c, :]  for all j  (compute when needed)
+    //   2. Y_intra[c, t] = Σ_{j<=c} V[j, t] * score[c, j]
+    //   3. Y_inter[c, t] = Σ_{d=0..D} S[t, d] * Q[c, d]
+    //   4. Y[c, t] = Y_intra + Y_inter
+    //
+    // After all tokens:
+    //   5. S_new[t, d] = S[t, d] + Σ_{c} V[c, t] * K[c, d]
+    //
+    // Each thread holds one ROW of S (its t-th row), so all S accesses are
+    // local to this thread (read/write S[t, *]).
+    //
+    // For Y_inter[c, t] = S[t, :] · Q[c, :], thread t computes its own t-th
+    // output column (per-token).
+    // ============================================================
+
+    // We need scratch fp32 for scores. Each token c needs C scores.
+    // Use registers for compactness — only 32 score slots needed per token.
+    // Across all C tokens: store score[c, j] for j up to c (lower triangle).
+    // Per thread it's (c+1) values per token c. Won't fit in regs for C=32.
+    // → recompute scores on-the-fly within the inner loop.
+
+    // Outer loop: token c in [0, C)
+    mov.u32     %r20, 0;                // c (token index)
+token_loop:
+    setp.ge.u32 %p0, %r20, C;
+    @%p0 bra    token_done;
+
+    // Compute Y_inter[c, t] = Σ_d S[t, d] * Q[c, d]
+    //   S[t, d] is at SMEM_S + t*D*4 + d*4 (this thread's row, dim d)
+    //   Q[c, d] is at SMEM_Q + c*D*2 + d*2
+    mov.f32     %f0, 0.0;
+    mov.u32     %r21, 0;                // d
+    mul.lo.u32  %r22, %r0, D;
+    shl.b32     %r22, %r22, 2;          // t * D * 4
+    add.u32     %r22, %r5, SMEM_S;
+    add.u32     %r22, %r22, %r22;       // BUG: double-add base. Recompute properly:
+    mov.u32     %r22, %r5;
+    add.u32     %r22, %r22, SMEM_S;
+    mul.lo.u32  %r23, %r0, D;
+    shl.b32     %r23, %r23, 2;
+    add.u32     %r22, %r22, %r23;       // SMEM_S + t*D*4
+
+    mul.lo.u32  %r24, %r20, D;
+    shl.b32     %r24, %r24, 1;          // c * D * 2
+    add.u32     %r24, %r5, SMEM_Q;
+    add.u32     %r24, %r24, %r24;       // BUG again:
+    mov.u32     %r24, %r5;
+    add.u32     %r24, %r24, SMEM_Q;
+    mul.lo.u32  %r25, %r20, D;
+    shl.b32     %r25, %r25, 1;
+    add.u32     %r24, %r24, %r25;       // SMEM_Q + c*D*2
+
+inter_d_loop:
+    setp.ge.u32 %p1, %r21, D;
+    @%p1 bra    inter_d_done;
+    shl.b32     %r26, %r21, 2;          // d * 4
+    shl.b32     %r27, %r21, 1;          // d * 2
+    add.u32     %r28, %r22, %r26;
+    add.u32     %r29, %r24, %r27;
+    ld.shared.f32 %f1, [%r28];
+    ld.shared.b16 %h0, [%r29];
+    CVT_BF16_F32(%f2, %h0)
+    fma.rn.f32  %f0, %f1, %f2, %f0;
+    add.u32     %r21, %r21, 1;
+    bra         inter_d_loop;
+inter_d_done:
+    // %f0 = Y_inter[c, t]
+
+    // Compute Y_intra[c, t] = Σ_{j<=c} V[j, t] * (K[j, :] · Q[c, :])
+    // For each j in [0, c+1):
+    //   score = Σ_d K[j, d] * Q[c, d]
+    //   add V[j, t] * score
+    // Loop j
+    mov.f32     %f10, 0.0;              // accumulator for Y_intra
+    mov.u32     %r30, 0;                // j
+intra_j_loop:
+    setp.gt.u32 %p1, %r30, %r20;
+    @%p1 bra    intra_j_done;
+
+    // Compute score = K[j, :] · Q[c, :]
+    mov.f32     %f11, 0.0;
+    mov.u32     %r31, 0;                // d
+    mov.u32     %r32, %r5;
+    add.u32     %r32, %r32, SMEM_K;
+    mul.lo.u32  %r33, %r30, D;
+    shl.b32     %r33, %r33, 1;
+    add.u32     %r32, %r32, %r33;       // SMEM_K + j*D*2
+
+    // Reuse %r24 for Q[c, *] addr (already SMEM_Q + c*D*2)
+intra_d_loop:
+    setp.ge.u32 %p2, %r31, D;
+    @%p2 bra    intra_d_done;
+    shl.b32     %r34, %r31, 1;
+    add.u32     %r35, %r32, %r34;
+    add.u32     %r36, %r24, %r34;
+    ld.shared.b16 %h1, [%r35];
+    ld.shared.b16 %h2, [%r36];
+    CVT_BF16_F32(%f12, %h1)
+    CVT_BF16_F32(%f13, %h2)
+    fma.rn.f32  %f11, %f12, %f13, %f11;
+    add.u32     %r31, %r31, 1;
+    bra         intra_d_loop;
+intra_d_done:
+    // %f11 = score for (c, j)
+
+    // Add V[j, t] * score into accumulator
+    mov.u32     %r37, %r5;
+    add.u32     %r37, %r37, SMEM_V;
+    mul.lo.u32  %r38, %r30, D;
+    add.u32     %r38, %r38, %r0;        // j * D + t
+    shl.b32     %r38, %r38, 1;          // bytes
+    add.u32     %r37, %r37, %r38;
+    ld.shared.b16 %h3, [%r37];
+    CVT_BF16_F32(%f12, %h3)
+    fma.rn.f32  %f10, %f12, %f11, %f10;
+
+    add.u32     %r30, %r30, 1;
+    bra         intra_j_loop;
+intra_j_done:
+    // %f10 = Y_intra[c, t]
+
+    // Y[c, t] = Y_intra + Y_inter
+    add.f32     %f0, %f0, %f10;
+
+    // Convert to BF16 + store
+    cvt.rn.bf16.f32 %h4, %f0;
+    mul.lo.u32  %r39, %r20, D;
+    add.u32     %r39, %r39, %r0;        // c * D + t (element idx)
+    mul.wide.u32 %rd22, %r39, 2;
+    add.u64     %rd23, %rd14, %rd22;
+    st.global.b16 [%rd23], %h4;
+
+    add.u32     %r20, %r20, 1;
+    bra         token_loop;
+token_done:
+
+    // ============================================================
+    // Update state: S_new[t, d] = S[t, d] + Σ_c V[c, t] * K[c, d]
+    // For each d, compute the V^T@K contribution and add to S row.
+    // ============================================================
+
+    // Each thread t updates its row S[t, *].
+    // For dim d in [0, D): S_new[t, d] = S[t, d] + Σ_c V[c, t] * K[c, d]
+    mov.u32     %r40, 0;                // d
+state_d_loop:
+    setp.ge.u32 %p0, %r40, D;
+    @%p0 bra    state_d_done;
+
+    // Load S[t, d]
+    shl.b32     %r41, %r40, 2;          // d * 4
+    add.u32     %r42, %r22, %r41;       // SMEM_S row + d*4 (r22 still holds row base)
+    ld.shared.f32 %f20, [%r42];
+
+    // Σ_c V[c, t] * K[c, d]
+    mov.u32     %r43, 0;                // c
+state_c_loop:
+    setp.ge.u32 %p1, %r43, C;
+    @%p1 bra    state_c_done;
+
+    mov.u32     %r44, %r5;
+    add.u32     %r44, %r44, SMEM_V;
+    mul.lo.u32  %r45, %r43, D;
+    add.u32     %r45, %r45, %r0;        // c*D + t
+    shl.b32     %r45, %r45, 1;
+    add.u32     %r44, %r44, %r45;
+    ld.shared.b16 %h5, [%r44];
+    CVT_BF16_F32(%f21, %h5)
+
+    mov.u32     %r44, %r5;
+    add.u32     %r44, %r44, SMEM_K;
+    mul.lo.u32  %r45, %r43, D;
+    add.u32     %r45, %r45, %r40;       // c*D + d
+    shl.b32     %r45, %r45, 1;
+    add.u32     %r44, %r44, %r45;
+    ld.shared.b16 %h6, [%r44];
+    CVT_BF16_F32(%f22, %h6)
+
+    fma.rn.f32  %f20, %f21, %f22, %f20;
+
+    add.u32     %r43, %r43, 1;
+    bra         state_c_loop;
+state_c_done:
+
+    // Store S_new[t, d] to global as FP16.
+    // Compute S_out global addr (FP16): (bh*D*D + t*D + d) * 2
+    mul.lo.u32  %r47, %r4, D;
+    mul.lo.u32  %r47, %r47, D;
+    add.u32     %r47, %r47, %r14;       // bh*D*D + t*D
+    add.u32     %r47, %r47, %r40;       // + d
+    mul.wide.u32 %rd22, %r47, 2;
+    add.u64     %rd23, %rd5, %rd22;
+    cvt.rn.f16.f32 %h7, %f20;
+    st.global.b16 [%rd23], %h7;
+
+    add.u32     %r40, %r40, 1;
+    bra         state_d_loop;
+state_d_done:
+
+    ret;
+}

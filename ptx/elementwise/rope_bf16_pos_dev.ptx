@@ -1,0 +1,93 @@
+// rope_bf16_pos_dev.ptx
+//
+// Decode-only RoPE variant that reads the sequence position from a DEVICE
+// pointer (instead of being baked into a host-side cos/sin slice). Enables
+// CUDA Graph capture where position varies per replay.
+//
+// Assumes single-token decode: B = S = 1. Grid: (heads, 1, 1).
+// Threads: D/2 — one thread per dimension pair.
+//
+// Each thread:
+//   pos = *position_ptr (one global load broadcast via L1)
+//   cos_off = pos * (D/2) + pair_idx
+//   x_off   = head_idx * D + 2 * pair_idx
+//   x[x_off] / x[x_off+1] ← rotated by cos[cos_off], sin[cos_off]
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+.visible .entry rope_bf16_pos_dev(
+    .param .u64 param_x,                  // [heads * D] bf16 (in-place, for decode B=S=1)
+    .param .u64 param_cos_full,           // [max_pos * D/2] f32
+    .param .u64 param_sin_full,           // [max_pos * D/2] f32
+    .param .u64 param_position_ptr,       // u32* device — current decode position
+    .param .u32 param_dim,                // D (head dim, must be even)
+    .param .u32 param_half_dim            // D / 2
+)
+{
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<12>;
+    .reg .f32 %f<10>;
+    .reg .b16 %h<4>;
+    .reg .pred %p<2>;
+
+    mov.u32         %r0, BLOCK_ID_X;       // head_idx
+    mov.u32         %r1, THREAD_ID;         // pair_idx
+    ld.param.u32    %r4, [param_dim];
+    ld.param.u32    %r5, [param_half_dim];
+
+    setp.ge.u32     %p0, %r1, %r5;
+    @%p0 bra        done;
+
+    ld.param.u64    %rd0, [param_x];
+    ld.param.u64    %rd1, [param_cos_full];
+    ld.param.u64    %rd2, [param_sin_full];
+    ld.param.u64    %rd8, [param_position_ptr];
+
+    // Load position from device. All threads load same value → cached in L1.
+    ld.global.u32   %r9, [%rd8];
+
+    // x_off = head_idx * D + 2 * pair_idx (elements)
+    mul.lo.u32      %r11, %r0, %r4;
+    shl.b32         %r12, %r1, 1;
+    add.u32         %r11, %r11, %r12;
+    mul.wide.u32    %rd3, %r11, 2;
+    add.u64         %rd4, %rd0, %rd3;
+
+    // cos/sin offset = pos * (D/2) + pair_idx (elements, f32)
+    mul.lo.u32      %r13, %r9, %r5;
+    add.u32         %r13, %r13, %r1;
+    mul.wide.u32    %rd5, %r13, 4;
+    add.u64         %rd6, %rd1, %rd5;
+    add.u64         %rd7, %rd2, %rd5;
+
+    // Load packed x[2i], x[2i+1]
+    ld.global.b32   %r14, [%rd4];
+    mov.b32         {%h0, %h1}, %r14;
+    CVT_BF16_F32(%f0, %h0)                 // x_even
+    CVT_BF16_F32(%f1, %h1)                 // x_odd
+
+    ld.global.f32   %f2, [%rd6];           // cos
+    ld.global.f32   %f3, [%rd7];           // sin
+
+    // x_rot[2i]   = x_even * cos - x_odd * sin
+    mul.f32         %f5, %f1, %f3;
+    neg.f32         %f5, %f5;
+    fma.rn.f32      %f6, %f0, %f2, %f5;
+
+    // x_rot[2i+1] = x_even * sin + x_odd * cos
+    mul.f32         %f8, %f1, %f2;
+    fma.rn.f32      %f9, %f0, %f3, %f8;
+
+    CVT_F32_BF16(%h2, %f6)
+    CVT_F32_BF16(%h3, %f9)
+    mov.b32         %r15, {%h2, %h3};
+    st.global.b32   [%rd4], %r15;
+
+done:
+    ret;
+}

@@ -1,0 +1,63 @@
+// moe_histogram.ptx
+//
+// Count tokens-per-expert from routing assignments.
+//
+//   expert_ids[i] ∈ [0, num_experts) for i ∈ [0, num_entries)
+//   histogram[e] = count of i where expert_ids[i] == e
+//
+// `num_entries` is typically `num_tokens * top_k` (one entry per routed slot).
+//
+// Layout:
+//   expert_ids: [num_entries] u32
+//   histogram: [num_experts] u32 (output, must be zeroed by caller)
+//
+// Grid: (ceil(num_entries / 256), 1, 1). Block: (256, 1, 1).
+// Uses global atomics (one per entry). For num_experts ≤ 256 we could cache
+// a shared histogram first, but for now simple global atomics are fine for
+// num_experts up to ~256 (typical MoE configs).
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+
+.visible .entry moe_histogram(
+    .param .u64 param_expert_ids,    // [num_entries] u32
+    .param .u64 param_histogram,     // [num_experts] u32 (output)
+    .param .u32 param_num_entries,
+    .param .u32 param_num_experts
+)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<8>;
+    .reg .pred %p<2>;
+
+    mov.u32         %r0, BLOCK_ID_X;
+    mov.u32         %r1, %ntid.x;
+    mov.u32         %r2, THREAD_ID;
+    mad.lo.u32      %r3, %r0, %r1, %r2;
+
+    ld.param.u64    %rd0, [param_expert_ids];
+    ld.param.u64    %rd1, [param_histogram];
+    ld.param.u32    %r4, [param_num_entries];
+    ld.param.u32    %r5, [param_num_experts];
+
+    setp.ge.u32     %p0, %r3, %r4;
+    @%p0 bra        done;
+
+    mul.wide.u32    %rd2, %r3, 4;
+    add.u64         %rd3, %rd0, %rd2;
+    ld.global.u32   %r6, [%rd3];                // expert_id
+
+    // Clamp (defensive)
+    setp.ge.u32     %p1, %r6, %r5;
+    @%p1 bra        done;
+
+    mul.wide.u32    %rd4, %r6, 4;
+    add.u64         %rd5, %rd1, %rd4;
+    atom.global.add.u32 %r7, [%rd5], 1;
+
+done:
+    ret;
+}

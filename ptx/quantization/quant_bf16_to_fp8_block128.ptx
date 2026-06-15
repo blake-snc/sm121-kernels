@@ -1,0 +1,125 @@
+// quant_bf16_to_fp8_block128.ptx
+//
+// DeepSeek V3-style block-scaled FP8 E4M3 quantization of BF16 tensors.
+// Each 128-element block along the last dim gets its own scale.
+//
+// Operation (per (row, block)):
+//   abs_max = max(|x[row, block*128..block*128+128]|)
+//   scale   = abs_max / FP8_E4M3_MAX                   (rounded up)
+//   out[row, block*128 + i] = round_to_e4m3(x / scale) (saturating)
+//   scales[row, block] = scale                          (FP32)
+//
+// Layout:
+//   x: [num_rows, hidden_dim] bf16; hidden_dim must be multiple of 128.
+//   out: [num_rows, hidden_dim] fp8_e4m3 (u8)
+//   scales: [num_rows, hidden_dim/128] f32
+//
+// Grid: (num_rows, num_blocks, 1). One CTA processes one 128-element block
+// of one row. Block: (32, 1, 1) — a single warp suffices for 128 elements.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "reduction.ptxh"
+#include "convert.ptxh"
+
+#define FP8_E4M3_MAX_INV 0f3B124925    // 1/448
+#define BLOCK_SIZE 128
+
+.visible .entry quant_bf16_to_fp8_block128(
+    .param .u64 param_x,         // [num_rows, hidden] bf16
+    .param .u64 param_out,       // [num_rows, hidden] fp8_e4m3 (u8)
+    .param .u64 param_scales,    // [num_rows, hidden/128] f32
+    .param .u32 param_hidden     // hidden_dim (multiple of 128)
+)
+{
+    .reg .b32 %r<28>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<16>;
+    .reg .b16 %h<8>;
+    .reg .pred %p<4>;
+
+    mov.u32         %r0, BLOCK_ID_X;           // row
+    mov.u32         %r1, BLOCK_ID_Y;           // block
+    mov.u32         %r2, THREAD_ID;            // lane within warp (0..31)
+
+    ld.param.u64    %rd0, [param_x];
+    ld.param.u64    %rd1, [param_out];
+    ld.param.u64    %rd2, [param_scales];
+    ld.param.u32    %r3, [param_hidden];
+
+    // x offset: row * hidden + block * 128, byte offset * 2 (bf16)
+    mul.lo.u32      %r4, %r0, %r3;
+    shl.b32         %r5, %r1, 7;               // block * 128
+    add.u32         %r4, %r4, %r5;
+    mul.wide.u32    %rd3, %r4, 2;
+    add.u64         %rd4, %rd0, %rd3;          // &x[row, block*128]
+
+    // out offset: same flat index, byte offset * 1
+    mul.wide.u32    %rd5, %r4, 1;
+    add.u64         %rd6, %rd1, %rd5;          // &out[row, block*128]
+
+    // Each lane (of 32) handles 4 BF16 elements of the 128-element block.
+    shl.b32         %r6, %r2, 2;               // lane * 4
+
+    mul.wide.u32    %rd7, %r6, 2;
+    add.u64         %rd8, %rd4, %rd7;
+    ld.global.v2.b32 {%r10, %r11}, [%rd8];
+    mov.b32         {%h0, %h1}, %r10;
+    mov.b32         {%h2, %h3}, %r11;
+    CVT_BF16_F32(%f0, %h0)
+    CVT_BF16_F32(%f1, %h1)
+    CVT_BF16_F32(%f2, %h2)
+    CVT_BF16_F32(%f3, %h3)
+
+    // Local abs_max
+    abs.f32         %f4, %f0;
+    abs.f32         %f5, %f1;
+    abs.f32         %f6, %f2;
+    abs.f32         %f7, %f3;
+    max.f32         %f8, %f4, %f5;
+    max.f32         %f9, %f6, %f7;
+    max.f32         %f8, %f8, %f9;             // lane abs_max
+
+    // Warp reduce max (single warp — butterfly)
+    WARP_REDUCE_MAX_F32(%f8, %f9)
+
+    // scale = max(abs_max / 448, tiny_eps)
+    mul.f32         %f10, %f8, FP8_E4M3_MAX_INV;
+    max.f32         %f10, %f10, 0f3727C5AC;    // 1e-5
+    rcp.approx.f32  %f11, %f10;                // inv_scale
+
+    // Lane 0 writes the scale
+    setp.eq.u32     %p0, %r2, 0;
+    @%p0 bra        write_scale;
+    bra             quantize;
+
+write_scale:
+    // scales offset: row * num_blocks + block
+    shr.u32         %r20, %r3, 7;              // num_blocks = hidden / 128
+    mul.lo.u32      %r21, %r0, %r20;
+    add.u32         %r21, %r21, %r1;
+    mul.wide.u32    %rd9, %r21, 4;
+    add.u64         %rd10, %rd2, %rd9;
+    st.global.f32   [%rd10], %f10;
+
+quantize:
+    // All lanes agree on %f11 after warp reduce — multiply and quantize
+    mul.f32         %f4, %f0, %f11;
+    mul.f32         %f5, %f1, %f11;
+    mul.f32         %f6, %f2, %f11;
+    mul.f32         %f7, %f3, %f11;
+
+    .reg .b16 _b0, _b1;
+    CVT_F32X2_E4M3X2(_b0, %f5, %f4)
+    CVT_F32X2_E4M3X2(_b1, %f7, %f6)
+    mov.b32         %r14, {_b0, _b1};
+
+    mul.wide.u32    %rd11, %r6, 1;
+    add.u64         %rd12, %rd6, %rd11;
+    st.global.b32   [%rd12], %r14;
+
+    ret;
+}

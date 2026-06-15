@@ -1,0 +1,286 @@
+// gemm_fp8_grouped_mma.ptx
+//
+// MoE grouped GEMM with per-expert scalar FP8 scale. Simpler than block128:
+// one FP32 scale per expert (applied at epilogue), not per-(N, k_block). Used
+// by generic FP8 MoE paths that don't use DeepSeek's block-scaled format.
+//
+// Compute:
+//   Y_e[row, n] = scale[e] * Σ_k A_e[row, k] * B_e[n, k]
+//
+// Layout:
+//   A: [total_tokens, K] BF16 (expert-permuted)
+//   B: [num_experts, N, K] FP8 E4M3
+//   scales: [num_experts] FP32 (one scalar per expert)
+//   C: [total_tokens, N] BF16
+//   expert_offsets: [num_experts+1] u32
+//
+// Tile: 32×32, 1 warp, BF16 m16n8k16. K must be multiple of 16.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+#include "mma.ptxh"
+
+.visible .entry gemm_fp8_grouped_mma(
+    .param .u64 param_A,
+    .param .u64 param_B,
+    .param .u64 param_scales,
+    .param .u64 param_C,
+    .param .u64 param_expert_offsets,
+    .param .u32 param_N,
+    .param .u32 param_K
+)
+{
+    .reg .b32  %r<110>;
+    .reg .b64  %rd<16>;
+    .reg .f32  %f<40>;
+    .reg .b16  %h<6>;
+    .reg .pred %p<8>;
+
+    // SMEM: A 1024 + B 1024 = 2048 B.
+    .shared .align 128 .b8 smem[2048];
+
+    mov.u32         %r40, %tid.x;
+    mov.u32         %r41, %ctaid.x;
+    mov.u32         %r42, %ctaid.y;
+    mov.u32         %r43, %ctaid.z;
+
+    ld.param.u64    %rd0, [param_A];
+    ld.param.u64    %rd1, [param_B];
+    ld.param.u64    %rd2, [param_scales];
+    ld.param.u64    %rd3, [param_C];
+    ld.param.u64    %rd4, [param_expert_offsets];
+    ld.param.u32    %r44, [param_N];
+    ld.param.u32    %r45, [param_K];
+
+    // Expert token range.
+    mul.wide.u32    %rd5, %r43, 4;
+    add.u64         %rd6, %rd4, %rd5;
+    ld.global.u32   %r46, [%rd6];
+    ld.global.u32   %r47, [%rd6 + 4];
+    sub.u32         %r48, %r47, %r46;
+
+    shl.b32         %r49, %r42, 5;
+    setp.ge.u32     %p0, %r49, %r48;
+    @%p0 ret;
+    shl.b32         %r50, %r41, 5;
+    setp.ge.u32     %p1, %r50, %r44;
+    @%p1 ret;
+
+    add.u32         %r51, %r46, %r49;
+    sub.u32         %r52, %r48, %r49;
+    min.u32         %r52, %r52, 32;
+
+    // Load per-expert scale.
+    add.u64         %rd14, %rd2, %rd5;
+    .reg .f32 %f_scale;
+    ld.global.f32   %f_scale, [%rd14];
+
+    mul.lo.u32      %r53, %r51, %r45;
+    mul.wide.u32    %rd7, %r53, 2;
+    add.u64         %rd7, %rd0, %rd7;
+
+    mul.lo.u32      %r54, %r43, %r44;
+    add.u32         %r54, %r54, %r50;
+    mul.lo.u32      %r55, %r54, %r45;
+    cvt.u64.u32     %rd8, %r55;
+    add.u64         %rd8, %rd1, %rd8;
+
+    mov.f32 %f0, 0.0;  mov.f32 %f1, 0.0;  mov.f32 %f2, 0.0;  mov.f32 %f3, 0.0;
+    mov.f32 %f4, 0.0;  mov.f32 %f5, 0.0;  mov.f32 %f6, 0.0;  mov.f32 %f7, 0.0;
+    mov.f32 %f8, 0.0;  mov.f32 %f9, 0.0;  mov.f32 %f10, 0.0; mov.f32 %f11, 0.0;
+    mov.f32 %f12, 0.0; mov.f32 %f13, 0.0; mov.f32 %f14, 0.0; mov.f32 %f15, 0.0;
+    mov.f32 %f16, 0.0; mov.f32 %f17, 0.0; mov.f32 %f18, 0.0; mov.f32 %f19, 0.0;
+    mov.f32 %f20, 0.0; mov.f32 %f21, 0.0; mov.f32 %f22, 0.0; mov.f32 %f23, 0.0;
+    mov.f32 %f24, 0.0; mov.f32 %f25, 0.0; mov.f32 %f26, 0.0; mov.f32 %f27, 0.0;
+    mov.f32 %f28, 0.0; mov.f32 %f29, 0.0; mov.f32 %f30, 0.0; mov.f32 %f31, 0.0;
+
+    mov.u32         %r60, smem;
+    add.u32         %r61, %r60, 1024;
+
+    setp.lt.u32     %p2, %r40, 16;
+    @%p2 mul.lo.u32 %r63, %r40, 32;
+    @!%p2 sub.u32   %r63, %r40, 16;
+    @!%p2 mad.lo.u32 %r63, %r63, 32, 16;
+    add.u32         %r64, %r60, %r63;
+    add.u32         %r65, %r64, 512;
+
+    and.b32         %r66, %r40, 15;
+    shl.b32         %r66, %r66, 6;
+    add.u32         %r67, %r61, %r66;
+
+    shr.b32         %r68, %r40, 2;
+    and.b32         %r69, %r40, 3;
+    shl.b32         %r70, %r69, 1;
+
+    shr.b32         %r71, %r40, 1;
+    and.b32         %r72, %r40, 1;
+    shl.b32         %r73, %r72, 4;
+
+    add.u32         %r75, %r50, %r73;
+    setp.lt.u32     %p5, %r75, %r44;
+
+    mul.lo.u32      %r76, %r40, 32;
+    add.u32         %r76, %r60, %r76;
+
+    shl.b32         %r77, %r71, 6;
+    shl.b32         %r78, %r72, 5;
+    add.u32         %r77, %r77, %r78;
+    add.u32         %r77, %r61, %r77;
+
+    setp.lt.u32     %p4, %r40, %r52;
+
+    mov.u32         %r80, 0;
+k_loop:
+    setp.ge.u32     %p3, %r80, %r45;
+    @%p3 bra        k_done;
+
+    // A tile
+    add.u32         %r88, %r51, %r40;
+    mul.lo.u32      %r89, %r88, %r45;
+    add.u32         %r89, %r89, %r80;
+    mul.wide.u32    %rd11, %r89, 2;
+    add.u64         %rd11, %rd0, %rd11;
+
+    .reg .b32 _a0a, _a1a, _a2a, _a3a, _a0b, _a1b, _a2b, _a3b;
+    @%p4 ld.global.v4.b32 {_a0a, _a1a, _a2a, _a3a}, [%rd11];
+    @%p4 ld.global.v4.b32 {_a0b, _a1b, _a2b, _a3b}, [%rd11 + 16];
+    @!%p4 mov.b32   _a0a, 0;
+    @!%p4 mov.b32   _a1a, 0;
+    @!%p4 mov.b32   _a2a, 0;
+    @!%p4 mov.b32   _a3a, 0;
+    @!%p4 mov.b32   _a0b, 0;
+    @!%p4 mov.b32   _a1b, 0;
+    @!%p4 mov.b32   _a2b, 0;
+    @!%p4 mov.b32   _a3b, 0;
+    st.shared.v4.b32 [%r76],      {_a0a, _a1a, _a2a, _a3a};
+    st.shared.v4.b32 [%r76 + 16], {_a0b, _a1b, _a2b, _a3b};
+
+    // B tile FP8 → BF16 (no per-col scale — per-expert scale applied at epilogue)
+    add.u32         %r90, %r80, %r71;
+    mul.lo.u32      %r92, %r73, %r45;
+    add.u32         %r92, %r92, %r90;
+    cvt.u64.u32     %rd12, %r92;
+    add.u64         %rd12, %rd8, %rd12;
+
+    mov.u32         %r93, 0;
+decode_loop:
+    setp.ge.u32     %p6, %r93, 16;
+    @%p6 bra        decode_done;
+
+    mul.lo.u32      %r94, %r93, %r45;
+    cvt.u64.u32     %rd13, %r94;
+    add.u64         %rd13, %rd12, %rd13;
+
+    .reg .b32 _fp8u;
+    mov.b32         _fp8u, 0;
+    @%p5 ld.global.u8 _fp8u, [%rd13];
+    .reg .b16 _fp8_pair, _hlo, _hhi;
+    .reg .b32 _fp16x2;
+    .reg .f32 _fv;
+    cvt.u16.u32     _fp8_pair, _fp8u;
+    cvt.rn.f16x2.e4m3x2 _fp16x2, _fp8_pair;
+    mov.b32         {_hlo, _hhi}, _fp16x2;
+    cvt.f32.f16     _fv, _hlo;
+    .reg .b16 _bv;
+    CVT_F32_BF16(_bv, _fv)
+    shl.b32         %r97, %r93, 1;
+    add.u32         %r98, %r77, %r97;
+    st.shared.b16   [%r98], _bv;
+
+    add.u32         %r93, %r93, 1;
+    bra             decode_loop;
+decode_done:
+
+    bar.sync        0;
+
+    .reg .b32 %rA0, %rA1, %rA2, %rA3, %rA4, %rA5, %rA6, %rA7;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%rA0, %rA1, %rA2, %rA3}, [%r64];
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%rA4, %rA5, %rA6, %rA7}, [%r65];
+
+    .reg .b32 %rB0, %rB1;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%rB0, %rB1}, [%r67];
+    MMA_BF16_M16N8K16(%f0,  %f1,  %f2,  %f3,  %rA0, %rA1, %rA2, %rA3, %rB0, %rB1)
+    MMA_BF16_M16N8K16(%f16, %f17, %f18, %f19, %rA4, %rA5, %rA6, %rA7, %rB0, %rB1)
+    add.u32         %r99, %r67, 16;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%rB0, %rB1}, [%r99];
+    MMA_BF16_M16N8K16(%f4,  %f5,  %f6,  %f7,  %rA0, %rA1, %rA2, %rA3, %rB0, %rB1)
+    MMA_BF16_M16N8K16(%f20, %f21, %f22, %f23, %rA4, %rA5, %rA6, %rA7, %rB0, %rB1)
+    add.u32         %r99, %r67, 32;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%rB0, %rB1}, [%r99];
+    MMA_BF16_M16N8K16(%f8,  %f9,  %f10, %f11, %rA0, %rA1, %rA2, %rA3, %rB0, %rB1)
+    MMA_BF16_M16N8K16(%f24, %f25, %f26, %f27, %rA4, %rA5, %rA6, %rA7, %rB0, %rB1)
+    add.u32         %r99, %r67, 48;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%rB0, %rB1}, [%r99];
+    MMA_BF16_M16N8K16(%f12, %f13, %f14, %f15, %rA0, %rA1, %rA2, %rA3, %rB0, %rB1)
+    MMA_BF16_M16N8K16(%f28, %f29, %f30, %f31, %rA4, %rA5, %rA6, %rA7, %rB0, %rB1)
+
+    bar.sync        0;
+
+    add.u32         %r80, %r80, 16;
+    bra             k_loop;
+k_done:
+
+    // Epilogue scale: multiply every accumulator by per-expert scalar.
+    mul.f32 %f0,  %f0,  %f_scale;  mul.f32 %f1,  %f1,  %f_scale;
+    mul.f32 %f2,  %f2,  %f_scale;  mul.f32 %f3,  %f3,  %f_scale;
+    mul.f32 %f4,  %f4,  %f_scale;  mul.f32 %f5,  %f5,  %f_scale;
+    mul.f32 %f6,  %f6,  %f_scale;  mul.f32 %f7,  %f7,  %f_scale;
+    mul.f32 %f8,  %f8,  %f_scale;  mul.f32 %f9,  %f9,  %f_scale;
+    mul.f32 %f10, %f10, %f_scale;  mul.f32 %f11, %f11, %f_scale;
+    mul.f32 %f12, %f12, %f_scale;  mul.f32 %f13, %f13, %f_scale;
+    mul.f32 %f14, %f14, %f_scale;  mul.f32 %f15, %f15, %f_scale;
+    mul.f32 %f16, %f16, %f_scale;  mul.f32 %f17, %f17, %f_scale;
+    mul.f32 %f18, %f18, %f_scale;  mul.f32 %f19, %f19, %f_scale;
+    mul.f32 %f20, %f20, %f_scale;  mul.f32 %f21, %f21, %f_scale;
+    mul.f32 %f22, %f22, %f_scale;  mul.f32 %f23, %f23, %f_scale;
+    mul.f32 %f24, %f24, %f_scale;  mul.f32 %f25, %f25, %f_scale;
+    mul.f32 %f26, %f26, %f_scale;  mul.f32 %f27, %f27, %f_scale;
+    mul.f32 %f28, %f28, %f_scale;  mul.f32 %f29, %f29, %f_scale;
+    mul.f32 %f30, %f30, %f_scale;  mul.f32 %f31, %f31, %f_scale;
+
+#define STORE_TILE_FP8G(mg, ng, d0, d1, d2, d3) \
+    { .reg .b32 _row, _col, _off; \
+      .reg .b64 _p; \
+      .reg .b16 _b0, _b1; \
+      .reg .b32 _pk; \
+      .reg .pred _rin; \
+      add.u32 _row, %r51, 0; \
+      add.u32 _row, _row, mg*16; \
+      add.u32 _row, _row, %r68; \
+      add.u32 _col, %r50, ng*8; \
+      add.u32 _col, _col, %r70; \
+      setp.lt.u32 _rin, _row, %r47; \
+      mul.lo.u32 _off, _row, %r44; \
+      add.u32 _off, _off, _col; \
+      mul.wide.u32 _p, _off, 2; \
+      add.u64 _p, %rd3, _p; \
+      CVT_F32_BF16(_b0, d0) \
+      CVT_F32_BF16(_b1, d1) \
+      mov.b32 _pk, {_b0, _b1}; \
+      @_rin st.global.b32 [_p], _pk; \
+      add.u32 _row, _row, 8; \
+      setp.lt.u32 _rin, _row, %r47; \
+      mul.lo.u32 _off, _row, %r44; \
+      add.u32 _off, _off, _col; \
+      mul.wide.u32 _p, _off, 2; \
+      add.u64 _p, %rd3, _p; \
+      CVT_F32_BF16(_b0, d2) \
+      CVT_F32_BF16(_b1, d3) \
+      mov.b32 _pk, {_b0, _b1}; \
+      @_rin st.global.b32 [_p], _pk; \
+    }
+    STORE_TILE_FP8G(0, 0, %f0,  %f1,  %f2,  %f3)
+    STORE_TILE_FP8G(0, 1, %f4,  %f5,  %f6,  %f7)
+    STORE_TILE_FP8G(0, 2, %f8,  %f9,  %f10, %f11)
+    STORE_TILE_FP8G(0, 3, %f12, %f13, %f14, %f15)
+    STORE_TILE_FP8G(1, 0, %f16, %f17, %f18, %f19)
+    STORE_TILE_FP8G(1, 1, %f20, %f21, %f22, %f23)
+    STORE_TILE_FP8G(1, 2, %f24, %f25, %f26, %f27)
+    STORE_TILE_FP8G(1, 3, %f28, %f29, %f30, %f31)
+
+    ret;
+}

@@ -1,0 +1,63 @@
+// add_bf16.ptx
+//
+// Elementwise BF16 add: out[i] = a[i] + b[i] for i in [0, n).
+// Accumulation in F32 then converted back to BF16.
+//
+// Grid: ceil(n / 256), Block: 256 threads.
+// Each thread processes one element, with grid-stride loop for n > grid*block.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+.visible .entry add_bf16(
+    .param .u64 param_a,        // a: [n] bf16
+    .param .u64 param_b,        // b: [n] bf16
+    .param .u64 param_out,      // out: [n] bf16
+    .param .u32 param_n
+)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<10>;
+    .reg .f32 %f<6>;
+    .reg .b16 %h<4>;
+    .reg .pred %p<2>;
+
+    mov.u32         %r0, BLOCK_ID_X;
+    mov.u32         %r1, %ntid.x;
+    mov.u32         %r2, THREAD_ID;
+    mad.lo.u32      %r3, %r0, %r1, %r2;     // global thread idx
+    mov.u32         %r4, %nctaid.x;
+    mul.lo.u32      %r5, %r4, %r1;           // grid stride
+
+    ld.param.u64    %rd0, [param_a];
+    ld.param.u64    %rd1, [param_b];
+    ld.param.u64    %rd2, [param_out];
+    ld.param.u32    %r6, [param_n];
+
+loop:
+    setp.ge.u32     %p0, %r3, %r6;
+    @%p0 bra        done;
+
+    mul.wide.u32    %rd3, %r3, 2;
+    add.u64         %rd4, %rd0, %rd3;
+    add.u64         %rd5, %rd1, %rd3;
+    add.u64         %rd6, %rd2, %rd3;
+
+    ld.global.b16   %h0, [%rd4];
+    ld.global.b16   %h1, [%rd5];
+    CVT_BF16_F32(%f0, %h0)
+    CVT_BF16_F32(%f1, %h1)
+    add.f32         %f2, %f0, %f1;
+    CVT_F32_BF16(%h2, %f2)
+    st.global.b16   [%rd6], %h2;
+
+    add.u32         %r3, %r3, %r5;
+    bra             loop;
+
+done:
+    ret;
+}

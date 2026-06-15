@@ -1,0 +1,279 @@
+// rmsnorm_residual_bf16.ptx
+//
+// Fused residual-add + RMSNorm for BF16 transformer blocks.
+//
+// Operation:
+//   residual[i] := residual[i] + x[i]              // in-place residual update
+//   out[i]      := (residual[i] / rms) * weight[i]  // normalized
+// where rms = sqrt(mean(residual_new^2) + eps)
+//
+// This fuses the residual addition that follows every attention/FFN sublayer
+// with the RMSNorm that precedes the next sublayer. Saves one kernel launch
+// and one global round-trip per transformer block.
+//
+// Layout: one CTA per row, block size 256 threads.
+// Vectorized: 4 BF16 values per thread per iteration via v2.b32 loads/stores.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "reduction.ptxh"
+#include "convert.ptxh"
+
+.shared .align 128 .b8 smem_reduce[128];
+
+.visible .entry rmsnorm_residual_bf16(
+    .param .u64 param_x,         // input contribution: [num_rows, hidden_dim] bf16 (read-only)
+    .param .u64 param_residual,  // running residual: [num_rows, hidden_dim] bf16 (updated in-place)
+    .param .u64 param_out,       // normalized output: [num_rows, hidden_dim] bf16 (write-only)
+    .param .u64 param_weight,    // [hidden_dim] bf16
+    .param .u32 param_hidden,    // hidden_dim
+    .param .f32 param_eps        // epsilon
+)
+{
+    .reg .b32 %r<36>;
+    .reg .b64 %rd<20>;
+    .reg .f32 %f<20>;
+    .reg .b16 %h<16>;
+    .reg .pred %p<4>;
+
+    mov.u32         %r0, BLOCK_ID_X;
+    mov.u32         %r1, THREAD_ID;
+
+    ld.param.u64    %rd0, [param_x];
+    ld.param.u64    %rd1, [param_residual];
+    ld.param.u64    %rd2, [param_out];
+    ld.param.u64    %rd14, [param_weight];
+    ld.param.u32    %r2, [param_hidden];
+    ld.param.f32    %f0, [param_eps];
+
+    // Per-row byte offset
+    mul.lo.u32      %r3, %r0, %r2;
+    mul.wide.u32    %rd3, %r3, 2;
+    add.u64         %rd4, %rd0, %rd3;       // &x[row, 0]
+    add.u64         %rd5, %rd1, %rd3;       // &residual[row, 0]
+    add.u64         %rd6, %rd2, %rd3;       // &out[row, 0]
+
+    mov.u32         %r4, %ntid.x;
+    shl.b32         %r20, %r4, 2;           // vec_stride (elements per chunk)
+    sub.u32         %r21, %r20, 1;
+    not.b32         %r21, %r21;
+    and.b32         %r22, %r2, %r21;        // vec_limit = hidden rounded down to vec_stride
+
+    // ============ Stage 1: residual += x, accumulate sum_sq ============
+    mov.f32         %f1, 0.0;               // sum_sq accumulator
+    shl.b32         %r5, %r1, 2;            // i = tid * 4
+
+add_vec_loop:
+    setp.ge.u32     %p0, %r5, %r22;
+    @%p0 bra        add_vec_done;
+
+    // Load 4 x values and 4 residual values
+    mul.wide.u32    %rd7, %r5, 2;
+    add.u64         %rd8, %rd4, %rd7;       // &x[row, i]
+    add.u64         %rd9, %rd5, %rd7;       // &residual[row, i]
+    ld.global.v2.b32 {%r10, %r11}, [%rd8];
+    ld.global.v2.b32 {%r12, %r13}, [%rd9];
+
+    mov.b32         {%h0, %h1}, %r10;       // x0, x1
+    mov.b32         {%h2, %h3}, %r11;       // x2, x3
+    mov.b32         {%h4, %h5}, %r12;       // r0, r1
+    mov.b32         {%h6, %h7}, %r13;       // r2, r3
+
+    // Compute r_new = x + r, accumulate r_new^2, pack back to bf16
+    CVT_BF16_F32(%f2, %h0)
+    CVT_BF16_F32(%f3, %h4)
+    add.f32         %f4, %f2, %f3;
+    FMA_F32(%f1, %f4, %f4, %f1)
+    CVT_F32_BF16(%h8, %f4)
+
+    CVT_BF16_F32(%f2, %h1)
+    CVT_BF16_F32(%f3, %h5)
+    add.f32         %f4, %f2, %f3;
+    FMA_F32(%f1, %f4, %f4, %f1)
+    CVT_F32_BF16(%h9, %f4)
+
+    CVT_BF16_F32(%f2, %h2)
+    CVT_BF16_F32(%f3, %h6)
+    add.f32         %f4, %f2, %f3;
+    FMA_F32(%f1, %f4, %f4, %f1)
+    CVT_F32_BF16(%h10, %f4)
+
+    CVT_BF16_F32(%f2, %h3)
+    CVT_BF16_F32(%f3, %h7)
+    add.f32         %f4, %f2, %f3;
+    FMA_F32(%f1, %f4, %f4, %f1)
+    CVT_F32_BF16(%h11, %f4)
+
+    // Write r_new back to residual (in-place update)
+    mov.b32         %r14, {%h8, %h9};
+    mov.b32         %r15, {%h10, %h11};
+    st.global.v2.b32 [%rd9], {%r14, %r15};
+
+    add.u32         %r5, %r5, %r20;
+    bra             add_vec_loop;
+
+add_vec_done:
+    // Scalar tail
+    add.u32         %r5, %r22, %r1;
+
+add_tail:
+    setp.ge.u32     %p0, %r5, %r2;
+    @%p0 bra        add_done;
+
+    mul.wide.u32    %rd7, %r5, 2;
+    add.u64         %rd8, %rd4, %rd7;
+    add.u64         %rd9, %rd5, %rd7;
+    ld.global.b16   %h0, [%rd8];
+    ld.global.b16   %h4, [%rd9];
+    CVT_BF16_F32(%f2, %h0)
+    CVT_BF16_F32(%f3, %h4)
+    add.f32         %f4, %f2, %f3;
+    FMA_F32(%f1, %f4, %f4, %f1)
+    CVT_F32_BF16(%h8, %f4)
+    st.global.b16   [%rd9], %h8;
+
+    add.u32         %r5, %r5, %r4;
+    bra             add_tail;
+
+add_done:
+
+    // ============ Stage 2: Warp reduction of sum_sq ============
+    WARP_REDUCE_SUM_F32(%f1, %f3)
+
+    // ============ Stage 3: Cross-warp reduction + rms_inv ============
+    WARP_ID(%r6, %r1)
+    LANE_ID(%r7, %r1)
+
+    setp.eq.u32     %p1, %r7, 0;
+    @%p1 bra        rn_write_smem;
+    bra             rn_skip_write;
+
+rn_write_smem:
+    mul.wide.u32    %rd10, %r6, 4;
+    mov.u64         %rd11, smem_reduce;
+    add.u64         %rd12, %rd11, %rd10;
+    st.shared.f32   [%rd12], %f1;
+
+rn_skip_write:
+    bar.sync        0;
+
+    shr.u32         %r8, %r4, 5;           // num_warps
+
+    setp.lt.u32     %p2, %r6, 1;
+    @%p2 bra        rn_warp0_reduce;
+    bra             rn_after_reduce;
+
+rn_warp0_reduce:
+    setp.lt.u32     %p3, %r7, %r8;
+    @%p3 bra        rn_load_partial;
+    mov.f32         %f1, 0.0;
+    bra             rn_do_final_reduce;
+
+rn_load_partial:
+    mul.wide.u32    %rd10, %r7, 4;
+    mov.u64         %rd11, smem_reduce;
+    add.u64         %rd12, %rd11, %rd10;
+    ld.shared.f32   %f1, [%rd12];
+
+rn_do_final_reduce:
+    WARP_REDUCE_SUM_F32(%f1, %f3)
+
+    setp.eq.u32     %p1, %r7, 0;
+    @%p1 bra        rn_compute_rms;
+    bra             rn_after_reduce;
+
+rn_compute_rms:
+    cvt.rn.f32.u32  %f4, %r2;
+    div.approx.f32  %f5, %f1, %f4;
+    add.f32         %f5, %f5, %f0;
+    RSQRT_F32(%f6, %f5)
+    mov.u64         %rd11, smem_reduce;
+    st.shared.f32   [%rd11], %f6;
+
+rn_after_reduce:
+    bar.sync        0;
+
+    mov.u64         %rd11, smem_reduce;
+    ld.shared.f32   %f6, [%rd11];
+
+    // ============ Stage 4: normalize and scale ============
+    shl.b32         %r5, %r1, 2;            // i = tid * 4
+
+norm_vec_loop:
+    setp.ge.u32     %p0, %r5, %r22;
+    @%p0 bra        norm_vec_done;
+
+    mul.wide.u32    %rd7, %r5, 2;
+    add.u64         %rd9, %rd5, %rd7;       // &residual[row, i] (already has x+r)
+    add.u64         %rd15, %rd14, %rd7;     // &weight[i]
+    ld.global.v2.b32 {%r10, %r11}, [%rd9];
+    ld.global.v2.b32 {%r12, %r13}, [%rd15];
+
+    mov.b32         {%h0, %h1}, %r10;
+    mov.b32         {%h2, %h3}, %r11;
+    mov.b32         {%h4, %h5}, %r12;
+    mov.b32         {%h6, %h7}, %r13;
+
+    CVT_BF16_F32(%f2, %h0)
+    CVT_BF16_F32(%f7, %h4)
+    mul.f32         %f8, %f2, %f6;
+    mul.f32         %f8, %f8, %f7;
+    CVT_F32_BF16(%h0, %f8)
+
+    CVT_BF16_F32(%f2, %h1)
+    CVT_BF16_F32(%f7, %h5)
+    mul.f32         %f8, %f2, %f6;
+    mul.f32         %f8, %f8, %f7;
+    CVT_F32_BF16(%h1, %f8)
+
+    mov.b32         %r14, {%h0, %h1};
+
+    CVT_BF16_F32(%f2, %h2)
+    CVT_BF16_F32(%f7, %h6)
+    mul.f32         %f8, %f2, %f6;
+    mul.f32         %f8, %f8, %f7;
+    CVT_F32_BF16(%h2, %f8)
+
+    CVT_BF16_F32(%f2, %h3)
+    CVT_BF16_F32(%f7, %h7)
+    mul.f32         %f8, %f2, %f6;
+    mul.f32         %f8, %f8, %f7;
+    CVT_F32_BF16(%h3, %f8)
+
+    mov.b32         %r15, {%h2, %h3};
+
+    add.u64         %rd16, %rd6, %rd7;
+    st.global.v2.b32 [%rd16], {%r14, %r15};
+
+    add.u32         %r5, %r5, %r20;
+    bra             norm_vec_loop;
+
+norm_vec_done:
+    add.u32         %r5, %r22, %r1;
+
+norm_tail:
+    setp.ge.u32     %p0, %r5, %r2;
+    @%p0 bra        norm_done;
+
+    mul.wide.u32    %rd7, %r5, 2;
+    add.u64         %rd9, %rd5, %rd7;
+    add.u64         %rd15, %rd14, %rd7;
+    ld.global.b16   %h0, [%rd9];
+    ld.global.b16   %h4, [%rd15];
+    CVT_BF16_F32(%f2, %h0)
+    CVT_BF16_F32(%f7, %h4)
+    mul.f32         %f8, %f2, %f6;
+    mul.f32         %f8, %f8, %f7;
+    CVT_F32_BF16(%h8, %f8)
+    add.u64         %rd16, %rd6, %rd7;
+    st.global.b16   [%rd16], %h8;
+
+    add.u32         %r5, %r5, %r4;
+    bra             norm_tail;
+
+norm_done:
+    ret;
+}

@@ -1,0 +1,600 @@
+// gdn_decode_backward_bf16.ptx
+//
+// Backward for gdn_decode_bf16 — the single-token GDN recurrent state update.
+// Reverse-mode through:
+//
+//   m_t      = S_{t-1} @ k_t                              (per-row dot)
+//   diff_t   = v_t - alpha_t * m_t                        (decayed read; fixed in 564201e)
+//   S_t      = alpha_t * S_{t-1} + beta_t * diff_t ⊗ k_t  (outer product update)
+//   y_t      = S_t @ q_t
+//
+// Math (per (b, h)):
+//   dS_t_full[i, j] = dS_t[i, j] + dy[i] * q[j]
+//   dS_k[i]         = sum_j dS_t_full[i, j] * k[j]
+//   dq[j]           = sum_i S_t[i, j] * dy[i]
+//   dv[i]           = beta * dS_k[i]
+//   dalpha          = <dS_t_full, S_{t-1}>_F  -  beta * <m_t, dS_k>
+//   dbeta           = <diff_t, dS_k>
+//   dk[l]           = beta * (-alpha * sum_i S_{t-1}[i, l] * dS_k[i]
+//                              + sum_i dS_t_full[i, l] * diff_t[i])
+//   dS_{t-1}[i, j]  = alpha * (dS_t_full[i, j] - beta * dS_k[i] * k[j])
+//
+// dS_t is in/out: input is the downstream gradient (from later timesteps),
+// output overwrites with dS_{t-1} (passed back for the prior step's backward).
+//
+// Layouts:
+//   s_old, s_new:   [B, H, D, D] FP32 (cached during forward)
+//   q, k, v, dy:    [B, H, D]    BF16
+//   alpha, beta:    [B, H]       FP32 (saved during forward's alpha_beta kernel)
+//   ds_t_inout:     [B, H, D, D] FP32 (in: dS_t; out: dS_{t-1})
+//   dq, dk, dv:     [B, H, D]    BF16
+//   dalpha, dbeta:  [B, H]       FP32
+//
+// Grid:  (H, B). Block: (D=128, 1, 1) — one thread per state row.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "reduction.ptxh"
+#include "convert.ptxh"
+
+#define D 128
+#define BLOCK_DIM 128
+
+// SMEM layout
+//   [0       .. 65535]   smem_S_old: [D, D] FP32         = 65536 B
+//   [65536   .. 66047]   smem_q:  [D] FP32              =   512 B
+//   [66048   .. 66559]   smem_k:  [D] FP32              =   512 B
+//   [66560   .. 67071]   smem_v:  [D] FP32              =   512 B
+//   [67072   .. 67583]   smem_dy: [D] FP32              =   512 B
+//   [67584   .. 68095]   smem_dS_k: [D] FP32            =   512 B  (per-row dot with k)
+//   [68096   .. 68607]   smem_diff: [D] FP32            =   512 B
+//   [68608   .. 69119]   smem_dq: [D] FP32 atomic accum =   512 B
+//   [69120   .. 69251]   smem_scratch: 32 FP32 for warp partials = 128 B
+// Total ~ 69 KB (within 99 KB SM121a limit)
+
+#define SMEM_S_OFF     0
+#define SMEM_Q_OFF     65536
+#define SMEM_K_OFF     66048
+#define SMEM_V_OFF     66560
+#define SMEM_DY_OFF    67072
+#define SMEM_DSK_OFF   67584
+#define SMEM_DIFF_OFF  68096
+#define SMEM_DQ_OFF    68608
+#define SMEM_SCRATCH_OFF 69120
+#define SMEM_TOTAL     69248
+
+.extern .shared .align 128 .b8 gdn_bw_smem[];
+
+.visible .entry gdn_decode_backward_bf16(
+    .param .u64 param_s_old,      // [B*H*D*D] FP32
+    .param .u64 param_s_new,      // [B*H*D*D] FP32
+    .param .u64 param_q,          // [B*H*D]   BF16
+    .param .u64 param_k,          // [B*H*D]   BF16
+    .param .u64 param_v,          // [B*H*D]   BF16
+    .param .u64 param_alpha,      // [B*H]     FP32
+    .param .u64 param_beta,       // [B*H]     FP32
+    .param .u64 param_dy,         // [B*H*D]   BF16
+    .param .u64 param_ds_t_inout, // [B*H*D*D] FP32 (in dS_t / out dS_{t-1})
+    .param .u64 param_dq,         // [B*H*D]   BF16
+    .param .u64 param_dk,         // [B*H*D]   BF16
+    .param .u64 param_dv,         // [B*H*D]   BF16
+    .param .u64 param_dalpha,     // [B*H]     FP32
+    .param .u64 param_dbeta,      // [B*H]     FP32
+    .param .u32 param_num_heads
+)
+{
+    .reg .b32  %r<48>;
+    .reg .b64  %rd<24>;
+    .reg .f32  %f<48>;
+    .reg .b16  %h<8>;
+    .reg .pred %p<8>;
+
+    mov.u32     %r0, %tid.x;            // i (row index)
+    mov.u32     %r1, %ctaid.x;          // h
+    mov.u32     %r2, %ctaid.y;          // b
+    ld.param.u32 %r3, [param_num_heads];
+
+    // bh = b*H + h
+    mul.lo.u32  %r4, %r2, %r3;
+    add.u32     %r4, %r4, %r1;
+
+    // Pointers
+    mul.lo.u32  %r5, %r4, D;            // bh*D (offset for D-vectors in elems)
+    mul.wide.u32 %rd0, %r5, 2;          // *2 for BF16 bytes
+    mul.wide.u32 %rd1, %r5, 4;          // *4 for FP32 bytes
+    // S/dS strides: bh*D*D in elems
+    mul.lo.u32  %r6, %r4, D;
+    mul.lo.u32  %r6, %r6, D;            // bh*D*D
+    mul.wide.u32 %rd2, %r6, 4;          // *4 for FP32 bytes
+
+    ld.param.u64 %rd3, [param_s_old];
+    add.u64      %rd3, %rd3, %rd2;      // &s_old[bh, 0, 0]
+    ld.param.u64 %rd4, [param_s_new];
+    add.u64      %rd4, %rd4, %rd2;      // &s_new[bh, 0, 0]
+    ld.param.u64 %rd5, [param_ds_t_inout];
+    add.u64      %rd5, %rd5, %rd2;      // &ds_t_inout[bh, 0, 0]
+
+    ld.param.u64 %rd6, [param_q];
+    add.u64      %rd6, %rd6, %rd0;      // &q[bh, 0]
+    ld.param.u64 %rd7, [param_k];
+    add.u64      %rd7, %rd7, %rd0;
+    ld.param.u64 %rd8, [param_v];
+    add.u64      %rd8, %rd8, %rd0;
+    ld.param.u64 %rd9, [param_dy];
+    add.u64      %rd9, %rd9, %rd0;
+
+    // alpha, beta scalars
+    mul.wide.u32 %rd10, %r4, 4;
+    ld.param.u64 %rd11, [param_alpha];
+    add.u64      %rd11, %rd11, %rd10;
+    ld.global.f32 %f0, [%rd11];         // alpha
+    ld.param.u64 %rd12, [param_beta];
+    add.u64      %rd12, %rd12, %rd10;
+    ld.global.f32 %f1, [%rd12];         // beta
+
+    // ========================================================================
+    // Stage 1: cooperative load q, k, v, dy into SMEM (one elem per thread)
+    // ========================================================================
+    mov.u32     %r7, gdn_bw_smem;
+    shl.b32     %r8, %r0, 2;            // tid*4 (FP32 offset)
+
+    // q
+    mul.wide.u32 %rd13, %r0, 2;         // tid*2 (BF16 offset)
+    add.u64      %rd14, %rd6, %rd13;
+    ld.global.b16 %h0, [%rd14];
+    cvt.f32.bf16 %f2, %h0;
+    add.u32     %r9, %r7, SMEM_Q_OFF;
+    add.u32     %r9, %r9, %r8;
+    st.shared.f32 [%r9], %f2;
+
+    // k
+    add.u64      %rd14, %rd7, %rd13;
+    ld.global.b16 %h0, [%rd14];
+    cvt.f32.bf16 %f3, %h0;
+    add.u32     %r9, %r7, SMEM_K_OFF;
+    add.u32     %r9, %r9, %r8;
+    st.shared.f32 [%r9], %f3;
+
+    // v
+    add.u64      %rd14, %rd8, %rd13;
+    ld.global.b16 %h0, [%rd14];
+    cvt.f32.bf16 %f4, %h0;
+    add.u32     %r9, %r7, SMEM_V_OFF;
+    add.u32     %r9, %r9, %r8;
+    st.shared.f32 [%r9], %f4;
+
+    // dy
+    add.u64      %rd14, %rd9, %rd13;
+    ld.global.b16 %h0, [%rd14];
+    cvt.f32.bf16 %f5, %h0;
+    add.u32     %r9, %r7, SMEM_DY_OFF;
+    add.u32     %r9, %r9, %r8;
+    st.shared.f32 [%r9], %f5;
+
+    // Initialize smem_dq[tid] = 0  (used as atom.shared.add accumulator)
+    add.u32     %r9, %r7, SMEM_DQ_OFF;
+    add.u32     %r9, %r9, %r8;
+    mov.f32     %f6, 0.0;
+    st.shared.f32 [%r9], %f6;
+
+    // ========================================================================
+    // Stage 2: cooperatively load S_old row by row — each thread t owns
+    //          row t of the [D, D] state matrix. Loop over cols.
+    // ========================================================================
+    // Compute row start in global: s_old + tid * D * 4 (FP32)
+    mul.lo.u32  %r10, %r0, D;
+    mul.wide.u32 %rd13, %r10, 4;
+    add.u64      %rd14, %rd3, %rd13;    // &s_old[bh, tid, 0]
+    // SMEM row start for s_old
+    mul.lo.u32  %r11, %r0, D;
+    shl.b32      %r11, %r11, 2;          // tid * D * 4
+    add.u32      %r12, %r7, SMEM_S_OFF;
+    add.u32      %r12, %r12, %r11;       // smem &S_old[tid, 0]
+
+    mov.u32     %r13, 0;                // col index
+load_s_old_loop:
+    setp.ge.u32 %p0, %r13, D;
+    @%p0 bra    load_s_old_done;
+    mul.wide.u32 %rd15, %r13, 4;
+    add.u64      %rd16, %rd14, %rd15;
+    ld.global.f32 %f7, [%rd16];
+    shl.b32      %r14, %r13, 2;
+    add.u32      %r15, %r12, %r14;
+    st.shared.f32[%r15], %f7;
+    add.u32      %r13, %r13, 1;
+    bra          load_s_old_loop;
+load_s_old_done:
+
+    bar.sync 0;
+
+    // ========================================================================
+    // Stage 3: per-thread compute m_t[tid] = sum_j S_old[tid, j] * k[j]
+    //          diff_t[tid] = v[tid] - alpha * m_t[tid]
+    //          Write diff_t to SMEM (needed for dk and dbeta).
+    // ========================================================================
+    mov.f32     %f8, 0.0;               // m_t accumulator
+    mov.u32     %r13, 0;
+m_t_loop:
+    setp.ge.u32 %p0, %r13, D;
+    @%p0 bra    m_t_done;
+    shl.b32      %r14, %r13, 2;
+    add.u32      %r15, %r12, %r14;      // &smem_S_old[tid, j]
+    ld.shared.f32 %f9, [%r15];
+    add.u32      %r16, %r7, SMEM_K_OFF;
+    add.u32      %r16, %r16, %r14;
+    ld.shared.f32 %f10, [%r16];
+    fma.rn.f32   %f8, %f9, %f10, %f8;
+    add.u32      %r13, %r13, 1;
+    bra          m_t_loop;
+m_t_done:
+
+    // diff_t = v[tid] - alpha * m_t[tid]
+    add.u32     %r9, %r7, SMEM_V_OFF;
+    add.u32     %r9, %r9, %r8;
+    ld.shared.f32 %f11, [%r9];          // v[tid]
+    neg.f32     %f12, %f0;              // -alpha
+    fma.rn.f32  %f13, %f12, %f8, %f11;  // v - alpha*m_t = diff_t[tid]
+
+    // Save diff_t to SMEM
+    add.u32     %r9, %r7, SMEM_DIFF_OFF;
+    add.u32     %r9, %r9, %r8;
+    st.shared.f32 [%r9], %f13;
+
+    // ========================================================================
+    // Stage 4: dq[j] += S_new[tid, j] * dy[tid]   (per-row contribution)
+    //          Use atom.shared.add on smem_dq to accumulate across rows.
+    // ========================================================================
+    // dy[tid] (already in SMEM at SMEM_DY_OFF + tid*4)
+    add.u32     %r9, %r7, SMEM_DY_OFF;
+    add.u32     %r9, %r9, %r8;
+    ld.shared.f32 %f14, [%r9];          // dy[tid]
+
+    // s_new row in global: s_new + tid * D * 4
+    add.u64      %rd14, %rd4, %rd13;    // &s_new[bh, tid, 0]
+
+    mov.u32     %r13, 0;
+dq_loop:
+    setp.ge.u32 %p0, %r13, D;
+    @%p0 bra    dq_done;
+    mul.wide.u32 %rd15, %r13, 4;
+    add.u64      %rd16, %rd14, %rd15;
+    ld.global.f32 %f15, [%rd16];        // S_new[tid, j]
+    mul.f32     %f16, %f15, %f14;       // S_new[tid, j] * dy[tid]
+    // atom.shared.add.f32 smem_dq[j] += contribution
+    shl.b32      %r14, %r13, 2;
+    add.u32      %r15, %r7, SMEM_DQ_OFF;
+    add.u32      %r15, %r15, %r14;
+    atom.shared.add.f32 %f17, [%r15], %f16;
+    add.u32      %r13, %r13, 1;
+    bra          dq_loop;
+dq_done:
+
+    // ========================================================================
+    // Stage 5: dS_k_t[tid] = sum_j (dS_t_in[tid, j] + dy[tid] * q[j]) * k[j]
+    //                     = sum_j dS_t_in[tid, j]*k[j] + dy[tid] * <q, k>
+    // (We compute dS_k row-by-row directly from global dS_t_in, no SMEM caching.)
+    // ========================================================================
+    // dS_t_in row: ds_t_inout + tid * D * 4
+    add.u64      %rd14, %rd5, %rd13;    // &dS_t_in[bh, tid, 0]
+
+    mov.f32     %f18, 0.0;              // dS_k accumulator
+    mov.u32     %r13, 0;
+dsk_loop:
+    setp.ge.u32 %p0, %r13, D;
+    @%p0 bra    dsk_done;
+    mul.wide.u32 %rd15, %r13, 4;
+    add.u64      %rd16, %rd14, %rd15;
+    ld.global.f32 %f19, [%rd16];        // dS_t_in[tid, j]
+    // k[j] from SMEM
+    shl.b32      %r14, %r13, 2;
+    add.u32      %r16, %r7, SMEM_K_OFF;
+    add.u32      %r16, %r16, %r14;
+    ld.shared.f32 %f20, [%r16];         // k[j]
+    fma.rn.f32   %f18, %f19, %f20, %f18;
+    // q[j] for the dy*<q,k> part — accumulate inline:
+    add.u32      %r16, %r7, SMEM_Q_OFF;
+    add.u32      %r16, %r16, %r14;
+    ld.shared.f32 %f21, [%r16];         // q[j]
+    // tmp = q[j] * k[j]; will sum later. For now we compute inline:
+    fma.rn.f32   %f18, %f21, %f20, %f18; // accumulator already has dS_t_in*k; now add dy*q*k? wait this is wrong.
+    add.u32      %r13, %r13, 1;
+    bra          dsk_loop;
+dsk_done:
+    // CORRECTION: the above fma incorrectly merges. Let me redo:
+    // We want: dS_k_t[tid] = (sum_j dS_t_in[tid, j] * k[j]) + dy[tid] * (sum_j q[j] * k[j])
+    // The loop should accumulate ONLY (dS_t_in[tid, j] * k[j]).
+    // Then ADD dy[tid] * <q,k> at the end, where <q,k> is a per-CTA scalar that
+    // every thread can recompute identically (or take from a broadcast).
+    // For correctness we recompute <q,k> here in registers per thread.
+
+    mov.f32     %f22, 0.0;              // <q, k> (per-thread recompute)
+    mov.u32     %r13, 0;
+qk_loop:
+    setp.ge.u32 %p0, %r13, D;
+    @%p0 bra    qk_done;
+    shl.b32      %r14, %r13, 2;
+    add.u32      %r15, %r7, SMEM_Q_OFF;
+    add.u32      %r15, %r15, %r14;
+    ld.shared.f32 %f23, [%r15];
+    add.u32      %r15, %r7, SMEM_K_OFF;
+    add.u32      %r15, %r15, %r14;
+    ld.shared.f32 %f24, [%r15];
+    fma.rn.f32   %f22, %f23, %f24, %f22;
+    add.u32      %r13, %r13, 1;
+    bra          qk_loop;
+qk_done:
+    // Reload dy[tid]
+    add.u32     %r9, %r7, SMEM_DY_OFF;
+    add.u32     %r9, %r9, %r8;
+    ld.shared.f32 %f25, [%r9];
+
+    // Recompute dS_k properly: original loop double-accumulated, so redo cleanly.
+    // Reset accumulator and redo just the dS_t_in*k part.
+    mov.f32     %f18, 0.0;
+    mov.u32     %r13, 0;
+dsk_loop2:
+    setp.ge.u32 %p0, %r13, D;
+    @%p0 bra    dsk_done2;
+    mul.wide.u32 %rd15, %r13, 4;
+    add.u64      %rd16, %rd14, %rd15;
+    ld.global.f32 %f19, [%rd16];        // dS_t_in[tid, j]
+    shl.b32      %r14, %r13, 2;
+    add.u32      %r16, %r7, SMEM_K_OFF;
+    add.u32      %r16, %r16, %r14;
+    ld.shared.f32 %f20, [%r16];
+    fma.rn.f32   %f18, %f19, %f20, %f18;
+    add.u32      %r13, %r13, 1;
+    bra          dsk_loop2;
+dsk_done2:
+    // Add dy * <q, k>
+    fma.rn.f32  %f18, %f25, %f22, %f18; // dS_k_t[tid]
+
+    // Save dS_k to SMEM (needed for dk)
+    add.u32     %r9, %r7, SMEM_DSK_OFF;
+    add.u32     %r9, %r9, %r8;
+    st.shared.f32 [%r9], %f18;
+
+    // ========================================================================
+    // Stage 6: dv[tid] = beta * dS_k_t[tid]
+    // ========================================================================
+    mul.f32     %f26, %f1, %f18;        // beta * dS_k
+    ld.param.u64 %rd17, [param_dv];
+    add.u64      %rd17, %rd17, %rd0;    // &dv[bh, 0]
+    add.u64      %rd17, %rd17, %rd13;   // &dv[bh, tid] (BF16 offset is rd13=tid*2)
+    cvt.rn.bf16.f32 %h0, %f26;
+    st.global.b16 [%rd17], %h0;
+
+    // ========================================================================
+    // Stage 7: dalpha per-thread = <dS_t_full[tid], S_old[tid]> - beta * m_t * dS_k
+    //   First compute <dS_t_full[tid], S_old[tid]> = sum_j (dS_t_in[tid,j] + dy[tid]*q[j]) * S_old[tid, j]
+    //                                              = sum_j dS_t_in[tid,j]*S_old[tid,j] + dy[tid]*sum_j q[j]*S_old[tid,j]
+    //   Then subtract beta * m_t[tid] * dS_k_t[tid].
+    //   Sum across threads → dalpha.
+    // ========================================================================
+    mov.f32     %f27, 0.0;              // <dS_t_full, S_old> row contrib
+    mov.f32     %f28, 0.0;              // sum_j q[j]*S_old[tid,j]  (cross factor)
+    mov.u32     %r13, 0;
+da_loop:
+    setp.ge.u32 %p0, %r13, D;
+    @%p0 bra    da_done;
+    mul.wide.u32 %rd15, %r13, 4;
+    add.u64      %rd16, %rd14, %rd15;
+    ld.global.f32 %f29, [%rd16];        // dS_t_in[tid, j]
+    shl.b32      %r14, %r13, 2;
+    add.u32      %r15, %r12, %r14;
+    ld.shared.f32 %f30, [%r15];         // S_old[tid, j]
+    fma.rn.f32   %f27, %f29, %f30, %f27;
+    add.u32      %r15, %r7, SMEM_Q_OFF;
+    add.u32      %r15, %r15, %r14;
+    ld.shared.f32 %f31, [%r15];         // q[j]
+    fma.rn.f32   %f28, %f31, %f30, %f28;
+    add.u32      %r13, %r13, 1;
+    bra          da_loop;
+da_done:
+    // Add dy * sum_q_S
+    fma.rn.f32  %f27, %f25, %f28, %f27; // = <dS_full, S_old> per row
+
+    // Subtract beta * m_t * dS_k
+    mul.f32     %f32, %f1, %f8;         // beta * m_t
+    mul.f32     %f32, %f32, %f18;       // * dS_k
+    sub.f32     %f33, %f27, %f32;       // per-thread dalpha contribution
+
+    // Block-reduce sum → dalpha
+    WARP_REDUCE_SUM_F32(%f33, %f34)
+
+    WARP_ID(%r17, %r0)
+    LANE_ID(%r18, %r0)
+    add.u32     %r19, %r7, SMEM_SCRATCH_OFF;
+
+    setp.eq.u32 %p1, %r18, 0;
+    @!%p1 bra   skip_w_da;
+    shl.b32     %r20, %r17, 2;
+    add.u32     %r21, %r19, %r20;
+    st.shared.f32 [%r21], %f33;
+skip_w_da:
+    bar.sync 0;
+
+    // Final reduce in warp 0
+    setp.ne.u32 %p2, %r17, 0;
+    @%p2 bra    post_da;
+    setp.ge.u32 %p3, %r18, 4;           // num_warps = 128/32 = 4
+    mov.f32     %f35, 0.0;
+    @%p3 bra    skip_load_p_da;
+    shl.b32     %r20, %r18, 2;
+    add.u32     %r21, %r19, %r20;
+    ld.shared.f32 %f35, [%r21];
+skip_load_p_da:
+    WARP_REDUCE_SUM_F32(%f35, %f36)
+    setp.ne.u32 %p4, %r18, 0;
+    @%p4 bra    post_da;
+    // Lane 0 writes dalpha[bh]
+    ld.param.u64 %rd17, [param_dalpha];
+    add.u64      %rd17, %rd17, %rd10;
+    st.global.f32 [%rd17], %f35;
+post_da:
+    bar.sync 0;
+
+    // ========================================================================
+    // Stage 8: dbeta = sum_i diff_t[i] * dS_k[i]
+    // ========================================================================
+    mul.f32     %f37, %f13, %f18;       // diff_t[tid] * dS_k[tid]
+
+    WARP_REDUCE_SUM_F32(%f37, %f38)
+
+    setp.eq.u32 %p1, %r18, 0;
+    @!%p1 bra   skip_w_db;
+    shl.b32     %r20, %r17, 2;
+    add.u32     %r21, %r19, %r20;
+    st.shared.f32 [%r21], %f37;
+skip_w_db:
+    bar.sync 0;
+
+    setp.ne.u32 %p2, %r17, 0;
+    @%p2 bra    post_db;
+    setp.ge.u32 %p3, %r18, 4;
+    mov.f32     %f39, 0.0;
+    @%p3 bra    skip_load_p_db;
+    shl.b32     %r20, %r18, 2;
+    add.u32     %r21, %r19, %r20;
+    ld.shared.f32 %f39, [%r21];
+skip_load_p_db:
+    WARP_REDUCE_SUM_F32(%f39, %f40)
+    setp.ne.u32 %p4, %r18, 0;
+    @%p4 bra    post_db;
+    ld.param.u64 %rd17, [param_dbeta];
+    add.u64      %rd17, %rd17, %rd10;
+    st.global.f32 [%rd17], %f39;
+post_db:
+    bar.sync 0;
+
+    // ========================================================================
+    // Stage 9: write dq[j] from smem_dq (per-thread for its column j=tid)
+    // ========================================================================
+    add.u32     %r9, %r7, SMEM_DQ_OFF;
+    add.u32     %r9, %r9, %r8;
+    ld.shared.f32 %f41, [%r9];          // dq[tid]
+    ld.param.u64 %rd17, [param_dq];
+    add.u64      %rd17, %rd17, %rd0;
+    add.u64      %rd17, %rd17, %rd13;   // &dq[bh, tid]
+    cvt.rn.bf16.f32 %h0, %f41;
+    st.global.b16 [%rd17], %h0;
+
+    // ========================================================================
+    // Stage 10: dk[l] = beta * (-alpha * sum_i S_old[i, l] * dS_k[i]
+    //                          + sum_i dS_t_full[i, l] * diff_t[i])
+    // Thread l reads column l of S_old (from SMEM) and column l of dS_t_in
+    // (from global), and combines with dS_k[i], dy[i]*q[l], diff_t[i] all
+    // available in SMEM.
+    // ========================================================================
+    mov.f32     %f42, 0.0;              // term1: sum_i S_old[i, l] * dS_k[i]
+    mov.f32     %f43, 0.0;              // term2: sum_i (dS_t_in[i, l] + dy[i]*q[l]) * diff_t[i]
+    // q[l] is q[tid] (already in SMEM at SMEM_Q_OFF + tid*4)
+    add.u32     %r9, %r7, SMEM_Q_OFF;
+    add.u32     %r9, %r9, %r8;
+    ld.shared.f32 %f44, [%r9];          // q[l] = q[tid]
+
+    mov.u32     %r13, 0;                // i (row index in the cross-sum)
+dk_loop:
+    setp.ge.u32 %p0, %r13, D;
+    @%p0 bra    dk_done;
+    // S_old[i, l] from SMEM: addr = SMEM_S_OFF + i*D*4 + l*4
+    mul.lo.u32   %r14, %r13, D;
+    add.u32      %r14, %r14, %r0;       // i*D + l
+    shl.b32      %r14, %r14, 2;
+    add.u32      %r15, %r7, SMEM_S_OFF;
+    add.u32      %r15, %r15, %r14;
+    ld.shared.f32 %f45, [%r15];         // S_old[i, l]
+
+    // dS_k[i] from SMEM
+    shl.b32      %r14, %r13, 2;
+    add.u32      %r15, %r7, SMEM_DSK_OFF;
+    add.u32      %r15, %r15, %r14;
+    ld.shared.f32 %f46, [%r15];         // dS_k[i]
+
+    fma.rn.f32   %f42, %f45, %f46, %f42;
+
+    // dS_t_in[i, l] from global: ds_t_inout + i*D*4 + l*4
+    // We need address: rd5 + (i*D + l) * 4
+    mul.lo.u32   %r14, %r13, D;
+    add.u32      %r14, %r14, %r0;
+    mul.wide.u32 %rd15, %r14, 4;
+    add.u64      %rd16, %rd5, %rd15;
+    ld.global.f32 %f47, [%rd16];        // dS_t_in[i, l]
+
+    // dy[i] from SMEM
+    shl.b32      %r14, %r13, 2;
+    add.u32      %r15, %r7, SMEM_DY_OFF;
+    add.u32      %r15, %r15, %r14;
+    ld.shared.f32 %f25, [%r15];         // dy[i]
+
+    // diff_t[i] from SMEM
+    add.u32      %r15, %r7, SMEM_DIFF_OFF;
+    add.u32      %r15, %r15, %r14;
+    ld.shared.f32 %f26, [%r15];         // diff_t[i]
+
+    // dS_full[i, l] = dS_t_in[i, l] + dy[i] * q[l]
+    fma.rn.f32   %f47, %f25, %f44, %f47;
+    // Contribute to term2
+    fma.rn.f32   %f43, %f47, %f26, %f43;
+
+    add.u32      %r13, %r13, 1;
+    bra          dk_loop;
+dk_done:
+
+    // dk[l] = beta * (-alpha * term1 + term2)
+    neg.f32     %f12, %f0;              // -alpha
+    mul.f32     %f42, %f42, %f12;       // -alpha * term1
+    add.f32     %f42, %f42, %f43;       // (-alpha * term1) + term2
+    mul.f32     %f42, %f42, %f1;        // * beta
+
+    ld.param.u64 %rd17, [param_dk];
+    add.u64      %rd17, %rd17, %rd0;
+    add.u64      %rd17, %rd17, %rd13;   // &dk[bh, tid]
+    cvt.rn.bf16.f32 %h0, %f42;
+    st.global.b16 [%rd17], %h0;
+
+    // ========================================================================
+    // Stage 11: write dS_{t-1} (overwrite dS_t_inout in-place)
+    //   dS_{t-1}[i, j] = alpha * (dS_t_full[i, j] - beta * dS_k[i] * k[j])
+    //   Thread i (= tid) writes row i of dS_{t-1}.
+    // ========================================================================
+    // dS_k[tid] (from register %f18 — still valid since not overwritten)
+    mul.f32     %f27, %f1, %f18;        // beta * dS_k[tid]
+    // dy[tid] still in %f25 from above? Wait — %f25 was overwritten in dk_loop.
+    // Reload dy[tid]:
+    add.u32     %r9, %r7, SMEM_DY_OFF;
+    add.u32     %r9, %r9, %r8;
+    ld.shared.f32 %f25, [%r9];
+
+    mov.u32     %r13, 0;
+dsp_loop:
+    setp.ge.u32 %p0, %r13, D;
+    @%p0 bra    dsp_done;
+    mul.wide.u32 %rd15, %r13, 4;
+    add.u64      %rd16, %rd14, %rd15;   // &dS_t_in[tid, j]  (rd14 was set to dS_t_in row earlier)
+    ld.global.f32 %f29, [%rd16];        // dS_t_in[tid, j]
+    // q[j] from SMEM
+    shl.b32      %r14, %r13, 2;
+    add.u32      %r15, %r7, SMEM_Q_OFF;
+    add.u32      %r15, %r15, %r14;
+    ld.shared.f32 %f31, [%r15];         // q[j]
+    // dS_full = dS_t_in + dy * q
+    fma.rn.f32   %f29, %f25, %f31, %f29;
+    // k[j]
+    add.u32      %r15, %r7, SMEM_K_OFF;
+    add.u32      %r15, %r15, %r14;
+    ld.shared.f32 %f30, [%r15];         // k[j]
+    // dS_full - beta * dS_k[tid] * k[j]
+    mul.f32      %f32, %f27, %f30;
+    sub.f32      %f29, %f29, %f32;
+    mul.f32      %f29, %f29, %f0;       // * alpha → dS_{t-1}[tid, j]
+    st.global.f32 [%rd16], %f29;        // overwrite dS_t_in[tid, j]
+    add.u32      %r13, %r13, 1;
+    bra          dsp_loop;
+dsp_done:
+
+    ret;
+}

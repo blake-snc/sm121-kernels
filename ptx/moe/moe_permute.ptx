@@ -1,0 +1,150 @@
+// moe_permute.ptx
+//
+// Permute MoE routing outputs: sort (token, expert, weight) triples by
+// expert_id so that all tokens for expert 0 come first, then expert 1, etc.
+// Produces the permuted activation and inverse-permutation index for
+// post-GEMM unscatter.
+//
+//   expert_ids[i] ∈ [0, num_experts) for i ∈ [0, total_entries = tokens*K)
+//   The source token for entry i is i / K.
+//
+// For each entry i:
+//   e = expert_ids[i]
+//   pos_in_expert = atomicAdd(expert_cursor[e], 1)
+//   dst = expert_offsets[e] + pos_in_expert
+//   permuted_activations[dst, :] = activations[i / K, :]
+//   inverse_index[dst] = i           // so unscatter can find the source entry
+//
+// Layout:
+//   activations: [num_tokens, hidden] bf16
+//   expert_ids: [total_entries] u32  (where total_entries = num_tokens * K)
+//   expert_offsets: [num_experts+1] u32
+//   expert_cursor: [num_experts] u32 (scratch, zero-initialized by caller)
+//   permuted_activations: [total_entries, hidden] bf16 (output)
+//   inverse_index: [total_entries] u32 (output)
+//
+// Grid: (total_entries, 1, 1). Block: (256, 1, 1).
+// Each CTA handles one entry; threads cooperate on the row copy.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+
+.visible .entry moe_permute(
+    .param .u64 param_activations,   // [num_tokens, hidden] bf16
+    .param .u64 param_expert_ids,    // [total_entries] u32
+    .param .u64 param_offsets,       // [num_experts+1] u32
+    .param .u64 param_cursor,        // [num_experts] u32 scratch
+    .param .u64 param_permuted,      // [total_entries, hidden] bf16
+    .param .u64 param_inverse,       // [total_entries] u32
+    .param .u32 param_top_k,
+    .param .u32 param_hidden
+)
+{
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<16>;
+    .reg .pred %p<4>;
+    .shared .align 4 .b8 smem_bcast[16];       // broadcast dst index + expert
+
+    mov.u32         %r0, BLOCK_ID_X;           // entry_id (i)
+    mov.u32         %r1, THREAD_ID;
+
+    ld.param.u64    %rd0, [param_activations];
+    ld.param.u64    %rd1, [param_expert_ids];
+    ld.param.u64    %rd2, [param_offsets];
+    ld.param.u64    %rd3, [param_cursor];
+    ld.param.u64    %rd4, [param_permuted];
+    ld.param.u64    %rd5, [param_inverse];
+    ld.param.u32    %r2, [param_top_k];
+    ld.param.u32    %r3, [param_hidden];
+
+    // Thread 0 computes destination index via atomic
+    setp.ne.u32     %p0, %r1, 0;
+    @%p0 bra        wait_bcast;
+
+    // Load expert_id for this entry
+    mul.wide.u32    %rd6, %r0, 4;
+    add.u64         %rd7, %rd1, %rd6;
+    ld.global.u32   %r10, [%rd7];              // expert_id
+
+    // Bump expert's cursor
+    mul.wide.u32    %rd8, %r10, 4;
+    add.u64         %rd9, %rd3, %rd8;
+    atom.global.add.u32 %r11, [%rd9], 1;       // pos_in_expert (returned = old value)
+
+    // Look up expert_offsets[expert_id]
+    add.u64         %rd10, %rd2, %rd8;
+    ld.global.u32   %r12, [%rd10];             // offset_base
+    add.u32         %r13, %r12, %r11;          // dst = base + pos_in_expert
+
+    // Broadcast dst via shared memory
+    mov.u64         %rd11, smem_bcast;
+    st.shared.u32   [%rd11], %r13;
+
+    // Write inverse_index[dst] = entry_id
+    mul.wide.u32    %rd12, %r13, 4;
+    add.u64         %rd13, %rd5, %rd12;
+    st.global.u32   [%rd13], %r0;
+
+wait_bcast:
+    bar.sync        0;
+
+    // All threads read dst
+    mov.u64         %rd11, smem_bcast;
+    ld.shared.u32   %r13, [%rd11];
+
+    // Source row: entry_id / top_k (integer division)
+    div.u32         %r14, %r0, %r2;            // token_id = entry_id / top_k
+
+    // Source pointer: &activations[token_id * hidden]
+    mul.lo.u32      %r15, %r14, %r3;
+    mul.wide.u32    %rd14, %r15, 2;
+    add.u64         %rd0, %rd0, %rd14;
+
+    // Dest pointer: &permuted[dst * hidden]
+    mul.lo.u32      %r16, %r13, %r3;
+    mul.wide.u32    %rd15, %r16, 2;
+    add.u64         %rd4, %rd4, %rd15;
+
+    // Cooperative copy: each thread copies `hidden / blockDim` bf16 values
+    // Use b32 loads (2 bf16 per thread step).
+    mov.u32         %r17, %ntid.x;
+    shl.b32         %r18, %r17, 1;             // stride in bf16 elements (2 per thread)
+
+    shl.b32         %r19, %r1, 1;              // i = tid * 2
+
+copy_loop:
+    setp.ge.u32     %p1, %r19, %r3;
+    @%p1 bra        copy_tail;
+
+    mul.wide.u32    %rd12, %r19, 2;
+    .reg .b64 _srcp, _dstp;
+    add.u64         _srcp, %rd0, %rd12;
+    add.u64         _dstp, %rd4, %rd12;
+    .reg .b32 _v;
+    ld.global.b32   _v, [_srcp];
+    st.global.b32   [_dstp], _v;
+
+    add.u32         %r19, %r19, %r18;
+    bra             copy_loop;
+
+copy_tail:
+    // Handle the odd trailing element if hidden is not a multiple of 2
+    setp.lt.u32     %p1, %r19, %r3;
+    @!%p1 bra       done;
+    sub.u32         %r20, %r19, 1;
+    setp.lt.u32     %p1, %r20, %r3;
+    @!%p1 bra       done;
+    mul.wide.u32    %rd12, %r20, 2;
+    .reg .b64 _srcp2, _dstp2;
+    add.u64         _srcp2, %rd0, %rd12;
+    add.u64         _dstp2, %rd4, %rd12;
+    .reg .b16 _h;
+    ld.global.b16   _h, [_srcp2];
+    st.global.b16   [_dstp2], _h;
+
+done:
+    ret;
+}

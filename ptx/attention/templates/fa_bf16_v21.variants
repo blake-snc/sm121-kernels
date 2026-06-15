@@ -1,0 +1,28 @@
+# fa_bf16_v21 variant manifest.
+#
+# Maps each generated variant to its file stem, kernel entry name, and the cpp -D
+# flag set that selects its feature blocks in fa_bf16_v21.ptx.in.
+#
+# Format (whitespace separated):
+#   <file_stem>  <entry_name>  <flags...>
+#     file_stem  = output file name without .ptx (matches the hand-written file)
+#     entry_name = -DSPARK_ENTRY=<entry_name> (the .visible .entry symbol)
+#     flags      = zero or more SPARK_* macros to -D, or "-" for none
+#
+# Feature axes (independent): SPARK_CAUSAL, SPARK_GQA, SPARK_VARLEN.
+#
+# NOT templated (left as hand PTX, excluded here):
+#   fa_bf16_v21_swa, fa_bf16_v21_swa_softcap, fa_bf16_v21_softcap_causal
+#   SWA rewrites the mask as an absolute-position window check applied
+#   unconditionally; softcap rewrites the shared softmax core (tracks post-softcap
+#   row max, dropping the scale-on-max step). Neither is a clean additive #ifdef
+#   block on the shared body.
+
+fa_bf16_v21_streaming_p           flash_attn_bf16_v21_streaming_p           -
+fa_bf16_v21_causal                flash_attn_bf16_v21_causal                SPARK_CAUSAL
+fa_bf16_v21_gqa                   flash_attn_bf16_v21_gqa                   SPARK_GQA
+fa_bf16_v21_gqa_causal            flash_attn_bf16_v21_gqa_causal            SPARK_GQA SPARK_CAUSAL
+fa_bf16_v21_varlen                flash_attn_bf16_v21_varlen                SPARK_VARLEN
+fa_bf16_v21_varlen_causal         flash_attn_bf16_v21_varlen_causal         SPARK_VARLEN SPARK_CAUSAL
+fa_bf16_v21_varlen_gqa            flash_attn_bf16_v21_varlen_gqa            SPARK_VARLEN SPARK_GQA
+fa_bf16_v21_varlen_gqa_causal     flash_attn_bf16_v21_varlen_gqa_causal     SPARK_VARLEN SPARK_GQA SPARK_CAUSAL

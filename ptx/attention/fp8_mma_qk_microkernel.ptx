@@ -1,0 +1,311 @@
+// fp8_mma_qk_microkernel.ptx
+//
+// Standalone validation kernel for FP8 MMA m16n8k32 in attention shape.
+// Computes QK = Q @ K^T where:
+//   Q [M=16, D=512]  FP8 E4M3
+//   K [N=8,  D=512]  FP8 E4M3
+//   QK [M=16, N=8]   FP32 (output, with q_scale * k_scale applied)
+//
+// Pattern: D=512 tiled along K dim of MMA in K=32 chunks → 16 MMA calls per
+// per (M=16, N=8) tile. Per lane accumulates 4 FP32 outputs per the standard
+// m16n8k* output layout.
+//
+// FP8 MMA register layout (validated in gemm_fp8_mma.ptx):
+//   A: 4 b32 regs, each holds 4 FP8 (16 FP8/lane). K-interleaved layout from ldmatrix.
+//   B: 2 b32 regs (b0=K[0..15], b1=K[16..31]), K-split (NOT N-split).
+//   D: 4 FP32 regs per lane, standard m16n8k* output layout.
+//
+// Grid: (1, 1, 1). Block: (32, 1, 1) — single warp.
+// SMEM: 8 KB Q + 4 KB K = 12 KB.
+//
+// This is a microkernel for PROOF-OF-CONCEPT validation. The real MLA decode
+// kernel will integrate this pattern with online softmax + PV.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+#include "mma.ptxh"
+
+#define M 16
+#define N 8
+#define D 512
+
+.shared .align 128 .b8 fp8mqk_smem[12288]; // 8K Q + 4K K
+
+.visible .entry fp8_mma_qk_microkernel(
+    .param .u64 param_Q,       // [16, 512] FP8 E4M3 (u8)
+    .param .u64 param_K,       // [8,  512] FP8 E4M3 (u8) — row-major (each row = 1 N-position)
+    .param .u64 param_QK_out,  // [16, 8] FP32 output
+    .param .f32 param_scale    // applied as combined q_scale * k_scale
+)
+{
+    .reg .b32  %r<90>;
+    .reg .b64  %rd<10>;
+    .reg .f32  %f<6>;
+    .reg .pred %p<4>;
+
+    mov.u32      %r40, %tid.x;             // lane (0..31)
+
+    ld.param.u64 %rd0, [param_Q];
+    ld.param.u64 %rd1, [param_K];
+    ld.param.u64 %rd2, [param_QK_out];
+    ld.param.f32 %f4, [param_scale];
+
+    mov.u32      %r48, fp8mqk_smem;        // SMEM base (Q region)
+    add.u32      %r49, %r48, 8192;         // SMEM K region (after 8K of Q)
+
+    // === Load Q tile [16, 512] FP8 = 8192 bytes into SMEM ===
+    // 32 lanes × 256 bytes/lane = 8192. Each lane loads 256 bytes = 16 v4.b32 (no, too many).
+    // Better: each lane loads 256 bytes = 4 × ld.global.v4.b32 (4 × 16 bytes = 64) — wait.
+    // 256 bytes / 16 bytes = 16 v4.b32. Or use 64 bytes/lane × 4 ld.global.v4.b32.
+    // Simplest: 32 lanes × 256 bytes total = 8192 bytes. But Q rows are 512 bytes each (16 rows).
+    // Layout: row-major. Per row: 512 bytes = 32 b16 = 16 v4.b32.
+    //
+    // Cooperative load: 32 threads, 16 rows. 2 threads per row. Each loads 256 bytes (= 4 v4.b32).
+    shr.b32      %r41, %r40, 1;            // q_row = lane / 2
+    and.b32      %r42, %r40, 1;            // half = lane % 2 (0=cols 0..255, 1=cols 256..511)
+    shl.b32      %r43, %r42, 8;            // half * 256 (byte offset within row)
+    mul.lo.u32   %r44, %r41, 512;          // row * 512 bytes
+    add.u32      %r44, %r44, %r43;         // global byte offset
+    cvt.u64.u32  %rd3, %r44;
+    add.u64      %rd4, %rd0, %rd3;         // &Q[row, half*256]
+
+    // SMEM dst: same layout
+    add.u32      %r45, %r48, %r44;         // smem_Q + same offset
+
+    // Load 256 bytes = 4 × v4.b32 per thread
+    .reg .b32 _q0, _q1, _q2, _q3;
+    .reg .b32 _q4, _q5, _q6, _q7;
+    .reg .b32 _q8, _q9, _q10, _q11;
+    .reg .b32 _q12, _q13, _q14, _q15;
+    ld.global.v4.b32 {_q0, _q1, _q2, _q3},     [%rd4];
+    ld.global.v4.b32 {_q4, _q5, _q6, _q7},     [%rd4 + 16];
+    ld.global.v4.b32 {_q8, _q9, _q10, _q11},   [%rd4 + 32];
+    ld.global.v4.b32 {_q12, _q13, _q14, _q15}, [%rd4 + 48];
+    st.shared.v4.b32 [%r45],      {_q0, _q1, _q2, _q3};
+    st.shared.v4.b32 [%r45 + 16], {_q4, _q5, _q6, _q7};
+    st.shared.v4.b32 [%r45 + 32], {_q8, _q9, _q10, _q11};
+    st.shared.v4.b32 [%r45 + 48], {_q12, _q13, _q14, _q15};
+    ld.global.v4.b32 {_q0, _q1, _q2, _q3},     [%rd4 + 64];
+    ld.global.v4.b32 {_q4, _q5, _q6, _q7},     [%rd4 + 80];
+    ld.global.v4.b32 {_q8, _q9, _q10, _q11},   [%rd4 + 96];
+    ld.global.v4.b32 {_q12, _q13, _q14, _q15}, [%rd4 + 112];
+    st.shared.v4.b32 [%r45 + 64],  {_q0, _q1, _q2, _q3};
+    st.shared.v4.b32 [%r45 + 80],  {_q4, _q5, _q6, _q7};
+    st.shared.v4.b32 [%r45 + 96],  {_q8, _q9, _q10, _q11};
+    st.shared.v4.b32 [%r45 + 112], {_q12, _q13, _q14, _q15};
+    ld.global.v4.b32 {_q0, _q1, _q2, _q3},     [%rd4 + 128];
+    ld.global.v4.b32 {_q4, _q5, _q6, _q7},     [%rd4 + 144];
+    ld.global.v4.b32 {_q8, _q9, _q10, _q11},   [%rd4 + 160];
+    ld.global.v4.b32 {_q12, _q13, _q14, _q15}, [%rd4 + 176];
+    st.shared.v4.b32 [%r45 + 128], {_q0, _q1, _q2, _q3};
+    st.shared.v4.b32 [%r45 + 144], {_q4, _q5, _q6, _q7};
+    st.shared.v4.b32 [%r45 + 160], {_q8, _q9, _q10, _q11};
+    st.shared.v4.b32 [%r45 + 176], {_q12, _q13, _q14, _q15};
+    ld.global.v4.b32 {_q0, _q1, _q2, _q3},     [%rd4 + 192];
+    ld.global.v4.b32 {_q4, _q5, _q6, _q7},     [%rd4 + 208];
+    ld.global.v4.b32 {_q8, _q9, _q10, _q11},   [%rd4 + 224];
+    ld.global.v4.b32 {_q12, _q13, _q14, _q15}, [%rd4 + 240];
+    st.shared.v4.b32 [%r45 + 192], {_q0, _q1, _q2, _q3};
+    st.shared.v4.b32 [%r45 + 208], {_q4, _q5, _q6, _q7};
+    st.shared.v4.b32 [%r45 + 224], {_q8, _q9, _q10, _q11};
+    st.shared.v4.b32 [%r45 + 240], {_q12, _q13, _q14, _q15};
+
+    // === Load K tile [8, 512] FP8 = 4096 bytes into SMEM ===
+    // 32 lanes × 128 bytes/lane = 4096. Each lane: 8 v4.b32 = 128 bytes.
+    // K layout: 8 rows × 512 bytes. 4 lanes per row. Each loads 128 bytes.
+    shr.b32      %r50, %r40, 2;            // k_row = lane / 4
+    and.b32      %r51, %r40, 3;            // sub = lane % 4 (0..3, 128 bytes each)
+    shl.b32      %r52, %r51, 7;            // sub * 128
+    mul.lo.u32   %r53, %r50, 512;          // row * 512
+    add.u32      %r53, %r53, %r52;
+    cvt.u64.u32  %rd5, %r53;
+    add.u64      %rd6, %rd1, %rd5;
+    add.u32      %r54, %r49, %r53;         // smem K dst
+
+    ld.global.v4.b32 {_q0, _q1, _q2, _q3},     [%rd6];
+    ld.global.v4.b32 {_q4, _q5, _q6, _q7},     [%rd6 + 16];
+    ld.global.v4.b32 {_q8, _q9, _q10, _q11},   [%rd6 + 32];
+    ld.global.v4.b32 {_q12, _q13, _q14, _q15}, [%rd6 + 48];
+    st.shared.v4.b32 [%r54],      {_q0, _q1, _q2, _q3};
+    st.shared.v4.b32 [%r54 + 16], {_q4, _q5, _q6, _q7};
+    st.shared.v4.b32 [%r54 + 32], {_q8, _q9, _q10, _q11};
+    st.shared.v4.b32 [%r54 + 48], {_q12, _q13, _q14, _q15};
+    ld.global.v4.b32 {_q0, _q1, _q2, _q3},     [%rd6 + 64];
+    ld.global.v4.b32 {_q4, _q5, _q6, _q7},     [%rd6 + 80];
+    ld.global.v4.b32 {_q8, _q9, _q10, _q11},   [%rd6 + 96];
+    ld.global.v4.b32 {_q12, _q13, _q14, _q15}, [%rd6 + 112];
+    st.shared.v4.b32 [%r54 + 64],  {_q0, _q1, _q2, _q3};
+    st.shared.v4.b32 [%r54 + 80],  {_q4, _q5, _q6, _q7};
+    st.shared.v4.b32 [%r54 + 96],  {_q8, _q9, _q10, _q11};
+    st.shared.v4.b32 [%r54 + 112], {_q12, _q13, _q14, _q15};
+
+    bar.sync 0;
+
+    // === Init 4 FP32 accumulators per lane (output [M=16, N=8] = 4 per lane) ===
+    .reg .f32 %acc0, %acc1, %acc2, %acc3;
+    mov.f32 %acc0, 0.0;
+    mov.f32 %acc1, 0.0;
+    mov.f32 %acc2, 0.0;
+    mov.f32 %acc3, 0.0;
+
+    // === Precompute ldmatrix base addresses ===
+    // A (Q): 16 rows × K=32 FP8 per MMA call. Q SMEM is row-major 16×512.
+    // For each K=32 chunk, ldmatrix.x4 loads 16 rows × 16 b16 (= 32 FP8).
+    //   lane < 16: addr = smem_Q + lane*512 + k_chunk*32
+    //   lane >=16: addr = smem_Q + (lane-16)*512 + k_chunk*32 + 16
+    // Q row stride = 512 bytes.
+    setp.lt.u32  %p0, %r40, 16;
+    @%p0 mul.lo.u32 %r60, %r40, 512;
+    @!%p0 sub.u32   %r60, %r40, 16;
+    @!%p0 mad.lo.u32 %r60, %r60, 512, 16;
+    add.u32      %r61, %r48, %r60;        // ldm_Q_base (k_chunk=0)
+
+    // B (K): N=8 rows × K=32 FP8 per MMA call. K SMEM row-major 8×512.
+    // LOAD_FP8_B_FRAG addresses 4 bytes at stride 32 (per gid, tip swap).
+    //   groupID = lane / 4, tipInGroup = lane % 4
+    // For our layout B = K^T conceptually, but we stored K row-major with rows = N positions.
+    // Per the MMA convention (gemm_fp8_mma uses B = [K, N] row-major), we need to think of
+    // K SMEM as being indexed by "K dim" first. But our K is stored as [N=8, K=512].
+    //
+    // For MMA m16n8k32 row.col, B is treated as col-major K×N (K=32 contracted, N=8 cols).
+    // LOAD_FP8_B_FRAG with stride 32 expects N=8 cols × stride-32 bytes = column-major.
+    //
+    // Our K SMEM is [N=8, K=512] row-major (stride 512 between N rows).
+    // For each K=32 chunk, we need fragment that maps as if B[k_chunk*32 + k, n] = K[n, k_chunk*32 + k].
+    //
+    // Per LOAD_FP8_B_FRAG: each lane loads 4 bytes from {addr, +32, +64, +96}.
+    //   gid = lane/4 (0..7), tip = lane%4 (0..3).
+    //   addr = smem_K + gid*1 + tip*1024? Need to check existing usage.
+    //
+    // From gemm_fp8_mma:
+    //   shr.b32 %r54, %r40, 2;          // groupID = lane / 4
+    //   and.b32 %r55, %r40, 3;          // tidInGroup = lane % 4
+    //   mul.lo.u32 %r52, %r55, 128;     // tidInGroup * 128
+    //   add.u32 %r52, %r52, %r54;       // + groupID
+    //   add.u32 %r52, %r48, %r52;
+    //   add.u32 %r52, %r52, 1024;       // b0_base_ng0 (smem_B base)
+    //   add.u32 %r53, %r52, 512;        // b1_base_ng0 = b0 + 512 (16*32)
+    //
+    // Where B SMEM is row-major [K=32, N=32] with row stride 32 bytes.
+    //
+    // Our K SMEM is [N=8, K=512]. We need to interpret it as B [K=32 chunk, N=8] for each K-chunk.
+    // For K-chunk c: B[k, n] = K[n, c*32 + k]. SMEM addr = K_base + n*512 + c*32 + k.
+    //
+    // Per gemm_fp8_mma's LOAD_FP8_B_FRAG addressing, using gid=lane/4 (0..7) and tip=lane%4 (0..3):
+    //   bytes from offsets {0, 32, 64, 96} relative to base.
+    //   These 4 bytes form K[0..3] of B's K-dim. tip*4 advances K position by 4.
+    //   Wait no — base = b_base + tip*128 + gid. The 4 byte loads at +{0, 32, 64, 96} read
+    //   from rows (in B [K=32, N] layout) 0, 1, 2, 3. So lane gets B[K0..K3, N=gid].
+    //   Hmm that's 4 K-values for 1 N. b0 reg = 4 FP8 = K[0..3] for n=gid.
+    //   For b1, base += 512 (row 16). So b1 = K[16..19] for n=gid.
+    //   That's the K-split convention.
+    //
+    // For our K SMEM [N=8, K=512] the equivalent would be:
+    //   base for K-chunk c, gid = K_base + gid*512 + c*32 + tip*4? No need to recompute.
+    //
+    // Actually simpler: our K SMEM has N as outer dim. For each K-chunk c, we want lane 'l'
+    // (with gid = l/4 < 8 = N) to read K[gid, c*32 + tip*4 + 0..3] for b0, and
+    // K[gid, c*32 + 16 + tip*4 + 0..3] for b1.
+    //
+    // Address: K_base + gid*512 + c*32 + tip*4 + {0, 32?, 64?, 96?}.
+    // Wait those stride-32 offsets in LOAD_FP8_B_FRAG were because the original B SMEM had
+    // stride 32 between consecutive rows (B = [K=32 outer, N=32 inner] row-major with N stride 32).
+    //
+    // For our K SMEM, stride is 512 between N rows. So the equivalent FP8_B_FRAG load needs
+    // stride 512 between consecutive byte fetches.
+
+    shr.b32      %r62, %r40, 2;             // gid (0..7) — N-position
+    and.b32      %r63, %r40, 3;             // tip (0..3)
+    shl.b32      %r64, %r63, 2;             // tip * 4 (byte offset)
+    mul.lo.u32   %r65, %r62, 512;           // gid * 512 (N-row offset)
+    add.u32      %r66, %r49, %r65;          // smem_K + N-row
+    add.u32      %r67, %r66, %r64;          // + tip*4
+    // ldm_K_base: per K-chunk, we'll add c*32 (K-chunk byte offset)
+
+    // === MMA loop: 16 K-chunks of K=32 each, covering D=512 ===
+    mov.u32      %r70, 0;                   // chunk index
+mma_loop:
+    setp.ge.u32  %p1, %r70, 16;
+    @%p1 bra     mma_done;
+
+    shl.b32      %r71, %r70, 5;             // chunk * 32
+
+    // Load A fragment: ldmatrix.x4 from Q SMEM at chunk K offset
+    .reg .b32 _a0, _a1, _a2, _a3;
+    add.u32      %r72, %r61, %r71;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {_a0, _a1, _a2, _a3}, [%r72];
+
+    // Load B fragment: 8 bytes (b0 = K[0..3] for our N=gid; b1 = K[16..19])
+    // Custom load (NOT the gemm_fp8_mma macro since our stride is 512 not 32):
+    .reg .b32 _b0, _b1;
+    .reg .b32 _t0, _t1, _t2, _t3;
+    .reg .b32 _kbase;
+    add.u32      _kbase, %r67, %r71;        // K-row 0 base for this K-chunk
+    // b0: K[0..3] for n=gid, all from same N-row, at K[chunk*32 + tip*4 + 0..3]
+    ld.shared.u8 _t0, [_kbase];
+    ld.shared.u8 _t1, [_kbase + 1];
+    ld.shared.u8 _t2, [_kbase + 2];
+    ld.shared.u8 _t3, [_kbase + 3];
+    bfi.b32      _b0, _t1, _t0, 8, 8;
+    bfi.b32      _b0, _t2, _b0, 16, 8;
+    bfi.b32      _b0, _t3, _b0, 24, 8;
+    // b1: K[16..19] = K[chunk*32 + tip*4 + 16..19]
+    ld.shared.u8 _t0, [_kbase + 16];
+    ld.shared.u8 _t1, [_kbase + 17];
+    ld.shared.u8 _t2, [_kbase + 18];
+    ld.shared.u8 _t3, [_kbase + 19];
+    bfi.b32      _b1, _t1, _t0, 8, 8;
+    bfi.b32      _b1, _t2, _b1, 16, 8;
+    bfi.b32      _b1, _t3, _b1, 24, 8;
+
+    MMA_FP8_M16N8K32(%acc0, %acc1, %acc2, %acc3, _a0, _a1, _a2, _a3, _b0, _b1)
+
+    add.u32      %r70, %r70, 1;
+    bra          mma_loop;
+mma_done:
+
+    // Apply combined scale
+    mul.f32      %acc0, %acc0, %f4;
+    mul.f32      %acc1, %acc1, %f4;
+    mul.f32      %acc2, %acc2, %f4;
+    mul.f32      %acc3, %acc3, %f4;
+
+    // === Store [16, 8] FP32 output ===
+    // Per m16n8k* output layout:
+    //   groupID = lane / 4 (0..7) — output row offset
+    //   tipInGroup = lane % 4 (0..3)
+    //   acc0 @ (row=groupID,   col=2*tip)
+    //   acc1 @ (row=groupID,   col=2*tip+1)
+    //   acc2 @ (row=groupID+8, col=2*tip)
+    //   acc3 @ (row=groupID+8, col=2*tip+1)
+    shr.b32      %r80, %r40, 2;              // groupID
+    and.b32      %r81, %r40, 3;              // tipInGroup
+    shl.b32      %r82, %r81, 1;              // 2*tip
+
+    // QK_out [M=16, N=8]: addr = base + (row * 8 + col) * 4
+    .reg .b32 _row, _col, _off;
+    .reg .b64 _p;
+    add.u32      _row, %r80, 0;
+    add.u32      _col, %r82, 0;
+    mul.lo.u32   _off, _row, 8;
+    add.u32      _off, _off, _col;
+    mul.wide.u32 _p, _off, 4;
+    add.u64      _p, %rd2, _p;
+    st.global.f32 [_p], %acc0;
+    st.global.f32 [_p + 4], %acc1;
+
+    add.u32      _row, %r80, 8;
+    add.u32      _col, %r82, 0;
+    mul.lo.u32   _off, _row, 8;
+    add.u32      _off, _off, _col;
+    mul.wide.u32 _p, _off, 4;
+    add.u64      _p, %rd2, _p;
+    st.global.f32 [_p], %acc2;
+    st.global.f32 [_p + 4], %acc3;
+
+    ret;
+}

@@ -1,0 +1,128 @@
+// fa_bw_compute_ds_bf16.ptx
+//
+// Compute dS[m, n] = P[m, n] * (dP[m, n] - D[m])
+// where D[m] = sum_n(dP[m, n] * P[m, n]).
+//
+// One CTA per row m. Block: 128 threads. Computes D via block reduction,
+// then updates dS in-place into the output buffer.
+//
+// Layout (per batch-head):
+//   P:  [S, S] BF16 (input)
+//   dP: [S, S] BF16 (input)
+//   dS: [S, S] BF16 (output)
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "reduction.ptxh"
+#include "convert.ptxh"
+
+.shared .align 128 .b8 smem[128];
+
+.visible .entry fa_bw_compute_ds_bf16(
+    .param .u64 param_P,
+    .param .u64 param_dP,
+    .param .u64 param_dS,
+    .param .u32 param_S
+)
+{
+    .reg .b32  %r<16>;
+    .reg .b64  %rd<12>;
+    .reg .f32  %f<12>;
+    .reg .b16  %h<4>;
+    .reg .pred %p<8>;
+
+    mov.u32         %r0, %ctaid.x;          // m
+    mov.u32         %r1, %tid.x;
+    mov.u32         %r4, %ntid.x;
+
+    ld.param.u64    %rd0, [param_P];
+    ld.param.u64    %rd1, [param_dP];
+    ld.param.u64    %rd2, [param_dS];
+    ld.param.u32    %r2, [param_S];
+
+    // Row offsets
+    mul.lo.u32      %r5, %r0, %r2;
+    mul.wide.u32    %rd3, %r5, 2;
+    add.u64         %rd4, %rd0, %rd3;       // &P[m, 0]
+    add.u64         %rd5, %rd1, %rd3;       // &dP[m, 0]
+    add.u64         %rd6, %rd2, %rd3;       // &dS[m, 0]
+
+    // Stage 1: D = sum(dP * P)
+    mov.f32         %f10, 0.0;
+    mov.u32         %r6, %r1;
+acc_loop:
+    setp.ge.u32     %p0, %r6, %r2;
+    @%p0 bra        acc_done;
+    mul.wide.u32    %rd7, %r6, 2;
+    add.u64         %rd8, %rd4, %rd7;
+    add.u64         %rd9, %rd5, %rd7;
+    ld.global.b16   %h0, [%rd8];
+    CVT_BF16_F32(%f0, %h0)
+    ld.global.b16   %h1, [%rd9];
+    CVT_BF16_F32(%f1, %h1)
+    fma.rn.f32      %f10, %f0, %f1, %f10;
+    add.u32         %r6, %r6, %r4;
+    bra             acc_loop;
+acc_done:
+    .reg .b32 %_t;
+    WARP_REDUCE_SUM_F32(%f10, %_t)
+    WARP_ID(%r7, %r1)
+    LANE_ID(%r8, %r1)
+    setp.eq.u32     %p1, %r8, 0;
+    @!%p1 bra       w_skip;
+    mul.wide.u32    %rd10, %r7, 4;
+    mov.u64         %rd11, smem;
+    add.u64         %rd11, %rd11, %rd10;
+    st.shared.f32   [%rd11], %f10;
+w_skip:
+    bar.sync        0;
+    shr.u32         %r9, %r4, 5;
+    setp.lt.u32     %p2, %r7, 1;
+    @!%p2 bra       skip_w0;
+    setp.lt.u32     %p3, %r8, %r9;
+    @%p3 bra        load_p;
+    mov.f32         %f10, 0.0;
+    bra             do_red;
+load_p:
+    mul.wide.u32    %rd10, %r8, 4;
+    mov.u64         %rd11, smem;
+    add.u64         %rd11, %rd11, %rd10;
+    ld.shared.f32   %f10, [%rd11];
+do_red:
+    WARP_REDUCE_SUM_F32(%f10, %_t)
+    setp.eq.u32     %p1, %r8, 0;
+    @!%p1 bra       skip_w0;
+    mov.u64         %rd11, smem;
+    add.u64         %rd11, %rd11, 64;
+    st.shared.f32   [%rd11], %f10;
+skip_w0:
+    bar.sync        0;
+    mov.u64         %rd11, smem;
+    add.u64         %rd11, %rd11, 64;
+    ld.shared.f32   %f11, [%rd11];          // D
+
+    // Stage 2: dS[n] = P[n] * (dP[n] - D)
+    mov.u32         %r6, %r1;
+write_loop:
+    setp.ge.u32     %p0, %r6, %r2;
+    @%p0 bra        write_done;
+    mul.wide.u32    %rd7, %r6, 2;
+    add.u64         %rd8, %rd4, %rd7;
+    add.u64         %rd9, %rd5, %rd7;
+    add.u64         %rd10, %rd6, %rd7;
+    ld.global.b16   %h0, [%rd8];
+    CVT_BF16_F32(%f0, %h0)
+    ld.global.b16   %h1, [%rd9];
+    CVT_BF16_F32(%f1, %h1)
+    sub.f32         %f2, %f1, %f11;
+    mul.f32         %f3, %f0, %f2;
+    CVT_F32_BF16(%h2, %f3)
+    st.global.b16   [%rd10], %h2;
+    add.u32         %r6, %r6, %r4;
+    bra             write_loop;
+write_done:
+    ret;
+}

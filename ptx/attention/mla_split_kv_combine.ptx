@@ -1,0 +1,206 @@
+// mla_split_kv_combine.ptx
+//
+// Log-sum-exp combine for split-K / FlashDecoding-style MLA attention.
+//
+// When MLA decode is split across num_splits CTAs (each owning a slice of
+// seq_kv), each CTA produces a partial O and a per-(batch, head) log-sum-exp.
+// This kernel combines them:
+//
+//   weight[i] = exp(LSE[i] - max_i LSE[i])
+//   Z          = Σ weight[i]
+//   O_final[b,h,d] = Σ_i (weight[i] / Z) * O_partial[i, b, h, d]
+//
+// Inputs:
+//   o_partial: [num_splits, B, H, D_C] FP32
+//   lse:       [num_splits, B, H]       FP32
+// Output:
+//   o_final:   [B, H, D_C]              BF16
+//
+// Grid: (num_heads, batch). Block: (128, 1, 1). Each thread handles 4 dims
+// of D_C=512 (128 × 4 = 512).
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+#include "reduction.ptxh"
+
+#define D_C 512
+#define BLOCK_DIM 128
+#define NUM_WARPS 4
+
+.shared .align 4 .b8 smem_combine_lse[256];   // up to 64 splits × 4 B FP32
+.shared .align 4 .b8 smem_combine_max[4];
+.shared .align 4 .b8 smem_combine_z[4];
+
+.visible .entry mla_split_kv_combine(
+    .param .u64 param_o_partial,
+    .param .u64 param_lse,
+    .param .u64 param_o_final,
+    .param .u32 param_num_splits,
+    .param .u32 param_num_heads
+)
+{
+    .reg .b32 %r<48>;
+    .reg .b64 %rd<12>;
+    .reg .f32 %f<20>;
+    .reg .b16 %h<4>;
+    .reg .pred %p<8>;
+
+    mov.u32     %r0, %tid.x;               // 0..127
+    mov.u32     %r1, %ctaid.x;             // head
+    mov.u32     %r2, %ctaid.y;             // batch
+
+    ld.param.u64 %rd0, [param_o_partial];
+    ld.param.u64 %rd1, [param_lse];
+    ld.param.u64 %rd2, [param_o_final];
+    ld.param.u32 %r3, [param_num_splits];
+    ld.param.u32 %r4, [param_num_heads];
+
+    shr.b32     %r5, %r0, 5;
+    and.b32     %r6, %r0, 31;
+
+    // bh = b*H + h
+    mul.lo.u32  %r7, %r2, %r4;
+    add.u32     %r7, %r7, %r1;
+
+    // ==================================================================
+    // Step 1: load LSE[s] for s in 0..num_splits into SMEM
+    // LSE layout: [num_splits, B, H] → lse + (s * B*H + bh) * 4
+    // Thread t loads LSE[t] if t < num_splits
+    // ==================================================================
+    setp.lt.u32 %p1, %r0, %r3;
+    mov.u32     %r10, %nctaid.x;             // H (gridDim.x)
+    mov.u32     %r11, %nctaid.y;             // B (gridDim.y)
+    mul.lo.u32  %r12, %r11, %r10;            // B * H
+    mul.lo.u32  %r13, %r0, %r12;             // s * B*H
+    add.u32     %r13, %r13, %r7;             // + bh
+    @%p1 mul.wide.u32 %rd3, %r13, 4;
+    @%p1 add.u64 %rd4, %rd1, %rd3;
+    mov.f32     %f1, 0fFF800000;              // -inf for out-of-range
+    @%p1 ld.global.f32 %f1, [%rd4];
+
+    // Write to SMEM
+    setp.lt.u32 %p2, %r0, 64;                // cap at 64 splits
+    and.pred    %p3, %p2, %p1;
+    shl.b32     %r14, %r0, 2;
+    mov.u32     %r15, smem_combine_lse;
+    add.u32     %r15, %r15, %r14;
+    @%p3 st.shared.f32 [%r15], %f1;
+    bar.sync 0;
+
+    // ==================================================================
+    // Step 2: compute max LSE and Z = Σ exp(LSE - max)
+    // Do this serially in thread 0 for simplicity (num_splits ≤ 64).
+    // ==================================================================
+    setp.eq.u32 %p4, %r0, 0;
+    mov.f32     %f2, 0fFF800000;              // running max
+    @!%p4 bra   skip_max_scan;
+    mov.u32     %r30, 0;
+max_scan:
+    setp.ge.u32 %p5, %r30, %r3;
+    @%p5 bra    max_done;
+    shl.b32     %r31, %r30, 2;
+    mov.u32     %r32, smem_combine_lse;
+    add.u32     %r32, %r32, %r31;
+    ld.shared.f32 %f5, [%r32];
+    max.f32     %f2, %f2, %f5;
+    add.u32     %r30, %r30, 1;
+    bra         max_scan;
+max_done:
+    mov.u32     %r33, smem_combine_max;
+    st.shared.f32 [%r33], %f2;
+skip_max_scan:
+    bar.sync 0;
+    ld.shared.f32 %f2, [smem_combine_max];
+
+    // Z = Σ exp(LSE - max)
+    mov.f32     %f3, 0.0;
+    @!%p4 bra   skip_z_scan;
+    mov.u32     %r30, 0;
+z_scan:
+    setp.ge.u32 %p5, %r30, %r3;
+    @%p5 bra    z_done;
+    shl.b32     %r31, %r30, 2;
+    mov.u32     %r32, smem_combine_lse;
+    add.u32     %r32, %r32, %r31;
+    ld.shared.f32 %f5, [%r32];
+    sub.f32     %f6, %f5, %f2;
+    mul.f32     %f6, %f6, LOG2E;
+    ex2.approx.ftz.f32 %f6, %f6;
+    add.f32     %f3, %f3, %f6;
+    add.u32     %r30, %r30, 1;
+    bra         z_scan;
+z_done:
+    mov.u32     %r33, smem_combine_z;
+    st.shared.f32 [%r33], %f3;
+skip_z_scan:
+    bar.sync 0;
+    ld.shared.f32 %f3, [smem_combine_z];
+    rcp.approx.f32 %f3, %f3;                  // 1/Z
+
+    // ==================================================================
+    // Step 3: O_final[b, h, thread_dims] = Σ_i (exp(LSE[i]-max)/Z) *
+    //                                       O_partial[i, b, h, thread_dims]
+    // Each thread handles 4 dims of D_C.
+    // ==================================================================
+    shl.b32     %r18, %r0, 3;                 // t*8 (4 BF16 per thread)
+
+    mov.f32     %f10, 0.0;                    // out[0]
+    mov.f32     %f11, 0.0;
+    mov.f32     %f12, 0.0;
+    mov.f32     %f13, 0.0;
+
+    mov.u32     %r20, 0;
+split_loop:
+    setp.ge.u32 %p5, %r20, %r3;
+    @%p5 bra    split_done;
+
+    // weight = exp(LSE[i] - max) / Z
+    shl.b32     %r14, %r20, 2;
+    mov.u32     %r15, smem_combine_lse;
+    add.u32     %r15, %r15, %r14;
+    ld.shared.f32 %f4, [%r15];
+    sub.f32     %f4, %f4, %f2;
+    mul.f32     %f4, %f4, LOG2E;
+    ex2.approx.ftz.f32 %f4, %f4;
+    mul.f32     %f4, %f4, %f3;                // weight_i
+
+    // o_partial_addr = o_partial + ((i * B*H + bh) * D_C + thread_dims_start) * 4
+    mul.lo.u32  %r21, %r20, %r12;              // i * B*H
+    add.u32     %r21, %r21, %r7;               // + bh
+    mul.lo.u32  %r22, %r21, D_C;
+    shl.b32     %r23, %r0, 2;                  // thread_dim_start = t*4 (FP32)
+    add.u32     %r22, %r22, %r23;
+    mul.wide.u32 %rd5, %r22, 4;
+    add.u64     %rd6, %rd0, %rd5;
+
+    .reg .f32 _p0, _p1, _p2, _p3;
+    ld.global.v4.f32 {_p0, _p1, _p2, _p3}, [%rd6];
+    fma.rn.f32  %f10, %f4, _p0, %f10;
+    fma.rn.f32  %f11, %f4, _p1, %f11;
+    fma.rn.f32  %f12, %f4, _p2, %f12;
+    fma.rn.f32  %f13, %f4, _p3, %f13;
+
+    add.u32     %r20, %r20, 1;
+    bra         split_loop;
+split_done:
+
+    // Store BF16 O_final[bh, thread_dim_start..thread_dim_start+3]
+    mul.lo.u32  %r24, %r7, D_C;
+    add.u32     %r24, %r24, %r23;
+    mul.wide.u32 %rd5, %r24, 2;
+    add.u64     %rd7, %rd2, %rd5;
+
+    cvt.rn.bf16.f32 %h0, %f10;
+    cvt.rn.bf16.f32 %h1, %f11;
+    mov.b32     %r14, {%h0, %h1};
+    cvt.rn.bf16.f32 %h0, %f12;
+    cvt.rn.bf16.f32 %h1, %f13;
+    mov.b32     %r15, {%h0, %h1};
+    st.global.v2.b32 [%rd7], {%r14, %r15};
+
+    ret;
+}

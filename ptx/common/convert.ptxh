@@ -1,0 +1,103 @@
+// convert.ptxh
+// Type conversion and math helpers
+
+#ifndef SPARK_CONVERT_PTXH
+#define SPARK_CONVERT_PTXH
+
+// log2(e) for converting exp(x) to 2^(x * log2(e))
+#define LOG2E 1.44269504
+
+// ln(2) for converting log2(x) to ln(x) = log2(x) * ln(2)
+#define LN2 0.693147181
+
+// sqrt(2/pi) for GeLU-tanh approximation
+#define SQRT_2_OVER_PI 0.7978845608
+
+// exp(x) via base-2 exponential: exp(x) = 2^(x * log2(e))
+// EXP_F32(dst, src, tmp) -- all .f32 registers
+#define EXP_F32(dst, src, tmp) \
+    mul.f32 tmp, src, LOG2E; \
+    ex2.approx.f32 dst, tmp;
+
+// sigmoid(x) = 1 / (1 + exp(-x))
+// SIGMOID_F32(dst, src, tmp1, tmp2) -- all .f32 registers
+#define SIGMOID_F32(dst, src, tmp1, tmp2) \
+    neg.f32 tmp1, src; \
+    mul.f32 tmp1, tmp1, LOG2E; \
+    ex2.approx.f32 tmp1, tmp1; \
+    add.f32 tmp2, tmp1, 1.0; \
+    rcp.approx.f32 dst, tmp2;
+
+// silu(x) = x * sigmoid(x)
+// SILU_F32(dst, src, tmp1, tmp2) -- all .f32 registers
+#define SILU_F32(dst, src, tmp1, tmp2) \
+    SIGMOID_F32(tmp1, src, tmp1, tmp2) \
+    mul.f32 dst, src, tmp1;
+
+// BF16 <-> F32 conversion
+#define CVT_BF16_F32(f32_dst, bf16_src) cvt.f32.bf16 f32_dst, bf16_src;
+#define CVT_F32_BF16(bf16_dst, f32_src) cvt.rn.bf16.f32 bf16_dst, f32_src;
+
+// F32 -> FP8 E4M3 (saturating, round-to-nearest-even).
+// Only the paired variant exists on SM121 — packs two F32 values into
+// a single 16-bit register (low byte = lo_src, high byte = hi_src).
+// CVT_F32X2_E4M3X2(b16_dst, hi_f32_src, lo_f32_src)
+#define CVT_F32X2_E4M3X2(b16_dst, hi_src, lo_src) \
+    cvt.rn.satfinite.e4m3x2.f32 b16_dst, hi_src, lo_src;
+
+// F32 -> FP8 E5M2 (wider dynamic range, less precision; used rarely for KV cache).
+#define CVT_F32X2_E5M2X2(b16_dst, hi_src, lo_src) \
+    cvt.rn.satfinite.e5m2x2.f32 b16_dst, hi_src, lo_src;
+
+// F32 -> FP4 E2M1 paired variant. Packs two FP4 values into one byte:
+// low nibble = lo_src, high nibble = hi_src. Used for MXFP4 / NVFP4
+// quantization on SM121a (no single-lane variant exists).
+// CVT_F32X2_E2M1X2(b8_dst, hi_f32_src, lo_f32_src)
+#define CVT_F32X2_E2M1X2(b8_dst, hi_src, lo_src) \
+    cvt.rn.satfinite.e2m1x2.f32 b8_dst, hi_src, lo_src;
+
+// Reciprocal square root (approximate, sufficient for normalization)
+#define RSQRT_F32(dst, src) rsqrt.approx.f32 dst, src;
+
+// Fused multiply-accumulate: dst = a * b + c
+#define FMA_F32(dst, a, b, c) fma.rn.f32 dst, a, b, c;
+
+// GeLU (exact) approximation via erf
+// gelu(x) = x * 0.5 * (1 + erf(x / sqrt(2)))
+// We use tanh-based approximation: erf(x) ≈ tanh(sqrt(2/pi) * (x + 0.044715 * x^3))
+//
+// Numerically-stable formulation. Math identity:
+//   gelu(x) = 0.5 * x * (1 + tanh(arg))
+//          = x * (1 + tanh(arg)) / 2
+//          = x * sigmoid(2 * arg)
+//          = x / (1 + exp(-2 * arg))
+// where arg = sqrt(2/pi) * (x + 0.044715 * x^3).
+//
+// This form avoids the `exp(arg) - exp(-arg)` pattern from the prior macro which
+// produced NaN when arg was large enough to overflow exp() (e.g. layer-deep
+// hidden states with magnitudes > ~16). The sigmoid form has a single exp on a
+// negative argument, so the worst case is `exp(-large) → 0`, denominator → 1,
+// gelu → x — no Inf/NaN.
+//
+// GELU_TANH_F32(dst, src, tmp1, tmp2, tmp3) -- all .f32 registers
+#define GELU_TANH_F32(dst, src, tmp1, tmp2, tmp3) \
+    mul.f32 tmp1, src, src; \
+    mul.f32 tmp1, tmp1, src; \
+    mul.f32 tmp1, tmp1, 0f3D372713;  /* 0.044715 */ \
+    add.f32 tmp1, tmp1, src; \
+    mul.f32 tmp1, tmp1, 0f3F4C422A;  /* sqrt(2/pi) */ \
+    add.f32 tmp1, tmp1, tmp1;        /* 2 * arg */ \
+    neg.f32 tmp1, tmp1;              /* -2 * arg */ \
+    mul.f32 tmp1, tmp1, LOG2E;       /* prep for ex2 */ \
+    ex2.approx.f32 tmp2, tmp1;       /* e^(-2 * arg) */ \
+    add.f32 tmp2, tmp2, 0f3F800000;  /* 1 + e^(-2 * arg) */ \
+    rcp.approx.f32 tmp2, tmp2;       /* 1 / (1 + e^(-2 * arg)) = sigmoid(2*arg) */ \
+    mul.f32 dst, src, tmp2;
+
+// GeLU (exact) via polynomial approximation of erf
+// gelu(x) = x * Phi(x) where Phi is the standard normal CDF
+// We approximate: gelu(x) ≈ 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+// Note: GELU_TANH_F32 above implements this. For the "exact" GeLU (torch default),
+// the difference is negligible for inference.
+
+#endif

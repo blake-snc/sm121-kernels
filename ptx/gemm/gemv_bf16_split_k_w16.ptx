@@ -1,0 +1,190 @@
+// gemv_bf16_split_k_w16.ptx
+//
+// BF16 sibling of gemv_w8a16_split_k_w16: 16 cols/thread, 2048 cols/block.
+//   - Two ld.global.v4.b32 (8 BF16 each = 16 BF16 / 16 cols) per K-iter.
+//   - 16 FMA accumulators per thread; split into two ILP groups.
+//   - Block: 128 threads × 16 cols = 2048 cols/block.
+//   - Grid: (ceil(N / 2048), num_shards, 1).
+//
+// Targets large-N BF16 gemv: lm_head when running BF16-only (no FP8 env
+// var). At vocab=262144 etc. the wide block amortizes per-block costs.
+// On the gate/up/down range (inter ≤ 10240) the per-thread parallelism
+// dominates — use the regular `gemv_bf16_split_k` there. Caller picks.
+//
+// Same ABI as gemv_bf16_split_k except B is BF16 (not FP8) and no `scale`.
+// Caller MUST zero out_f32[N] before launch.
+// SMEM: k_shard * 2 bytes for the X-shard tile.
+// Constraints: N must be a multiple of 16.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+.extern .shared .align 16 .b8 smem_xsh_bf16_w16[];
+
+.visible .entry gemv_bf16_split_k_w16(
+    .param .u64 param_x,         // [K] bf16
+    .param .u64 param_b,         // [K, N] bf16
+    .param .u64 param_out_f32,   // [N] f32 (caller-zeroed accumulator)
+    .param .u32 param_n,
+    .param .u32 param_k,
+    .param .u32 param_k_shard
+)
+{
+    .reg .b32 %r<48>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<48>;
+    .reg .b16 %h<32>;
+    .reg .pred %p<8>;
+
+    mov.u32         %r0, %ctaid.x;
+    mov.u32         %r1, %ctaid.y;
+    mov.u32         %r2, %tid.x;
+    mov.u32         %r3, %ntid.x;
+
+    // col_start = col_block * 2048 + tid * 16
+    shl.b32         %r4, %r0, 11;
+    shl.b32         %r5, %r2, 4;
+    add.u32         %r6, %r4, %r5;
+
+    ld.param.u64    %rd0, [param_x];
+    ld.param.u64    %rd1, [param_b];
+    ld.param.u64    %rd2, [param_out_f32];
+    ld.param.u32    %r7, [param_n];
+    ld.param.u32    %r8, [param_k];
+    ld.param.u32    %r9, [param_k_shard];
+
+    // K range
+    mul.lo.u32      %r10, %r1, %r9;
+    add.u32         %r11, %r10, %r9;
+    min.u32         %r11, %r11, %r8;
+    sub.u32         %r13, %r11, %r10;
+
+    // ----- Load X[k_start..k_end] into SMEM -----
+    mov.u32         %r12, smem_xsh_bf16_w16;
+    mov.u32         %r14, %r2;
+load_x:
+    setp.ge.u32     %p0, %r14, %r13;
+    @%p0 bra        load_done;
+    add.u32         %r15, %r14, %r10;
+    mul.wide.u32    %rd3, %r15, 2;
+    add.u64         %rd4, %rd0, %rd3;
+    ld.global.b16   %h0, [%rd4];
+    shl.b32         %r16, %r14, 1;
+    add.u32         %r17, %r12, %r16;
+    st.shared.b16   [%r17], %h0;
+    add.u32         %r14, %r14, %r3;
+    bra             load_x;
+load_done:
+    bar.sync        0;
+
+    // Skip whole thread if its 16-col group is past N.
+    setp.ge.u32     %p1, %r6, %r7;
+    @%p1 bra        ret;
+
+    // 16 accumulators (split into 2 groups of 8 for ILP).
+    mov.f32         %f0, 0.0;  mov.f32 %f1, 0.0;  mov.f32 %f2, 0.0;  mov.f32 %f3, 0.0;
+    mov.f32         %f4, 0.0;  mov.f32 %f5, 0.0;  mov.f32 %f6, 0.0;  mov.f32 %f7, 0.0;
+    mov.f32         %f16, 0.0; mov.f32 %f17, 0.0; mov.f32 %f18, 0.0; mov.f32 %f19, 0.0;
+    mov.f32         %f20, 0.0; mov.f32 %f21, 0.0; mov.f32 %f22, 0.0; mov.f32 %f23, 0.0;
+
+    // K-shard loop
+    mov.u32         %r18, 0;
+k_loop:
+    setp.ge.u32     %p2, %r18, %r13;
+    @%p2 bra        k_done;
+
+    // x_f32 = fp32(X[k])
+    shl.b32         %r19, %r18, 1;
+    add.u32         %r20, %r12, %r19;
+    ld.shared.b16   %h0, [%r20];
+    CVT_BF16_F32(%f8, %h0)
+
+    // B[k_global, col_start..col_start+16] = 16 BF16 = 32 bytes = 2 × v4.b32.
+    add.u32         %r21, %r18, %r10;
+    mul.lo.u32      %r22, %r21, %r7;
+    add.u32         %r22, %r22, %r6;
+    mul.wide.u32    %rd5, %r22, 2;       // BF16 stride
+    add.u64         %rd6, %rd1, %rd5;
+
+    ld.global.v4.b32 {%r23, %r24, %r25, %r26}, [%rd6];        // cols 0..7 (8 BF16)
+    ld.global.v4.b32 {%r27, %r28, %r29, %r30}, [%rd6 + 16];   // cols 8..15
+
+    // Unpack 16 BF16 into 16 b16 regs.
+    mov.b32         {%h0,  %h1},  %r23;
+    mov.b32         {%h2,  %h3},  %r24;
+    mov.b32         {%h4,  %h5},  %r25;
+    mov.b32         {%h6,  %h7},  %r26;
+    mov.b32         {%h8,  %h9},  %r27;
+    mov.b32         {%h10, %h11}, %r28;
+    mov.b32         {%h12, %h13}, %r29;
+    mov.b32         {%h14, %h15}, %r30;
+
+    // Convert each BF16 to FP32.
+    CVT_BF16_F32(%f9,  %h0)
+    CVT_BF16_F32(%f10, %h1)
+    CVT_BF16_F32(%f11, %h2)
+    CVT_BF16_F32(%f12, %h3)
+    CVT_BF16_F32(%f13, %h4)
+    CVT_BF16_F32(%f14, %h5)
+    CVT_BF16_F32(%f15, %h6)
+    CVT_BF16_F32(%f24, %h7)
+    CVT_BF16_F32(%f25, %h8)
+    CVT_BF16_F32(%f26, %h9)
+    CVT_BF16_F32(%f27, %h10)
+    CVT_BF16_F32(%f28, %h11)
+    CVT_BF16_F32(%f31, %h12)
+    CVT_BF16_F32(%f32, %h13)
+    CVT_BF16_F32(%f33, %h14)
+    CVT_BF16_F32(%f34, %h15)
+
+    // 16 FMAs, interleaved across two acc groups for ILP.
+    fma.rn.f32      %f0,  %f8, %f9,  %f0;
+    fma.rn.f32      %f16, %f8, %f25, %f16;
+    fma.rn.f32      %f1,  %f8, %f10, %f1;
+    fma.rn.f32      %f17, %f8, %f26, %f17;
+    fma.rn.f32      %f2,  %f8, %f11, %f2;
+    fma.rn.f32      %f18, %f8, %f27, %f18;
+    fma.rn.f32      %f3,  %f8, %f12, %f3;
+    fma.rn.f32      %f19, %f8, %f28, %f19;
+    fma.rn.f32      %f4,  %f8, %f13, %f4;
+    fma.rn.f32      %f20, %f8, %f31, %f20;
+    fma.rn.f32      %f5,  %f8, %f14, %f5;
+    fma.rn.f32      %f21, %f8, %f32, %f21;
+    fma.rn.f32      %f6,  %f8, %f15, %f6;
+    fma.rn.f32      %f22, %f8, %f33, %f22;
+    fma.rn.f32      %f7,  %f8, %f24, %f7;
+    fma.rn.f32      %f23, %f8, %f34, %f23;
+
+    add.u32         %r18, %r18, 1;
+    bra             k_loop;
+
+k_done:
+    // Atomically accumulate 16 f32 outputs.
+    mul.wide.u32    %rd7, %r6, 4;
+    add.u64         %rd8, %rd2, %rd7;
+
+    .reg .f32 %old;
+    atom.global.add.f32 %old, [%rd8 + 0],  %f0;
+    atom.global.add.f32 %old, [%rd8 + 4],  %f1;
+    atom.global.add.f32 %old, [%rd8 + 8],  %f2;
+    atom.global.add.f32 %old, [%rd8 + 12], %f3;
+    atom.global.add.f32 %old, [%rd8 + 16], %f4;
+    atom.global.add.f32 %old, [%rd8 + 20], %f5;
+    atom.global.add.f32 %old, [%rd8 + 24], %f6;
+    atom.global.add.f32 %old, [%rd8 + 28], %f7;
+    atom.global.add.f32 %old, [%rd8 + 32], %f16;
+    atom.global.add.f32 %old, [%rd8 + 36], %f17;
+    atom.global.add.f32 %old, [%rd8 + 40], %f18;
+    atom.global.add.f32 %old, [%rd8 + 44], %f19;
+    atom.global.add.f32 %old, [%rd8 + 48], %f20;
+    atom.global.add.f32 %old, [%rd8 + 52], %f21;
+    atom.global.add.f32 %old, [%rd8 + 56], %f22;
+    atom.global.add.f32 %old, [%rd8 + 60], %f23;
+
+ret:
+    ret;
+}

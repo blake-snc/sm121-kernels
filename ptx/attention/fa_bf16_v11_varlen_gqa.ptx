@@ -1,0 +1,1147 @@
+// fa_bf16_v11_varlen_gqa.ptx
+//
+// Flash Attention V11 VARLEN GQA (non-causal): V11 varlen + Grouped Query Attention.
+// 5 warps (160 threads): warps 0-3 = MMA, warp 4 = DMA.
+// Br=64, Bc=64, D=128. Grid: (ceil(max_seqlen_q/64), num_heads_q, batch). Block: (160,1,1).
+//
+// GQA: K/V use num_heads_kv <= num_heads_q heads.
+// head_kv = head_q * H_kv / H_q (integer, requires H_q divisible by H_kv).
+//
+// Memory layout: HEAD-MAJOR varlen — Q,O use [H_q, total_q, D], K/V use [H_kv, total_kv, D].
+//   Q TMA row for (head_q, batch b, q_block q): head_q * total_q + cu_seqlens_q[b] + q*64
+//   K/V TMA row for (batch b, kv_block k): head_kv * total_kv + cu_seqlens_k[b] + k*64
+//
+// All KV blocks are processed (no causal masking).
+//
+// Requires dynamic SMEM (90KB > 48KB default).
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+#include "mma.ptxh"
+#include "reduction.ptxh"
+
+#define BR 64
+#define BC 64
+#define D  128
+#define NUM_MMA_WARPS 4
+#define DMA_WARP_ID   4
+
+// SMEM layout (90224 bytes total, ~88 KB)
+// Each Q/K/V buffer: 16384 bytes = two halves of 8192 bytes each
+// Left half (cols 0-63): offset 0, Right half (cols 64-127): offset 8192
+// Within each half: 64 rows x 64 cols x 2B = 8192 bytes, row stride = 128 bytes
+// With SWIZZLE_128B applied by TMA hardware
+#define SMEM_Q            0                    // 64*128*2 = 16384
+#define SMEM_K0           16384                // 64*128*2 = 16384
+#define SMEM_K1           32768                // 64*128*2 = 16384
+#define SMEM_V0           49152                // 64*128*2 = 16384
+#define SMEM_V1           65536                // 64*128*2 = 16384
+#define SMEM_P            81920                // 64*64*2  = 8192
+#define SMEM_MBAR_Q       90112                // 16 bytes
+#define SMEM_MBAR_K0      90128                // 16 bytes
+#define SMEM_MBAR_K1      90144                // 16 bytes  (= MBAR_K0 + 16)
+#define SMEM_MBAR_V0      90160                // 16 bytes
+#define SMEM_MBAR_V1      90176                // 16 bytes  (= MBAR_V0 + 16)
+#define SMEM_MBAR_DONE0   90192                // 16 bytes
+#define SMEM_MBAR_DONE1   90208                // 16 bytes  (= MBAR_DONE0 + 16)
+#define SMEM_TOTAL        90224
+
+// Half offsets within each tile buffer
+#define HALF_SIZE 8192
+
+// Dynamic shared memory (>48KB requires cuFuncSetAttribute)
+.extern .shared .align 128 .b8 smem[];
+
+.visible .entry flash_attn_bf16_v11_varlen_gqa(
+    .param .u64 param_Q_tma_ptr,          // TMA descriptor for Q [H_q * total_q, D]
+    .param .u64 param_K_tma_ptr,          // TMA descriptor for K [H_kv * total_kv, D]
+    .param .u64 param_V_tma_ptr,          // TMA descriptor for V [H_kv * total_kv, D]
+    .param .u64 param_O,                  // Output [H_q, total_q, D] row-major bf16
+    .param .u64 param_cu_seqlens_q,       // [batch+1] u32 cumulative Q seq lengths
+    .param .u64 param_cu_seqlens_k,       // [batch+1] u32 cumulative KV seq lengths
+    .param .u32 param_total_q,            // total Q tokens (= cu_seqlens_q[batch])
+    .param .u32 param_total_kv,           // total KV tokens (= cu_seqlens_k[batch])
+    .param .u32 param_num_heads_q,        // H_q (number of Q heads)
+    .param .u32 param_num_heads_kv,       // H_kv (number of KV heads, <= H_q)
+    .param .f32 param_scale
+)
+{
+    .reg .b32  %r<220>;
+    .reg .b64  %rd<38>;
+    .reg .f32  %f<200>;
+    .reg .b16  %h<8>;
+    .reg .pred %p<21>;
+
+    mov.u32         %r0, %tid.x;
+    shr.b32         %r1, %r0, 5;             // warp_id
+    and.b32         %r2, %r0, 31;            // lane
+
+    mov.u32         %r3, %ctaid.x;           // q_block
+    mov.u32         %r4, %ctaid.y;           // head
+    mov.u32         %r5, %ctaid.z;           // batch
+
+    ld.param.f32    %f196, [param_scale];
+
+    // Thread 0: init 7 mbarriers
+    setp.eq.u32     %p0, %r0, 0;
+    @%p0 mbarrier.init.shared.b64 [smem + SMEM_MBAR_Q], 1;
+    @%p0 mbarrier.init.shared.b64 [smem + SMEM_MBAR_K0], 1;
+    @%p0 mbarrier.init.shared.b64 [smem + SMEM_MBAR_K1], 1;
+    @%p0 mbarrier.init.shared.b64 [smem + SMEM_MBAR_V0], 1;
+    @%p0 mbarrier.init.shared.b64 [smem + SMEM_MBAR_V1], 1;
+    @%p0 mbarrier.init.shared.b64 [smem + SMEM_MBAR_DONE0], NUM_MMA_WARPS;
+    @%p0 mbarrier.init.shared.b64 [smem + SMEM_MBAR_DONE1], NUM_MMA_WARPS;
+    fence.mbarrier_init.release.cluster;
+    bar.sync 0;
+
+    // Load cu_seqlens for this batch element (all threads do the same loads)
+    ld.param.u64    %rd32, [param_cu_seqlens_q];
+    ld.param.u64    %rd33, [param_cu_seqlens_k];
+    ld.param.u32    %r205, [param_total_q];
+    ld.param.u32    %r206, [param_total_kv];
+
+    cvt.u64.u32     %rd34, %r5;              // batch_idx as u64
+    shl.b64         %rd34, %rd34, 2;         // * 4 bytes (u32 elements)
+    add.u64         %rd35, %rd32, %rd34;     // &cu_seqlens_q[batch]
+    ld.global.u32   %r207, [%rd35];          // cu_q_start
+    ld.global.u32   %r208, [%rd35 + 4];      // cu_q_end
+    add.u64         %rd36, %rd33, %rd34;     // &cu_seqlens_k[batch]
+    ld.global.u32   %r209, [%rd36];          // cu_k_start
+    ld.global.u32   %r210, [%rd36 + 4];      // cu_k_end
+
+    sub.u32         %r6, %r208, %r207;       // seq_q = cu_q_end - cu_q_start
+    sub.u32         %r7, %r210, %r209;       // seq_kv = cu_k_end - cu_k_start
+
+    // Early exit: if this q_block is beyond this sequence's length
+    shl.b32         %r11, %r3, 6;            // q_block * 64
+    setp.ge.u32     %p20, %r11, %r6;
+    @%p20 bra       early_exit;
+
+    // Head-major varlen row offsets (GQA):
+    //   Q TMA row: head_q * total_q + cu_q_start + q_block * 64
+    //   KV TMA row base: head_kv * total_kv + cu_k_start  (head_kv = head_q * H_kv / H_q)
+    mul.lo.u32      %r211, %r4, %r205;       // head_q * total_q
+    add.u32         %r10, %r211, %r207;      // + cu_q_start
+    add.u32         %r10, %r10, %r11;        // + q_block * 64 = Q TMA row
+    ld.param.u32    %r215, [param_num_heads_q];
+    ld.param.u32    %r216, [param_num_heads_kv];
+    mul.lo.u32      %r217, %r4, %r216;       // head_q * H_kv
+    div.u32         %r218, %r217, %r215;     // / H_q = head_kv
+    mul.lo.u32      %r212, %r218, %r206;     // head_kv * total_kv
+    add.u32         %r12, %r212, %r209;      // + cu_k_start = KV base row
+
+    // TMA descriptors
+    ld.param.u64    %rd0, [param_Q_tma_ptr];
+    ld.param.u64    %rd1, [param_K_tma_ptr];
+    ld.param.u64    %rd2, [param_V_tma_ptr];
+
+    // Branch: warp 4 = DMA, warps 0-3 = MMA
+    setp.eq.u32     %p1, %r1, DMA_WARP_ID;
+    @%p1 bra        dma_path;
+
+    // ================================================================
+    // MMA WARP PATH (warps 0-3)
+    // ================================================================
+
+    // Compute MMA thread decomposition
+    shr.b32         %r13, %r2, 2;            // groupID = lane / 4
+    and.b32         %r14, %r2, 3;            // tidInGroup = lane % 4
+
+    // Wait Q
+mma_wait_q:
+    mbarrier.try_wait.parity.shared.b64 %p2, [smem + SMEM_MBAR_Q], 0;
+    @!%p2 bra mma_wait_q;
+
+    // ================================================================
+    // Load Q from swizzled SMEM
+    // ================================================================
+    // Q layout: two halves at SMEM_Q+0 (cols 0-63) and SMEM_Q+8192 (cols 64-127)
+    // Each half: 64 rows, 64 cols, row_stride=128B, swizzled with (row&7)<<4
+    //
+    // Q A-operand for m16n8k16: each warp owns 16 rows, need 8 kc groups
+    // kc 0-3 from left half, kc 4-7 from right half
+    //
+    // ldmatrix.m8n8.x2: loads 2 consecutive 8x8 matrices (32 bytes)
+    // Row = lane<16 ? lane : lane-16
+    // half_pair = lane<16 ? 0 : 1 (offset 0 or 16 bytes)
+    //
+    // For kc_in_half (0-3):
+    //   byte_in_row = kc_in_half * 32 + half_pair * 16
+    //   swizzled = byte_in_row XOR ((row & 7) * 16)
+    //   addr = Q_half_base + warp_id*2048 + row*128 + swizzled
+    //
+    // Precompute: row, xor_val, warp Q base for each half
+
+    setp.lt.u32     %p3, %r2, 16;
+    @%p3 mov.u32    %r20, %r2;               // row = lane (for lane<16)
+    @!%p3 sub.u32   %r20, %r2, 16;           // row = lane-16 (for lane>=16)
+
+    // half_pair: 0 for lane<16, 16 for lane>=16
+    @%p3 mov.u32    %r22, 0;
+    @!%p3 mov.u32   %r22, 16;
+
+    // Swizzle XOR value for Q: (row & 7) * 16
+    and.b32         %r160, %r20, 7;           // row & 7
+    shl.b32         %r161, %r160, 4;          // (row & 7) * 16
+
+    // Row offset within half = row * 128
+    shl.b32         %r21, %r20, 7;            // row * 128
+
+    // Q left half base per warp
+    mov.u32         %r23, smem;
+    mul.lo.u32      %r26, %r1, 2048;         // warp_id * 16rows * 128B
+    add.u32         %r162, %r23, SMEM_Q;
+    add.u32         %r162, %r162, %r26;       // Q_left_base + warp_offset
+    add.u32         %r162, %r162, %r21;       // + row * 128
+
+    // Q right half base per warp (+ HALF_SIZE)
+    add.u32         %r163, %r162, HALF_SIZE;
+
+    // ================================================================
+    // Load Q from swizzled SMEM using ldmatrix.x4
+    // ================================================================
+    // Q layout: two halves at SMEM_Q+0 (cols 0-63) and SMEM_Q+8192 (cols 64-127)
+    // Each half: 64 rows, row_stride=128B, swizzled with (row&7)<<4
+    //
+    // ldmatrix.x4 works with swizzle because each thread provides its own address
+    // and reads 16B independently. SWIZZLE_128B XOR has 16B granularity, so
+    // 16B-aligned reads at swizzled offsets get the correct logical data.
+    //
+    // For kc_in_half i (0-3): byte = i*32 + half_pair
+    // swizzled = byte XOR ((row&7)*16)
+    // addr = half_base + warp*2048 + row*128 + swizzled
+    // kc 0-3 from left half, kc 4-7 from right half
+
+    // kc=0 (kc_in_half=0, left): byte = 0 + half_pair
+    xor.b32         %r24, %r22, %r161;       // half_pair XOR swizzle
+    add.u32         %r24, %r162, %r24;        // left_base + row*128 + swizzled
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r30, %r31, %r32, %r33}, [%r24];
+
+    // kc=1 (kc_in_half=1, left): byte = 32 + half_pair
+    mov.u32         %r25, 32;
+    add.u32         %r25, %r25, %r22;
+    xor.b32         %r25, %r25, %r161;
+    add.u32         %r25, %r162, %r25;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r34, %r35, %r36, %r37}, [%r25];
+
+    // kc=2 (kc_in_half=2, left): byte = 64 + half_pair
+    mov.u32         %r25, 64;
+    add.u32         %r25, %r25, %r22;
+    xor.b32         %r25, %r25, %r161;
+    add.u32         %r25, %r162, %r25;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r38, %r39, %r40, %r41}, [%r25];
+
+    // kc=3 (kc_in_half=3, left): byte = 96 + half_pair
+    mov.u32         %r25, 96;
+    add.u32         %r25, %r25, %r22;
+    xor.b32         %r25, %r25, %r161;
+    add.u32         %r25, %r162, %r25;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r42, %r43, %r44, %r45}, [%r25];
+
+    // kc=4 (kc_in_half=0, right): byte = 0 + half_pair, from right half
+    xor.b32         %r25, %r22, %r161;
+    add.u32         %r25, %r163, %r25;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r46, %r47, %r48, %r49}, [%r25];
+
+    // kc=5 (kc_in_half=1, right): byte = 32 + half_pair
+    mov.u32         %r25, 32;
+    add.u32         %r25, %r25, %r22;
+    xor.b32         %r25, %r25, %r161;
+    add.u32         %r25, %r163, %r25;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r50, %r51, %r52, %r53}, [%r25];
+
+    // kc=6 (kc_in_half=2, right): byte = 64 + half_pair
+    mov.u32         %r25, 64;
+    add.u32         %r25, %r25, %r22;
+    xor.b32         %r25, %r25, %r161;
+    add.u32         %r25, %r163, %r25;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r54, %r55, %r56, %r57}, [%r25];
+
+    // kc=7 (kc_in_half=3, right): byte = 96 + half_pair
+    mov.u32         %r25, 96;
+    add.u32         %r25, %r25, %r22;
+    xor.b32         %r25, %r25, %r161;
+    add.u32         %r25, %r163, %r25;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r58, %r59, %r60, %r61}, [%r25];
+
+    // Q regs: kc0={30,31,32,33}, kc1={34,35,36,37}, kc2={38,39,40,41}, kc3={42,43,44,45}
+    //          kc4={46,47,48,49}, kc5={50,51,52,53}, kc6={54,55,56,57}, kc7={58,59,60,61}
+
+    // ================================================================
+    // Initialize O accumulators and softmax state
+    // ================================================================
+    mov.f32 %f0, 0.0;   mov.f32 %f1, 0.0;   mov.f32 %f2, 0.0;   mov.f32 %f3, 0.0;
+    mov.f32 %f4, 0.0;   mov.f32 %f5, 0.0;   mov.f32 %f6, 0.0;   mov.f32 %f7, 0.0;
+    mov.f32 %f8, 0.0;   mov.f32 %f9, 0.0;   mov.f32 %f10, 0.0;  mov.f32 %f11, 0.0;
+    mov.f32 %f12, 0.0;  mov.f32 %f13, 0.0;  mov.f32 %f14, 0.0;  mov.f32 %f15, 0.0;
+    mov.f32 %f16, 0.0;  mov.f32 %f17, 0.0;  mov.f32 %f18, 0.0;  mov.f32 %f19, 0.0;
+    mov.f32 %f20, 0.0;  mov.f32 %f21, 0.0;  mov.f32 %f22, 0.0;  mov.f32 %f23, 0.0;
+    mov.f32 %f24, 0.0;  mov.f32 %f25, 0.0;  mov.f32 %f26, 0.0;  mov.f32 %f27, 0.0;
+    mov.f32 %f28, 0.0;  mov.f32 %f29, 0.0;  mov.f32 %f30, 0.0;  mov.f32 %f31, 0.0;
+    mov.f32 %f32, 0.0;  mov.f32 %f33, 0.0;  mov.f32 %f34, 0.0;  mov.f32 %f35, 0.0;
+    mov.f32 %f36, 0.0;  mov.f32 %f37, 0.0;  mov.f32 %f38, 0.0;  mov.f32 %f39, 0.0;
+    mov.f32 %f40, 0.0;  mov.f32 %f41, 0.0;  mov.f32 %f42, 0.0;  mov.f32 %f43, 0.0;
+    mov.f32 %f44, 0.0;  mov.f32 %f45, 0.0;  mov.f32 %f46, 0.0;  mov.f32 %f47, 0.0;
+    mov.f32 %f48, 0.0;  mov.f32 %f49, 0.0;  mov.f32 %f50, 0.0;  mov.f32 %f51, 0.0;
+    mov.f32 %f52, 0.0;  mov.f32 %f53, 0.0;  mov.f32 %f54, 0.0;  mov.f32 %f55, 0.0;
+    mov.f32 %f56, 0.0;  mov.f32 %f57, 0.0;  mov.f32 %f58, 0.0;  mov.f32 %f59, 0.0;
+    mov.f32 %f60, 0.0;  mov.f32 %f61, 0.0;  mov.f32 %f62, 0.0;  mov.f32 %f63, 0.0;
+
+    mov.b32         %f192, 0xff800000;        // row_max[0] = -inf
+    mov.b32         %f193, 0xff800000;        // row_max[1] = -inf
+    mov.f32         %f194, 0.0;               // row_sum[0] = 0
+    mov.f32         %f195, 0.0;               // row_sum[1] = 0
+
+    // Precompute K ldmatrix offsets (B-operand for QK GEMM)
+    // B-operand m16n8k16: ldmatrix.x2 with:
+    //   threads 0-7: mat0 rows 0-7
+    //   threads 8-15: mat1 rows 0-7
+    //   Others: don't provide unique addrs (x2 only uses 16 threads)
+    // sub_lane = lane % 8, half = (lane/8) % 2
+    // K row = ng*8 + sub_lane (ng = which 8-row group in Bc=64)
+    // K byte_in_row = kc_in_half * 32 + half * 16
+    // K swizzled = byte_in_row XOR ((sub_lane & 7) * 16)
+    //            = byte_in_row XOR (sub_lane * 16) since sub_lane < 8
+    // K addr = K_half_base + K_row * 128 + swizzled
+
+    and.b32         %r71, %r2, 7;             // sub_lane = lane % 8
+    shr.b32         %r72, %r2, 3;
+    and.b32         %r72, %r72, 1;            // half = (lane/8) % 2
+    shl.b32         %r74, %r72, 4;            // half * 16
+
+    // K swizzle XOR for this lane: sub_lane * 16
+    shl.b32         %r164, %r71, 4;           // %r164 = (lane%8) * 16
+
+    // K row offset within half: sub_lane * 128
+    shl.b32         %r73, %r71, 7;            // sub_lane * 128
+
+    // Precompute V ldmatrix lane offset
+    // V B-operand uses ldmatrix.x2.trans: row = lane % 16
+    // V row offset = (lane%16) * 128
+    and.b32         %r130, %r2, 15;           // lane % 16
+    shl.b32         %r131, %r130, 7;          // (lane%16) * 128
+
+    // V swizzle XOR: (lane%8) * 16 = %r164 (same as K)
+    // (lane%16) & 7 = lane%8 for lanes 0-7 and 8-15, so reuse %r164
+
+    // P store addresses (MMA C-operand layout)
+    // P has 64 cols = 128 bytes per row, fits in one 128B swizzle segment.
+    // P is stored WITHOUT swizzle (written via STS, not TMA).
+    // But we need to swizzle P manually for bank-conflict-free ldmatrix reads.
+    //
+    // P store: row = groupID (0-7) or groupID+8
+    // col_byte = ng*16 + tidInGroup*4  (each store is 4 bytes = 2 bf16)
+    // P row stride = 128 bytes
+    // swizzled_byte = col_byte XOR ((row & 7) * 16)
+    //
+    // P base per warp: SMEM_P + warp_id * 16 * 128 = SMEM_P + warp_id * 2048
+    mul.lo.u32      %r140, %r1, 2048;        // warp_id * 2048
+    add.u32         %r115, %r23, SMEM_P;
+    add.u32         %r115, %r115, %r140;      // P base for this warp
+
+    // P store row0 = groupID, row1 = groupID + 8
+    // P row0 offset = groupID * 128, P row1 offset = (groupID+8) * 128
+    mul.lo.u32      %r116, %r13, 128;        // groupID * 128
+    shl.b32         %r117, %r14, 2;           // tidInGroup * 4
+
+    // P store XOR for row0: (groupID & 7) * 16 = groupID * 16 (since groupID < 8)
+    shl.b32         %r165, %r13, 4;           // groupID * 16
+
+    // P store XOR for row1: ((groupID+8) & 7) * 16 = groupID * 16 (same!)
+    // So %r165 works for both rows.
+
+    // P store addr for row0: base + row0*128 + (tidInGroup*4 XOR groupID*16)
+    // We'll compute per-ng in the macro, but the tidInGroup*4 part:
+    // For ng=0: col_byte = 0*16 + tidInGroup*4 = tidInGroup*4
+    // swizzled = tidInGroup*4 XOR groupID*16
+
+    // Pre-compute base + row_offset for the two rows
+    add.u32         %r111, %r115, %r116;      // P_base + groupID*128
+    add.u32         %r112, %r111, 1024;       // P_base + (groupID+8)*128
+
+    // P ldmatrix addresses (A-operand for PV GEMM)
+    // Same as Q: ldmatrix.x4 with swizzle-aware addressing
+    // P layout: 16 rows x 64 cols x 2B per warp, row stride = 128B
+    // row = lane<16 ? lane : lane-16 (reuse %r20 and %p3)
+    // half_pair = lane<16 ? 0 : 16 (reuse %r22)
+    // For kp_in_half i: byte = i*32 + half_pair
+    // swizzled = byte XOR ((row&7)*16) = byte XOR %r161
+    // P addr = P_warp_base + row*128 + swizzled
+
+    // P base per lane (row part)
+    @%p3 mul.lo.u32 %r118, %r2, 128;         // row * 128 (lane < 16)
+    @!%p3 sub.u32   %r118, %r2, 16;
+    @!%p3 mul.lo.u32 %r118, %r118, 128;      // (lane-16) * 128
+    add.u32         %r119, %r115, %r118;      // P_warp_base + row*128
+
+    // ================================================================
+    // KV BLOCK LOOP — double-buffered
+    // ================================================================
+    add.u32         %r120, %r7, 63;
+    shr.b32         %r120, %r120, 6;          // num_kv_blocks
+
+    mov.u32         %r121, 0;                 // kv_block = 0
+    mov.u32         %r150, 0;                 // stage = 0
+    mov.u32         %r151, 0;                 // k0_phase = 0
+    mov.u32         %r152, 0;                 // k1_phase = 0
+    mov.u32         %r153, 0;                 // v0_phase = 0
+    mov.u32         %r154, 0;                 // v1_phase = 0
+
+    // V11: precompute scale_log2e = scale * LOG2E for fused softmax
+    // %f199 = scale * LOG2E; used in FMA instead of LOG2E (eliminates 32 FMUL per iter)
+    mul.f32         %f199, %f196, LOG2E;       // scale_log2e = scale * LOG2E
+
+kv_loop:
+    setp.ge.u32     %p7, %r121, %r120;
+    @%p7 bra        kv_done;
+
+    // ---- Compute K ldmatrix base for this stage ----
+    // K is stored as two halves: left (cols 0-63) at K_base+0, right (cols 64-127) at K_base+8192
+    // K_half_base = smem + SMEM_K0 + stage*16384
+    // K_addr = K_half_base + (ng*8 + sub_lane)*128 + swizzled_byte
+    // For kc_in_half i: byte = i*32 + half*16, swizzled = byte XOR (sub_lane*16)
+
+    mul.lo.u32      %r170, %r150, 16384;      // stage * 16384
+    add.u32         %r75, %r23, SMEM_K0;
+    add.u32         %r75, %r75, %r170;        // K left half base
+
+    // K addr for ng=0, kc_in_half=0:
+    // byte = 0*32 + half*16 = half*16
+    // swizzled = half*16 XOR sub_lane*16 = (half XOR sub_lane) * 16
+    // addr = K_left_base + sub_lane*128 + swizzled
+    xor.b32         %r166, %r74, %r164;       // (half*16) XOR (sub_lane*16)
+    add.u32         %r75, %r75, %r73;         // + sub_lane*128
+    add.u32         %r75, %r75, %r166;        // + swizzled byte
+
+    // K right half base (add HALF_SIZE to left base, keep sub_lane and swizzle offsets)
+    // Actually, we'll compute the right-half version when needed (kc 4-7)
+
+    // ---- Compute K mbar addr and select K wait phase ----
+    mul.lo.u32      %r171, %r150, 16;         // stage * 16
+    add.u32         %r157, %r23, SMEM_MBAR_K0;
+    add.u32         %r157, %r157, %r171;      // K mbar = MBAR_K0 + stage*16
+    setp.eq.u32     %p14, %r150, 0;
+    selp.u32        %r155, %r151, %r152, %p14;  // k_phase = k0 or k1
+
+    // Wait K
+mma_wait_k:
+    mbarrier.try_wait.parity.shared.b64 %p4, [%r157], %r155;
+    @!%p4 bra mma_wait_k;
+
+    // Zero S accumulators
+    mov.f32 %f64, 0.0;  mov.f32 %f65, 0.0;  mov.f32 %f66, 0.0;  mov.f32 %f67, 0.0;
+    mov.f32 %f68, 0.0;  mov.f32 %f69, 0.0;  mov.f32 %f70, 0.0;  mov.f32 %f71, 0.0;
+    mov.f32 %f72, 0.0;  mov.f32 %f73, 0.0;  mov.f32 %f74, 0.0;  mov.f32 %f75, 0.0;
+    mov.f32 %f76, 0.0;  mov.f32 %f77, 0.0;  mov.f32 %f78, 0.0;  mov.f32 %f79, 0.0;
+    mov.f32 %f80, 0.0;  mov.f32 %f81, 0.0;  mov.f32 %f82, 0.0;  mov.f32 %f83, 0.0;
+    mov.f32 %f84, 0.0;  mov.f32 %f85, 0.0;  mov.f32 %f86, 0.0;  mov.f32 %f87, 0.0;
+    mov.f32 %f88, 0.0;  mov.f32 %f89, 0.0;  mov.f32 %f90, 0.0;  mov.f32 %f91, 0.0;
+    mov.f32 %f92, 0.0;  mov.f32 %f93, 0.0;  mov.f32 %f94, 0.0;  mov.f32 %f95, 0.0;
+
+    // ================================================================
+    // QK GEMM with swizzled K
+    // ================================================================
+    // K B-operand: ldmatrix.x2
+    // For ng group (0-7), stepping by 8 rows = 8*128 = 1024 bytes
+    // kc 0-3 from left half, kc 4-7 from right half
+    //
+    // K addr for ng=0, kc_in_half=0 is in %r75 (computed above)
+    // Between kc_in_half: need to recompute swizzled byte offset
+    //   kc_in_half i: byte = i*32 + half*16
+    //   swizzled = byte XOR (sub_lane*16)
+    //
+    // Between ng: step = 8 * 128 = 1024 bytes (row offset changes, but
+    //   swizzle XOR also depends on row: new_row = ng*8 + sub_lane
+    //   XOR val = ((ng*8 + sub_lane) & 7) * 16 = (sub_lane & 7) * 16
+    //   since ng*8 & 7 = 0. So XOR is the SAME for all ng!
+    //   Therefore, stepping between ng groups = just add 1024 to base.
+
+    // QK_NG8 macro: 8 ng groups per kc, stepping by 1024 (was 2048 in V8)
+    #define QK_NG8(q0,q1,q2,q3, kb) \
+        ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%r100, %r101}, [kb]; \
+        MMA_BF16_M16N8K16(%f64,%f65,%f66,%f67, q0,q1,q2,q3, %r100,%r101) \
+        add.u32 %r82, kb, 1024; \
+        ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%r100, %r101}, [%r82]; \
+        MMA_BF16_M16N8K16(%f68,%f69,%f70,%f71, q0,q1,q2,q3, %r100,%r101) \
+        add.u32 %r82, %r82, 1024; \
+        ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%r100, %r101}, [%r82]; \
+        MMA_BF16_M16N8K16(%f72,%f73,%f74,%f75, q0,q1,q2,q3, %r100,%r101) \
+        add.u32 %r82, %r82, 1024; \
+        ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%r100, %r101}, [%r82]; \
+        MMA_BF16_M16N8K16(%f76,%f77,%f78,%f79, q0,q1,q2,q3, %r100,%r101) \
+        add.u32 %r82, %r82, 1024; \
+        ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%r100, %r101}, [%r82]; \
+        MMA_BF16_M16N8K16(%f80,%f81,%f82,%f83, q0,q1,q2,q3, %r100,%r101) \
+        add.u32 %r82, %r82, 1024; \
+        ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%r100, %r101}, [%r82]; \
+        MMA_BF16_M16N8K16(%f84,%f85,%f86,%f87, q0,q1,q2,q3, %r100,%r101) \
+        add.u32 %r82, %r82, 1024; \
+        ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%r100, %r101}, [%r82]; \
+        MMA_BF16_M16N8K16(%f88,%f89,%f90,%f91, q0,q1,q2,q3, %r100,%r101) \
+        add.u32 %r82, %r82, 1024; \
+        ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%r100, %r101}, [%r82]; \
+        MMA_BF16_M16N8K16(%f92,%f93,%f94,%f95, q0,q1,q2,q3, %r100,%r101)
+
+    // kc=0 (kc_in_half=0, left half): addr already in %r75
+    QK_NG8(%r30,%r31,%r32,%r33, %r75)
+
+    // kc=1 (kc_in_half=1, left): byte = 32 + half*16 → swizzled = (32+half*16) XOR (sub_lane*16)
+    // Compute K addr for kc_in_half=1: need to recompute swizzled byte
+    // K_left_base + sub_lane*128 is in %r75 - %r166 (we need to subtract old swizzle and add new)
+    // Actually, let's recompute from K base components.
+    // K_left_base (without per-lane offsets) = %r23 + SMEM_K0 + stage*16384 = (%r75 - %r73 - %r166)
+    // Let's save K_left_base + sub_lane*128:
+    sub.u32         %r167, %r75, %r166;       // K_left_base + sub_lane*128
+
+    // kc_in_half=1: byte = 32 + half*16
+    mov.u32         %r76, 32;
+    add.u32         %r76, %r76, %r74;         // 32 + half*16
+    xor.b32         %r76, %r76, %r164;        // XOR with sub_lane*16
+    add.u32         %r76, %r167, %r76;        // full addr
+    QK_NG8(%r34,%r35,%r36,%r37, %r76)
+
+    // kc_in_half=2: byte = 64 + half*16
+    mov.u32         %r76, 64;
+    add.u32         %r76, %r76, %r74;
+    xor.b32         %r76, %r76, %r164;
+    add.u32         %r76, %r167, %r76;
+    QK_NG8(%r38,%r39,%r40,%r41, %r76)
+
+    // kc_in_half=3: byte = 96 + half*16
+    mov.u32         %r76, 96;
+    add.u32         %r76, %r76, %r74;
+    xor.b32         %r76, %r76, %r164;
+    add.u32         %r76, %r167, %r76;
+    QK_NG8(%r42,%r43,%r44,%r45, %r76)
+
+    // kc=4..7: right half = K_left_base + HALF_SIZE + sub_lane*128
+    add.u32         %r168, %r167, HALF_SIZE;  // K_right_base + sub_lane*128
+
+    // kc_in_half=0 (kc=4): byte = 0 + half*16
+    xor.b32         %r76, %r74, %r164;
+    add.u32         %r76, %r168, %r76;
+    QK_NG8(%r46,%r47,%r48,%r49, %r76)
+
+    // kc_in_half=1 (kc=5): byte = 32 + half*16
+    mov.u32         %r76, 32;
+    add.u32         %r76, %r76, %r74;
+    xor.b32         %r76, %r76, %r164;
+    add.u32         %r76, %r168, %r76;
+    QK_NG8(%r50,%r51,%r52,%r53, %r76)
+
+    // kc_in_half=2 (kc=6): byte = 64 + half*16
+    mov.u32         %r76, 64;
+    add.u32         %r76, %r76, %r74;
+    xor.b32         %r76, %r76, %r164;
+    add.u32         %r76, %r168, %r76;
+    QK_NG8(%r54,%r55,%r56,%r57, %r76)
+
+    // kc_in_half=3 (kc=7): byte = 96 + half*16
+    mov.u32         %r76, 96;
+    add.u32         %r76, %r76, %r74;
+    xor.b32         %r76, %r76, %r164;
+    add.u32         %r76, %r168, %r76;
+    QK_NG8(%r58,%r59,%r60,%r61, %r76)
+
+    // V11: scale is fused into the softmax FMA (fma(S_unscaled, scale_log2e, neg_max*LOG2E))
+    // No explicit S *= scale needed here.
+
+    // ================================================================
+    // Online softmax
+    // ================================================================
+    mov.f32         %f96, %f64;
+    max.f32         %f96, %f96, %f65;
+    max.f32         %f96, %f96, %f68;  max.f32         %f96, %f96, %f69;
+    max.f32         %f96, %f96, %f72;  max.f32         %f96, %f96, %f73;
+    max.f32         %f96, %f96, %f76;  max.f32         %f96, %f96, %f77;
+    max.f32         %f96, %f96, %f80;  max.f32         %f96, %f96, %f81;
+    max.f32         %f96, %f96, %f84;  max.f32         %f96, %f96, %f85;
+    max.f32         %f96, %f96, %f88;  max.f32         %f96, %f96, %f89;
+    max.f32         %f96, %f96, %f92;  max.f32         %f96, %f96, %f93;
+
+    mov.f32         %f97, %f66;
+    max.f32         %f97, %f97, %f67;
+    max.f32         %f97, %f97, %f70;  max.f32         %f97, %f97, %f71;
+    max.f32         %f97, %f97, %f74;  max.f32         %f97, %f97, %f75;
+    max.f32         %f97, %f97, %f78;  max.f32         %f97, %f97, %f79;
+    max.f32         %f97, %f97, %f82;  max.f32         %f97, %f97, %f83;
+    max.f32         %f97, %f97, %f86;  max.f32         %f97, %f97, %f87;
+    max.f32         %f97, %f97, %f90;  max.f32         %f97, %f97, %f91;
+    max.f32         %f97, %f97, %f94;  max.f32         %f97, %f97, %f95;
+
+    GROUP4_REDUCE_MAX_F32(%f96, %f98)
+    GROUP4_REDUCE_MAX_F32(%f97, %f98)
+
+    // V11: scale the unscaled max values → scaled maxima (2 FMUL instead of 32)
+    // row_max stored as max_unscaled*scale throughout; compare against scaled old_max
+    mul.f32         %f96, %f96, %f196;         // new_max0_scaled = max_of_S_row0 * scale
+    mul.f32         %f97, %f97, %f196;         // new_max1_scaled = max_of_S_row1 * scale
+
+    max.f32         %f99, %f192, %f96;
+    max.f32         %f100, %f193, %f97;
+
+    // NaN guard
+    mov.b32 %f98, 0xff800000; setp.eq.f32 %p10, %f99, %f98;
+    @%p10 mov.f32   %f99, 0f00000000;
+    mov.b32 %f98, 0xff800000; setp.eq.f32 %p10, %f100, %f98;
+    @%p10 mov.f32   %f100, 0f00000000;
+
+    // Correction factors: exp(old_max - new_max), always <= 0, clamp for ptxas
+    sub.f32         %f101, %f192, %f99;
+    mul.f32         %f101, %f101, LOG2E;
+    max.f32         %f101, %f101, 0fC2FA0000;
+    ex2.approx.ftz.f32  %f101, %f101;
+    sub.f32         %f102, %f193, %f100;
+    mul.f32         %f102, %f102, LOG2E;
+    max.f32         %f102, %f102, 0fC2FA0000;
+    ex2.approx.ftz.f32  %f102, %f102;
+
+    // Rescale O accumulators
+    mul.f32 %f0, %f0, %f101;    mul.f32 %f1, %f1, %f101;
+    mul.f32 %f2, %f2, %f102;    mul.f32 %f3, %f3, %f102;
+    mul.f32 %f4, %f4, %f101;    mul.f32 %f5, %f5, %f101;
+    mul.f32 %f6, %f6, %f102;    mul.f32 %f7, %f7, %f102;
+    mul.f32 %f8, %f8, %f101;    mul.f32 %f9, %f9, %f101;
+    mul.f32 %f10, %f10, %f102;  mul.f32 %f11, %f11, %f102;
+    mul.f32 %f12, %f12, %f101;  mul.f32 %f13, %f13, %f101;
+    mul.f32 %f14, %f14, %f102;  mul.f32 %f15, %f15, %f102;
+    mul.f32 %f16, %f16, %f101;  mul.f32 %f17, %f17, %f101;
+    mul.f32 %f18, %f18, %f102;  mul.f32 %f19, %f19, %f102;
+    mul.f32 %f20, %f20, %f101;  mul.f32 %f21, %f21, %f101;
+    mul.f32 %f22, %f22, %f102;  mul.f32 %f23, %f23, %f102;
+    mul.f32 %f24, %f24, %f101;  mul.f32 %f25, %f25, %f101;
+    mul.f32 %f26, %f26, %f102;  mul.f32 %f27, %f27, %f102;
+    mul.f32 %f28, %f28, %f101;  mul.f32 %f29, %f29, %f101;
+    mul.f32 %f30, %f30, %f102;  mul.f32 %f31, %f31, %f102;
+    mul.f32 %f32, %f32, %f101;  mul.f32 %f33, %f33, %f101;
+    mul.f32 %f34, %f34, %f102;  mul.f32 %f35, %f35, %f102;
+    mul.f32 %f36, %f36, %f101;  mul.f32 %f37, %f37, %f101;
+    mul.f32 %f38, %f38, %f102;  mul.f32 %f39, %f39, %f102;
+    mul.f32 %f40, %f40, %f101;  mul.f32 %f41, %f41, %f101;
+    mul.f32 %f42, %f42, %f102;  mul.f32 %f43, %f43, %f102;
+    mul.f32 %f44, %f44, %f101;  mul.f32 %f45, %f45, %f101;
+    mul.f32 %f46, %f46, %f102;  mul.f32 %f47, %f47, %f102;
+    mul.f32 %f48, %f48, %f101;  mul.f32 %f49, %f49, %f101;
+    mul.f32 %f50, %f50, %f102;  mul.f32 %f51, %f51, %f102;
+    mul.f32 %f52, %f52, %f101;  mul.f32 %f53, %f53, %f101;
+    mul.f32 %f54, %f54, %f102;  mul.f32 %f55, %f55, %f102;
+    mul.f32 %f56, %f56, %f101;  mul.f32 %f57, %f57, %f101;
+    mul.f32 %f58, %f58, %f102;  mul.f32 %f59, %f59, %f102;
+    mul.f32 %f60, %f60, %f101;  mul.f32 %f61, %f61, %f101;
+    mul.f32 %f62, %f62, %f102;  mul.f32 %f63, %f63, %f102;
+
+    // Rescale row_sum
+    mul.f32         %f194, %f194, %f101;
+    mul.f32         %f195, %f195, %f102;
+
+    // Update running max
+    mov.f32         %f192, %f99;
+    mov.f32         %f193, %f100;
+
+    // ================================================================
+    // Compute P = exp(S - max), accumulate row_sum, store P to SMEM
+    // ================================================================
+    // V11: S values are UNSCALED. Precompute -(new_max_scaled * LOG2E) for FMA.
+    // FMA: exp2(fma(S_unscaled, scale_log2e, -max_scaled*LOG2E))
+    //    = exp2((S_unscaled * scale - max_scaled) * LOG2E)
+    //    = exp(S_scaled - max_scaled)  [correct]
+    // %f99/%f100 are already the SCALED new maxima (set above).
+    mul.f32         %f197, %f99, LOG2E;
+    neg.f32         %f197, %f197;           // %f197 = -(new_max0_scaled * LOG2E)
+    mul.f32         %f198, %f100, LOG2E;
+    neg.f32         %f198, %f198;           // %f198 = -(new_max1_scaled * LOG2E)
+
+    // P store: swizzled addresses
+    // swizzled = (ng XOR groupID)*16 + tidInGroup*4
+
+    // V11: use %f199 (scale_log2e) instead of LOG2E so that unscaled S
+    // gets correctly scaled inside the FMA (eliminates 32 FMUL from above)
+    #define EXP_CLAMP_EX2(s, neg_mx_log2e) \
+        fma.rn.f32 s, s, %f199, neg_mx_log2e;  max.f32 s, s, 0fC2FA0000;  ex2.approx.ftz.f32 s, s;
+
+    // For P store with swizzle: compute (ng XOR groupID)*16 + tidInGroup*4
+    // for each ng, relative to P_row_base (%r111 for row0, %r112 for row1)
+    // groupID = %r13, tidInGroup*4 = %r117
+
+    #define EXP_STORE_NG_SWZ(s0,s1,s2,s3, nmx0, nmx1, paddr0, paddr1, ng_imm) \
+        EXP_CLAMP_EX2(s0, nmx0)  EXP_CLAMP_EX2(s1, nmx0) \
+        EXP_CLAMP_EX2(s2, nmx1)  EXP_CLAMP_EX2(s3, nmx1) \
+        add.f32 %f194, %f194, s0;  add.f32 %f194, %f194, s1; \
+        add.f32 %f195, %f195, s2;  add.f32 %f195, %f195, s3; \
+        cvt.rn.bf16.f32 %h0, s0;  cvt.rn.bf16.f32 %h1, s1; \
+        mov.b32 %r100, {%h0, %h1}; \
+        mov.u32 %r169, ng_imm; \
+        xor.b32 %r169, %r169, %r13; \
+        shl.b32 %r169, %r169, 4; \
+        add.u32 %r169, %r169, %r117; \
+        add.u32 %r82, paddr0, %r169; \
+        st.shared.b32 [%r82], %r100; \
+        cvt.rn.bf16.f32 %h0, s2;  cvt.rn.bf16.f32 %h1, s3; \
+        mov.b32 %r100, {%h0, %h1}; \
+        add.u32 %r82, paddr1, %r169; \
+        st.shared.b32 [%r82], %r100;
+
+    EXP_STORE_NG_SWZ(%f64,%f65,%f66,%f67, %f197, %f198, %r111, %r112, 0)
+    EXP_STORE_NG_SWZ(%f68,%f69,%f70,%f71, %f197, %f198, %r111, %r112, 1)
+    EXP_STORE_NG_SWZ(%f72,%f73,%f74,%f75, %f197, %f198, %r111, %r112, 2)
+    EXP_STORE_NG_SWZ(%f76,%f77,%f78,%f79, %f197, %f198, %r111, %r112, 3)
+    EXP_STORE_NG_SWZ(%f80,%f81,%f82,%f83, %f197, %f198, %r111, %r112, 4)
+    EXP_STORE_NG_SWZ(%f84,%f85,%f86,%f87, %f197, %f198, %r111, %r112, 5)
+    EXP_STORE_NG_SWZ(%f88,%f89,%f90,%f91, %f197, %f198, %r111, %r112, 6)
+    EXP_STORE_NG_SWZ(%f92,%f93,%f94,%f95, %f197, %f198, %r111, %r112, 7)
+
+    // P stores are visible to subsequent loads within the same warp
+    // without a fence (warp-level sequential consistency).
+
+    // ================================================================
+    // Wait for V via mbarrier (per-stage buffer)
+    // ================================================================
+    add.u32         %r158, %r23, SMEM_MBAR_V0;
+    add.u32         %r158, %r158, %r171;      // + stage*16 → MBAR_V0 or MBAR_V1
+    selp.u32        %r156, %r153, %r154, %p14;  // v_phase = v0 or v1
+
+mma_wait_v:
+    mbarrier.try_wait.parity.shared.b64 %p8, [%r158], %r156;
+    @!%p8 bra mma_wait_v;
+
+    // ================================================================
+    // PV GEMM: O += P * V  (16x64) x (64x128) = 16x128
+    // ================================================================
+    // P (A-operand): ldmatrix.x4 from SMEM_P with swizzle
+    // V (B-operand): ldmatrix.x2.trans from swizzled V buffer
+
+    // V base for this stage (left half)
+    add.u32         %r110, %r23, SMEM_V0;
+    add.u32         %r110, %r110, %r170;      // + stage*16384
+    add.u32         %r110, %r110, %r131;      // + (lane%16)*128
+
+    // V right half base
+    add.u32         %r180, %r110, HALF_SIZE;
+
+    // PV_NG16 macro: V B-operand with swizzle
+    // V uses ldmatrix.x2.trans. For each ng (output column group 0-15):
+    //   ng 0-7 from left half, ng 8-15 from right half
+    //   ng_in_half = ng % 8
+    //   V col_byte = ng_in_half * 16
+    //   V swizzled = ng_in_half*16 XOR ((lane%8)*16) = (ng_in_half XOR lane%8)*16
+    //   V addr = V_half_base + (lane%16)*128 + swizzled
+    //
+    // Between kp groups (P's k-dimension, V's row dimension):
+    //   kp steps by 16 rows = 16*128 = 2048 bytes
+    //   row changes but row%8 determines swizzle. For kp*16 rows:
+    //   new_row = kp*16 + lane%16
+    //   new_row % 8 = (kp*16 + lane%16) % 8 = lane%8 (since kp*16 is multiple of 8)
+    //   So swizzle XOR is the same for all kp! kp step = just add 2048.
+
+    #define PV_NG16_SWZ(p0,p1,p2,p3, vlb, vrb) \
+        /* ng=0 (left, ng_in_half=0): (0 XOR lane%8)*16 */ \
+        shl.b32 %r82, %r71, 4; /* lane%8 * 16 (= %r164, but use %r82 temp) */ \
+        add.u32 %r82, vlb, %r82; \
+        ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r82]; \
+        MMA_BF16_M16N8K16(%f0,%f1,%f2,%f3, p0,p1,p2,p3, %r104,%r105) \
+        /* ng=1: (1 XOR lane%8)*16 */ \
+        mov.u32 %r82, 1; xor.b32 %r82, %r82, %r71; shl.b32 %r82, %r82, 4; \
+        add.u32 %r82, vlb, %r82; \
+        ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r82]; \
+        MMA_BF16_M16N8K16(%f4,%f5,%f6,%f7, p0,p1,p2,p3, %r104,%r105) \
+        /* ng=2: (2 XOR lane%8)*16 */ \
+        mov.u32 %r82, 2; xor.b32 %r82, %r82, %r71; shl.b32 %r82, %r82, 4; \
+        add.u32 %r82, vlb, %r82; \
+        ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r82]; \
+        MMA_BF16_M16N8K16(%f8,%f9,%f10,%f11, p0,p1,p2,p3, %r104,%r105) \
+        /* ng=3 */ \
+        mov.u32 %r82, 3; xor.b32 %r82, %r82, %r71; shl.b32 %r82, %r82, 4; \
+        add.u32 %r82, vlb, %r82; \
+        ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r82]; \
+        MMA_BF16_M16N8K16(%f12,%f13,%f14,%f15, p0,p1,p2,p3, %r104,%r105) \
+        /* ng=4 */ \
+        mov.u32 %r82, 4; xor.b32 %r82, %r82, %r71; shl.b32 %r82, %r82, 4; \
+        add.u32 %r82, vlb, %r82; \
+        ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r82]; \
+        MMA_BF16_M16N8K16(%f16,%f17,%f18,%f19, p0,p1,p2,p3, %r104,%r105) \
+        /* ng=5 */ \
+        mov.u32 %r82, 5; xor.b32 %r82, %r82, %r71; shl.b32 %r82, %r82, 4; \
+        add.u32 %r82, vlb, %r82; \
+        ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r82]; \
+        MMA_BF16_M16N8K16(%f20,%f21,%f22,%f23, p0,p1,p2,p3, %r104,%r105) \
+        /* ng=6 */ \
+        mov.u32 %r82, 6; xor.b32 %r82, %r82, %r71; shl.b32 %r82, %r82, 4; \
+        add.u32 %r82, vlb, %r82; \
+        ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r82]; \
+        MMA_BF16_M16N8K16(%f24,%f25,%f26,%f27, p0,p1,p2,p3, %r104,%r105) \
+        /* ng=7 */ \
+        mov.u32 %r82, 7; xor.b32 %r82, %r82, %r71; shl.b32 %r82, %r82, 4; \
+        add.u32 %r82, vlb, %r82; \
+        ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r82]; \
+        MMA_BF16_M16N8K16(%f28,%f29,%f30,%f31, p0,p1,p2,p3, %r104,%r105) \
+        /* ng=8 (right half, ng_in_half=0): (0 XOR lane%8)*16 */ \
+        shl.b32 %r82, %r71, 4; \
+        add.u32 %r82, vrb, %r82; \
+        ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r82]; \
+        MMA_BF16_M16N8K16(%f32,%f33,%f34,%f35, p0,p1,p2,p3, %r104,%r105) \
+        /* ng=9: (1 XOR lane%8)*16 */ \
+        mov.u32 %r82, 1; xor.b32 %r82, %r82, %r71; shl.b32 %r82, %r82, 4; \
+        add.u32 %r82, vrb, %r82; \
+        ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r82]; \
+        MMA_BF16_M16N8K16(%f36,%f37,%f38,%f39, p0,p1,p2,p3, %r104,%r105) \
+        /* ng=10 */ \
+        mov.u32 %r82, 2; xor.b32 %r82, %r82, %r71; shl.b32 %r82, %r82, 4; \
+        add.u32 %r82, vrb, %r82; \
+        ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r82]; \
+        MMA_BF16_M16N8K16(%f40,%f41,%f42,%f43, p0,p1,p2,p3, %r104,%r105) \
+        /* ng=11 */ \
+        mov.u32 %r82, 3; xor.b32 %r82, %r82, %r71; shl.b32 %r82, %r82, 4; \
+        add.u32 %r82, vrb, %r82; \
+        ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r82]; \
+        MMA_BF16_M16N8K16(%f44,%f45,%f46,%f47, p0,p1,p2,p3, %r104,%r105) \
+        /* ng=12 */ \
+        mov.u32 %r82, 4; xor.b32 %r82, %r82, %r71; shl.b32 %r82, %r82, 4; \
+        add.u32 %r82, vrb, %r82; \
+        ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r82]; \
+        MMA_BF16_M16N8K16(%f48,%f49,%f50,%f51, p0,p1,p2,p3, %r104,%r105) \
+        /* ng=13 */ \
+        mov.u32 %r82, 5; xor.b32 %r82, %r82, %r71; shl.b32 %r82, %r82, 4; \
+        add.u32 %r82, vrb, %r82; \
+        ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r82]; \
+        MMA_BF16_M16N8K16(%f52,%f53,%f54,%f55, p0,p1,p2,p3, %r104,%r105) \
+        /* ng=14 */ \
+        mov.u32 %r82, 6; xor.b32 %r82, %r82, %r71; shl.b32 %r82, %r82, 4; \
+        add.u32 %r82, vrb, %r82; \
+        ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r82]; \
+        MMA_BF16_M16N8K16(%f56,%f57,%f58,%f59, p0,p1,p2,p3, %r104,%r105) \
+        /* ng=15 */ \
+        mov.u32 %r82, 7; xor.b32 %r82, %r82, %r71; shl.b32 %r82, %r82, 4; \
+        add.u32 %r82, vrb, %r82; \
+        ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r82]; \
+        MMA_BF16_M16N8K16(%f60,%f61,%f62,%f63, p0,p1,p2,p3, %r104,%r105)
+
+    // P ldmatrix with swizzle: load A-operand from SMEM_P
+    // kp=0: kp_in_half=0, byte = 0 + half_pair, swizzled = half_pair XOR ((row&7)*16)
+    xor.b32         %r83, %r22, %r161;
+    add.u32         %r83, %r119, %r83;        // P_base + row*128 + swizzled(kp=0)
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r106, %r107, %r108, %r109}, [%r83];
+    PV_NG16_SWZ(%r106,%r107,%r108,%r109, %r110, %r180)
+
+    // kp=1: kp_in_half=1, byte = 32 + half_pair
+    mov.u32         %r83, 32;
+    add.u32         %r83, %r83, %r22;
+    xor.b32         %r83, %r83, %r161;
+    add.u32         %r83, %r119, %r83;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r106, %r107, %r108, %r109}, [%r83];
+    add.u32         %r84, %r110, 2048;        // V left + kp*2048
+    add.u32         %r181, %r180, 2048;       // V right + kp*2048
+    PV_NG16_SWZ(%r106,%r107,%r108,%r109, %r84, %r181)
+
+    // kp=2: kp_in_half=2, byte = 64 + half_pair
+    mov.u32         %r83, 64;
+    add.u32         %r83, %r83, %r22;
+    xor.b32         %r83, %r83, %r161;
+    add.u32         %r83, %r119, %r83;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r106, %r107, %r108, %r109}, [%r83];
+    add.u32         %r84, %r110, 4096;
+    add.u32         %r181, %r180, 4096;
+    PV_NG16_SWZ(%r106,%r107,%r108,%r109, %r84, %r181)
+
+    // kp=3: kp_in_half=3, byte = 96 + half_pair
+    mov.u32         %r83, 96;
+    add.u32         %r83, %r83, %r22;
+    xor.b32         %r83, %r83, %r161;
+    add.u32         %r83, %r119, %r83;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r106, %r107, %r108, %r109}, [%r83];
+    add.u32         %r84, %r110, 6144;
+    add.u32         %r181, %r180, 6144;
+    PV_NG16_SWZ(%r106,%r107,%r108,%r109, %r84, %r181)
+
+    // Signal DONE[stage]: each MMA warp's lane 0 arrives
+    add.u32         %r159, %r23, SMEM_MBAR_DONE0;
+    add.u32         %r159, %r159, %r171;      // + stage*16
+    setp.eq.u32     %p13, %r2, 0;
+    @%p13 mbarrier.arrive.shared.b64 _, [%r159];
+
+    // Toggle phases for current stage
+    @%p14 xor.b32   %r151, %r151, 1;         // toggle k0_phase
+    @!%p14 xor.b32  %r152, %r152, 1;         // toggle k1_phase
+    @%p14 xor.b32   %r153, %r153, 1;         // toggle v0_phase
+    @!%p14 xor.b32  %r154, %r154, 1;         // toggle v1_phase
+
+    // Advance KV block and toggle stage
+    add.u32         %r121, %r121, 1;
+    xor.b32         %r150, %r150, 1;
+    bra             kv_loop;
+
+kv_done:
+    // ================================================================
+    // Epilogue: O /= row_sum, convert to bf16, store
+    // ================================================================
+    GROUP4_REDUCE_SUM_F32(%f194, %f98)
+    GROUP4_REDUCE_SUM_F32(%f195, %f98)
+
+    // Clamp zero row_sum to 1.0
+    setp.eq.f32     %p10, %f194, 0f00000000;
+    @%p10 mov.f32   %f194, 0f3f800000;
+    setp.eq.f32     %p10, %f195, 0f00000000;
+    @%p10 mov.f32   %f195, 0f3f800000;
+
+    rcp.approx.f32  %f101, %f194;
+    rcp.approx.f32  %f102, %f195;
+
+    // Normalize O
+    mul.f32 %f0, %f0, %f101;    mul.f32 %f1, %f1, %f101;
+    mul.f32 %f2, %f2, %f102;    mul.f32 %f3, %f3, %f102;
+    mul.f32 %f4, %f4, %f101;    mul.f32 %f5, %f5, %f101;
+    mul.f32 %f6, %f6, %f102;    mul.f32 %f7, %f7, %f102;
+    mul.f32 %f8, %f8, %f101;    mul.f32 %f9, %f9, %f101;
+    mul.f32 %f10, %f10, %f102;  mul.f32 %f11, %f11, %f102;
+    mul.f32 %f12, %f12, %f101;  mul.f32 %f13, %f13, %f101;
+    mul.f32 %f14, %f14, %f102;  mul.f32 %f15, %f15, %f102;
+    mul.f32 %f16, %f16, %f101;  mul.f32 %f17, %f17, %f101;
+    mul.f32 %f18, %f18, %f102;  mul.f32 %f19, %f19, %f102;
+    mul.f32 %f20, %f20, %f101;  mul.f32 %f21, %f21, %f101;
+    mul.f32 %f22, %f22, %f102;  mul.f32 %f23, %f23, %f102;
+    mul.f32 %f24, %f24, %f101;  mul.f32 %f25, %f25, %f101;
+    mul.f32 %f26, %f26, %f102;  mul.f32 %f27, %f27, %f102;
+    mul.f32 %f28, %f28, %f101;  mul.f32 %f29, %f29, %f101;
+    mul.f32 %f30, %f30, %f102;  mul.f32 %f31, %f31, %f102;
+    mul.f32 %f32, %f32, %f101;  mul.f32 %f33, %f33, %f101;
+    mul.f32 %f34, %f34, %f102;  mul.f32 %f35, %f35, %f102;
+    mul.f32 %f36, %f36, %f101;  mul.f32 %f37, %f37, %f101;
+    mul.f32 %f38, %f38, %f102;  mul.f32 %f39, %f39, %f102;
+    mul.f32 %f40, %f40, %f101;  mul.f32 %f41, %f41, %f101;
+    mul.f32 %f42, %f42, %f102;  mul.f32 %f43, %f43, %f102;
+    mul.f32 %f44, %f44, %f101;  mul.f32 %f45, %f45, %f101;
+    mul.f32 %f46, %f46, %f102;  mul.f32 %f47, %f47, %f102;
+    mul.f32 %f48, %f48, %f101;  mul.f32 %f49, %f49, %f101;
+    mul.f32 %f50, %f50, %f102;  mul.f32 %f51, %f51, %f102;
+    mul.f32 %f52, %f52, %f101;  mul.f32 %f53, %f53, %f101;
+    mul.f32 %f54, %f54, %f102;  mul.f32 %f55, %f55, %f102;
+    mul.f32 %f56, %f56, %f101;  mul.f32 %f57, %f57, %f101;
+    mul.f32 %f58, %f58, %f102;  mul.f32 %f59, %f59, %f102;
+    mul.f32 %f60, %f60, %f101;  mul.f32 %f61, %f61, %f101;
+    mul.f32 %f62, %f62, %f102;  mul.f32 %f63, %f63, %f102;
+
+    // ================================================================
+    // Store O to global memory (same as V8 — O is not swizzled)
+    // ================================================================
+    ld.param.u64    %rd3, [param_O];
+
+    mul.lo.u32      %r141, %r1, 16;
+    add.u32         %r124, %r11, %r141;
+    add.u32         %r124, %r124, %r13;
+    add.u32         %r125, %r124, 8;
+
+    setp.lt.u32     %p11, %r124, %r6;
+    setp.lt.u32     %p12, %r125, %r6;
+
+    sub.u32         %r126, %r10, %r11;
+
+    add.u32         %r127, %r126, %r124;
+    mul.lo.u32      %r128, %r127, 256;
+    cvt.u64.u32     %rd4, %r128;
+    add.u64         %rd5, %rd3, %rd4;
+
+    add.u32         %r127, %r126, %r125;
+    mul.lo.u32      %r128, %r127, 256;
+    cvt.u64.u32     %rd4, %r128;
+    add.u64         %rd6, %rd3, %rd4;
+
+    shl.b32         %r129, %r14, 2;
+    cvt.u64.u32     %rd7, %r129;
+
+    #define STORE_NG(f0,f1,f2,f3, col_off) \
+        add.u64 %rd8, %rd5, %rd7; \
+        add.u64 %rd8, %rd8, col_off; \
+        cvt.rn.bf16.f32 %h0, f0;  cvt.rn.bf16.f32 %h1, f1; \
+        mov.b32 %r100, {%h0, %h1}; \
+        @%p11 st.global.b32 [%rd8], %r100; \
+        add.u64 %rd8, %rd6, %rd7; \
+        add.u64 %rd8, %rd8, col_off; \
+        cvt.rn.bf16.f32 %h0, f2;  cvt.rn.bf16.f32 %h1, f3; \
+        mov.b32 %r100, {%h0, %h1}; \
+        @%p12 st.global.b32 [%rd8], %r100;
+
+    STORE_NG(%f0,%f1,%f2,%f3, 0)
+    STORE_NG(%f4,%f5,%f6,%f7, 16)
+    STORE_NG(%f8,%f9,%f10,%f11, 32)
+    STORE_NG(%f12,%f13,%f14,%f15, 48)
+    STORE_NG(%f16,%f17,%f18,%f19, 64)
+    STORE_NG(%f20,%f21,%f22,%f23, 80)
+    STORE_NG(%f24,%f25,%f26,%f27, 96)
+    STORE_NG(%f28,%f29,%f30,%f31, 112)
+    STORE_NG(%f32,%f33,%f34,%f35, 128)
+    STORE_NG(%f36,%f37,%f38,%f39, 144)
+    STORE_NG(%f40,%f41,%f42,%f43, 160)
+    STORE_NG(%f44,%f45,%f46,%f47, 176)
+    STORE_NG(%f48,%f49,%f50,%f51, 192)
+    STORE_NG(%f52,%f53,%f54,%f55, 208)
+    STORE_NG(%f56,%f57,%f58,%f59, 224)
+    STORE_NG(%f60,%f61,%f62,%f63, 240)
+
+    ret;
+
+early_exit:
+    ret;
+
+    // ================================================================
+    // DMA WARP (warp 4): TMA loads Q, K, V with double-buffering
+    // Two TMA loads per tile: left half (coord_x=0) and right half (coord_x=64)
+    // ================================================================
+dma_path:
+    and.b32         %r96, %r0, 31;            // lane within DMA warp
+    setp.eq.u32     %p6, %r96, 0;
+    mov.u32         %r84, smem;
+
+    // Q load: two halves
+    // Left half: coord_x=0, dest=SMEM_Q
+    // Right half: coord_x=64, dest=SMEM_Q+HALF_SIZE
+    add.u32         %r85, %r84, SMEM_MBAR_Q;
+    add.u32         %r86, %r84, SMEM_Q;
+    // expect_tx for both halves: 8192 + 8192 = 16384
+    @%p6 mbarrier.arrive.expect_tx.shared.b64 _, [%r85], (BR * D * 2);
+    mov.u32         %r83, 0;                  // coord_x = 0
+    @%p6 cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
+        [%r86], [%rd0, {%r83, %r10}], [%r85];
+    mov.u32         %r83, 64;                 // coord_x = 64
+    add.u32         %r87, %r86, HALF_SIZE;
+    @%p6 cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
+        [%r87], [%rd0, {%r83, %r10}], [%r85];
+
+    add.u32         %r87, %r7, 63;
+    shr.b32         %r87, %r87, 6;            // num_kv_blocks
+
+    // Prefetch KV block 0 → buf0 (two halves each)
+    mov.u32         %r90, %r12;               // kv_row for block 0
+
+    // K0 left half
+    add.u32         %r91, %r84, SMEM_MBAR_K0;
+    add.u32         %r92, %r84, SMEM_K0;
+    @%p6 mbarrier.arrive.expect_tx.shared.b64 _, [%r91], (BC * D * 2);
+    mov.u32         %r83, 0;
+    @%p6 cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
+        [%r92], [%rd1, {%r83, %r90}], [%r91];
+    // K0 right half
+    mov.u32         %r83, 64;
+    add.u32         %r95, %r92, HALF_SIZE;
+    @%p6 cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
+        [%r95], [%rd1, {%r83, %r90}], [%r91];
+
+    // V0 left half
+    add.u32         %r93, %r84, SMEM_MBAR_V0;
+    add.u32         %r94, %r84, SMEM_V0;
+    @%p6 mbarrier.arrive.expect_tx.shared.b64 _, [%r93], (BC * D * 2);
+    mov.u32         %r83, 0;
+    @%p6 cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
+        [%r94], [%rd2, {%r83, %r90}], [%r93];
+    // V0 right half
+    mov.u32         %r83, 64;
+    add.u32         %r95, %r94, HALF_SIZE;
+    @%p6 cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
+        [%r95], [%rd2, {%r83, %r90}], [%r93];
+
+    // Prefetch KV block 1 → buf1 (if available)
+    setp.gt.u32     %p9, %r87, 1;
+    @!%p9 bra       dma_prefetch_done;
+
+    add.u32         %r90, %r12, 64;           // kv_row for block 1
+
+    // K1 left half
+    add.u32         %r91, %r84, SMEM_MBAR_K1;
+    add.u32         %r92, %r84, SMEM_K1;
+    @%p6 mbarrier.arrive.expect_tx.shared.b64 _, [%r91], (BC * D * 2);
+    mov.u32         %r83, 0;
+    @%p6 cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
+        [%r92], [%rd1, {%r83, %r90}], [%r91];
+    // K1 right half
+    mov.u32         %r83, 64;
+    add.u32         %r95, %r92, HALF_SIZE;
+    @%p6 cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
+        [%r95], [%rd1, {%r83, %r90}], [%r91];
+
+    // V1 left half
+    add.u32         %r93, %r84, SMEM_MBAR_V1;
+    add.u32         %r94, %r84, SMEM_V1;
+    @%p6 mbarrier.arrive.expect_tx.shared.b64 _, [%r93], (BC * D * 2);
+    mov.u32         %r83, 0;
+    @%p6 cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
+        [%r94], [%rd2, {%r83, %r90}], [%r93];
+    // V1 right half
+    mov.u32         %r83, 64;
+    add.u32         %r95, %r94, HALF_SIZE;
+    @%p6 cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
+        [%r95], [%rd2, {%r83, %r90}], [%r93];
+
+dma_prefetch_done:
+    // Remaining blocks: 2..N-1
+    mov.u32         %r88, 2;                  // kv_block = 2
+    mov.u32         %r155, 0;                 // done0_phase = 0
+    mov.u32         %r156, 0;                 // done1_phase = 0
+
+dma_rest_loop:
+    setp.ge.u32     %p9, %r88, %r87;
+    @%p9 bra        dma_done;
+
+    // buf = kv_block & 1
+    and.b32         %r150, %r88, 1;
+
+    // Compute DONE mbar addr = MBAR_DONE0 + buf*16
+    mul.lo.u32      %r160, %r150, 16;
+    add.u32         %r159, %r84, SMEM_MBAR_DONE0;
+    add.u32         %r159, %r159, %r160;
+
+    // Select done_phase for this buf
+    setp.eq.u32     %p10, %r150, 0;
+    selp.u32        %r161, %r155, %r156, %p10;
+
+    // Wait DONE[buf] — MMA finished reading this buffer
+dma_wait_done:
+    mbarrier.try_wait.parity.shared.b64 %p11, [%r159], %r161;
+    @!%p11 bra dma_wait_done;
+
+    // Toggle done_phase for this buf
+    @%p10 xor.b32   %r155, %r155, 1;
+    @!%p10 xor.b32  %r156, %r156, 1;
+
+    // kv_row = kv_base + kv_block * 64
+    shl.b32         %r89, %r88, 6;
+    add.u32         %r90, %r12, %r89;
+
+    // K: two halves
+    mul.lo.u32      %r170, %r150, 16384;
+    add.u32         %r92, %r84, SMEM_K0;
+    add.u32         %r92, %r92, %r170;
+    add.u32         %r91, %r84, SMEM_MBAR_K0;
+    add.u32         %r91, %r91, %r160;
+
+    @%p6 mbarrier.arrive.expect_tx.shared.b64 _, [%r91], (BC * D * 2);
+    mov.u32         %r83, 0;
+    @%p6 cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
+        [%r92], [%rd1, {%r83, %r90}], [%r91];
+    mov.u32         %r83, 64;
+    add.u32         %r95, %r92, HALF_SIZE;
+    @%p6 cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
+        [%r95], [%rd1, {%r83, %r90}], [%r91];
+
+    // V: two halves
+    add.u32         %r94, %r84, SMEM_V0;
+    add.u32         %r94, %r94, %r170;
+    add.u32         %r93, %r84, SMEM_MBAR_V0;
+    add.u32         %r93, %r93, %r160;
+
+    @%p6 mbarrier.arrive.expect_tx.shared.b64 _, [%r93], (BC * D * 2);
+    mov.u32         %r83, 0;
+    @%p6 cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
+        [%r94], [%rd2, {%r83, %r90}], [%r93];
+    mov.u32         %r83, 64;
+    add.u32         %r95, %r94, HALF_SIZE;
+    @%p6 cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
+        [%r95], [%rd2, {%r83, %r90}], [%r93];
+
+    add.u32         %r88, %r88, 1;
+    bra             dma_rest_loop;
+
+dma_done:
+    ret;
+}

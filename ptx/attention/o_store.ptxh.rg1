@@ -1,0 +1,195 @@
+// o_store.ptxh.rg1 — rg1 O store to global memory
+// O accumulators: %f128..%f191 (16 ng x 4 regs)
+// row0 addr: %rd21, row1 addr: %rd23, col offset: %rd24
+// Bounds predicates: %p4 (row0 valid), %p5 (row1 valid)
+// Each ng stores d0,d1 to row0 and d2,d3 to row1 at ng*16 + col offset
+
+    // ng0
+    cvt.rn.bf16.f32 %h0, %f128; cvt.rn.bf16.f32 %h1, %f129;
+    mov.b32 %r100, {%h0, %h1};
+    @%p4 add.u64 %rd30, %rd21, %rd24;
+    @%p4 st.global.b32 [%rd30], %r100;
+    cvt.rn.bf16.f32 %h0, %f130; cvt.rn.bf16.f32 %h1, %f131;
+    mov.b32 %r100, {%h0, %h1};
+    @%p5 add.u64 %rd30, %rd23, %rd24;
+    @%p5 st.global.b32 [%rd30], %r100;
+
+    // ng1
+    cvt.rn.bf16.f32 %h0, %f132; cvt.rn.bf16.f32 %h1, %f133;
+    mov.b32 %r100, {%h0, %h1};
+    add.u64 %rd25, %rd21, 16;
+    @%p4 add.u64 %rd30, %rd25, %rd24;
+    @%p4 st.global.b32 [%rd30], %r100;
+    cvt.rn.bf16.f32 %h0, %f134; cvt.rn.bf16.f32 %h1, %f135;
+    mov.b32 %r100, {%h0, %h1};
+    add.u64 %rd25, %rd23, 16;
+    add.u64 %rd30, %rd25, %rd24;
+    @%p5 st.global.b32 [%rd30], %r100;
+
+    // ng2
+    cvt.rn.bf16.f32 %h0, %f136; cvt.rn.bf16.f32 %h1, %f137;
+    mov.b32 %r100, {%h0, %h1};
+    add.u64 %rd25, %rd21, 32;
+    @%p4 add.u64 %rd30, %rd25, %rd24;
+    @%p4 st.global.b32 [%rd30], %r100;
+    cvt.rn.bf16.f32 %h0, %f138; cvt.rn.bf16.f32 %h1, %f139;
+    mov.b32 %r100, {%h0, %h1};
+    add.u64 %rd25, %rd23, 32;
+    add.u64 %rd30, %rd25, %rd24;
+    @%p5 st.global.b32 [%rd30], %r100;
+
+    // ng3
+    cvt.rn.bf16.f32 %h0, %f140; cvt.rn.bf16.f32 %h1, %f141;
+    mov.b32 %r100, {%h0, %h1};
+    add.u64 %rd25, %rd21, 48;
+    @%p4 add.u64 %rd30, %rd25, %rd24;
+    @%p4 st.global.b32 [%rd30], %r100;
+    cvt.rn.bf16.f32 %h0, %f142; cvt.rn.bf16.f32 %h1, %f143;
+    mov.b32 %r100, {%h0, %h1};
+    add.u64 %rd25, %rd23, 48;
+    add.u64 %rd30, %rd25, %rd24;
+    @%p5 st.global.b32 [%rd30], %r100;
+
+    // ng4
+    cvt.rn.bf16.f32 %h0, %f144; cvt.rn.bf16.f32 %h1, %f145;
+    mov.b32 %r100, {%h0, %h1};
+    add.u64 %rd25, %rd21, 64;
+    @%p4 add.u64 %rd30, %rd25, %rd24;
+    @%p4 st.global.b32 [%rd30], %r100;
+    cvt.rn.bf16.f32 %h0, %f146; cvt.rn.bf16.f32 %h1, %f147;
+    mov.b32 %r100, {%h0, %h1};
+    add.u64 %rd25, %rd23, 64;
+    add.u64 %rd30, %rd25, %rd24;
+    @%p5 st.global.b32 [%rd30], %r100;
+
+    // ng5
+    cvt.rn.bf16.f32 %h0, %f148; cvt.rn.bf16.f32 %h1, %f149;
+    mov.b32 %r100, {%h0, %h1};
+    add.u64 %rd25, %rd21, 80;
+    @%p4 add.u64 %rd30, %rd25, %rd24;
+    @%p4 st.global.b32 [%rd30], %r100;
+    cvt.rn.bf16.f32 %h0, %f150; cvt.rn.bf16.f32 %h1, %f151;
+    mov.b32 %r100, {%h0, %h1};
+    add.u64 %rd25, %rd23, 80;
+    add.u64 %rd30, %rd25, %rd24;
+    @%p5 st.global.b32 [%rd30], %r100;
+
+    // ng6
+    cvt.rn.bf16.f32 %h0, %f152; cvt.rn.bf16.f32 %h1, %f153;
+    mov.b32 %r100, {%h0, %h1};
+    add.u64 %rd25, %rd21, 96;
+    @%p4 add.u64 %rd30, %rd25, %rd24;
+    @%p4 st.global.b32 [%rd30], %r100;
+    cvt.rn.bf16.f32 %h0, %f154; cvt.rn.bf16.f32 %h1, %f155;
+    mov.b32 %r100, {%h0, %h1};
+    add.u64 %rd25, %rd23, 96;
+    add.u64 %rd30, %rd25, %rd24;
+    @%p5 st.global.b32 [%rd30], %r100;
+
+    // ng7
+    cvt.rn.bf16.f32 %h0, %f156; cvt.rn.bf16.f32 %h1, %f157;
+    mov.b32 %r100, {%h0, %h1};
+    add.u64 %rd25, %rd21, 112;
+    @%p4 add.u64 %rd30, %rd25, %rd24;
+    @%p4 st.global.b32 [%rd30], %r100;
+    cvt.rn.bf16.f32 %h0, %f158; cvt.rn.bf16.f32 %h1, %f159;
+    mov.b32 %r100, {%h0, %h1};
+    add.u64 %rd25, %rd23, 112;
+    add.u64 %rd30, %rd25, %rd24;
+    @%p5 st.global.b32 [%rd30], %r100;
+
+    // ng8
+    cvt.rn.bf16.f32 %h0, %f160; cvt.rn.bf16.f32 %h1, %f161;
+    mov.b32 %r100, {%h0, %h1};
+    add.u64 %rd25, %rd21, 128;
+    @%p4 add.u64 %rd30, %rd25, %rd24;
+    @%p4 st.global.b32 [%rd30], %r100;
+    cvt.rn.bf16.f32 %h0, %f162; cvt.rn.bf16.f32 %h1, %f163;
+    mov.b32 %r100, {%h0, %h1};
+    add.u64 %rd25, %rd23, 128;
+    add.u64 %rd30, %rd25, %rd24;
+    @%p5 st.global.b32 [%rd30], %r100;
+
+    // ng9
+    cvt.rn.bf16.f32 %h0, %f164; cvt.rn.bf16.f32 %h1, %f165;
+    mov.b32 %r100, {%h0, %h1};
+    add.u64 %rd25, %rd21, 144;
+    @%p4 add.u64 %rd30, %rd25, %rd24;
+    @%p4 st.global.b32 [%rd30], %r100;
+    cvt.rn.bf16.f32 %h0, %f166; cvt.rn.bf16.f32 %h1, %f167;
+    mov.b32 %r100, {%h0, %h1};
+    add.u64 %rd25, %rd23, 144;
+    add.u64 %rd30, %rd25, %rd24;
+    @%p5 st.global.b32 [%rd30], %r100;
+
+    // ng10
+    cvt.rn.bf16.f32 %h0, %f168; cvt.rn.bf16.f32 %h1, %f169;
+    mov.b32 %r100, {%h0, %h1};
+    add.u64 %rd25, %rd21, 160;
+    @%p4 add.u64 %rd30, %rd25, %rd24;
+    @%p4 st.global.b32 [%rd30], %r100;
+    cvt.rn.bf16.f32 %h0, %f170; cvt.rn.bf16.f32 %h1, %f171;
+    mov.b32 %r100, {%h0, %h1};
+    add.u64 %rd25, %rd23, 160;
+    add.u64 %rd30, %rd25, %rd24;
+    @%p5 st.global.b32 [%rd30], %r100;
+
+    // ng11
+    cvt.rn.bf16.f32 %h0, %f172; cvt.rn.bf16.f32 %h1, %f173;
+    mov.b32 %r100, {%h0, %h1};
+    add.u64 %rd25, %rd21, 176;
+    @%p4 add.u64 %rd30, %rd25, %rd24;
+    @%p4 st.global.b32 [%rd30], %r100;
+    cvt.rn.bf16.f32 %h0, %f174; cvt.rn.bf16.f32 %h1, %f175;
+    mov.b32 %r100, {%h0, %h1};
+    add.u64 %rd25, %rd23, 176;
+    add.u64 %rd30, %rd25, %rd24;
+    @%p5 st.global.b32 [%rd30], %r100;
+
+    // ng12
+    cvt.rn.bf16.f32 %h0, %f176; cvt.rn.bf16.f32 %h1, %f177;
+    mov.b32 %r100, {%h0, %h1};
+    add.u64 %rd25, %rd21, 192;
+    @%p4 add.u64 %rd30, %rd25, %rd24;
+    @%p4 st.global.b32 [%rd30], %r100;
+    cvt.rn.bf16.f32 %h0, %f178; cvt.rn.bf16.f32 %h1, %f179;
+    mov.b32 %r100, {%h0, %h1};
+    add.u64 %rd25, %rd23, 192;
+    add.u64 %rd30, %rd25, %rd24;
+    @%p5 st.global.b32 [%rd30], %r100;
+
+    // ng13
+    cvt.rn.bf16.f32 %h0, %f180; cvt.rn.bf16.f32 %h1, %f181;
+    mov.b32 %r100, {%h0, %h1};
+    add.u64 %rd25, %rd21, 208;
+    @%p4 add.u64 %rd30, %rd25, %rd24;
+    @%p4 st.global.b32 [%rd30], %r100;
+    cvt.rn.bf16.f32 %h0, %f182; cvt.rn.bf16.f32 %h1, %f183;
+    mov.b32 %r100, {%h0, %h1};
+    add.u64 %rd25, %rd23, 208;
+    add.u64 %rd30, %rd25, %rd24;
+    @%p5 st.global.b32 [%rd30], %r100;
+
+    // ng14
+    cvt.rn.bf16.f32 %h0, %f184; cvt.rn.bf16.f32 %h1, %f185;
+    mov.b32 %r100, {%h0, %h1};
+    add.u64 %rd25, %rd21, 224;
+    @%p4 add.u64 %rd30, %rd25, %rd24;
+    @%p4 st.global.b32 [%rd30], %r100;
+    cvt.rn.bf16.f32 %h0, %f186; cvt.rn.bf16.f32 %h1, %f187;
+    mov.b32 %r100, {%h0, %h1};
+    add.u64 %rd25, %rd23, 224;
+    add.u64 %rd30, %rd25, %rd24;
+    @%p5 st.global.b32 [%rd30], %r100;
+
+    // ng15
+    cvt.rn.bf16.f32 %h0, %f188; cvt.rn.bf16.f32 %h1, %f189;
+    mov.b32 %r100, {%h0, %h1};
+    add.u64 %rd25, %rd21, 240;
+    @%p4 add.u64 %rd30, %rd25, %rd24;
+    @%p4 st.global.b32 [%rd30], %r100;
+    cvt.rn.bf16.f32 %h0, %f190; cvt.rn.bf16.f32 %h1, %f191;
+    mov.b32 %r100, {%h0, %h1};
+    add.u64 %rd25, %rd23, 240;
+    add.u64 %rd30, %rd25, %rd24;
+    @%p5 st.global.b32 [%rd30], %r100;

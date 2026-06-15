@@ -1,0 +1,150 @@
+// softmax_backward_bf16.ptx
+//
+// Backward pass for softmax along last dim.
+//
+// Forward:  y = softmax(x, dim=-1)
+// Backward: dx[i] = y[i] * (dy[i] - sum_j(dy[j] * y[j]))
+//
+// Layout:
+//   y:  [N, D] BF16  (forward output, used as input)
+//   dy: [N, D] BF16
+//   dx: [N, D] BF16
+//
+// One CTA per row. Block size = 256.
+// Stage 1: scalar accumulation of sum(dy*y) per thread, warp/block reduce.
+// Stage 2: write dx with the scalar broadcast term.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "reduction.ptxh"
+#include "convert.ptxh"
+
+.shared .align 128 .b8 smem_reduce[128];
+
+.visible .entry softmax_backward_bf16(
+    .param .u64 param_y,
+    .param .u64 param_dy,
+    .param .u64 param_dx,
+    .param .u32 param_dim
+)
+{
+    .reg .b32  %r<24>;
+    .reg .b64  %rd<16>;
+    .reg .f32  %f<16>;
+    .reg .b16  %h<4>;
+    .reg .pred %p<8>;
+
+    mov.u32         %r0, BLOCK_ID_X;
+    mov.u32         %r1, THREAD_ID;
+    mov.u32         %r4, %ntid.x;
+
+    ld.param.u64    %rd0, [param_y];
+    ld.param.u64    %rd1, [param_dy];
+    ld.param.u64    %rd2, [param_dx];
+    ld.param.u32    %r2, [param_dim];
+
+    mul.lo.u32      %r3, %r0, %r2;
+    mul.wide.u32    %rd3, %r3, 2;
+    add.u64         %rd4, %rd0, %rd3;       // &y[row,0]
+    add.u64         %rd5, %rd1, %rd3;       // &dy[row,0]
+    add.u64         %rd6, %rd2, %rd3;       // &dx[row,0]
+
+    // ===== Stage 1: sum_j(dy[j] * y[j]) =====
+    mov.f32         %f10, 0.0;              // partial sum
+
+    mov.u32         %r5, %r1;               // i = tid
+acc_loop:
+    setp.ge.u32     %p0, %r5, %r2;
+    @%p0 bra        acc_done;
+
+    mul.wide.u32    %rd7, %r5, 2;
+    add.u64         %rd8, %rd4, %rd7;
+    add.u64         %rd9, %rd5, %rd7;
+
+    ld.global.b16   %h0, [%rd8];            // y[i]
+    CVT_BF16_F32(%f0, %h0)
+    ld.global.b16   %h1, [%rd9];            // dy[i]
+    CVT_BF16_F32(%f1, %h1)
+
+    fma.rn.f32      %f10, %f0, %f1, %f10;
+
+    add.u32         %r5, %r5, %r4;
+    bra             acc_loop;
+
+acc_done:
+    .reg .b32 %_t;
+    WARP_REDUCE_SUM_F32(%f10, %_t)
+    WARP_ID(%r6, %r1)
+    LANE_ID(%r7, %r1)
+
+    setp.eq.u32     %p1, %r7, 0;
+    @!%p1 bra       w_skip;
+    mul.wide.u32    %rd10, %r6, 4;
+    mov.u64         %rd11, smem_reduce;
+    add.u64         %rd12, %rd11, %rd10;
+    st.shared.f32   [%rd12], %f10;
+
+w_skip:
+    bar.sync        0;
+    shr.u32         %r8, %r4, 5;            // num_warps
+    setp.lt.u32     %p2, %r6, 1;
+    @!%p2 bra       skip_w0;
+
+    setp.lt.u32     %p3, %r7, %r8;
+    @%p3 bra        load_p;
+    mov.f32         %f10, 0.0;
+    bra             do_red;
+
+load_p:
+    mul.wide.u32    %rd10, %r7, 4;
+    mov.u64         %rd11, smem_reduce;
+    add.u64         %rd12, %rd11, %rd10;
+    ld.shared.f32   %f10, [%rd12];
+
+do_red:
+    WARP_REDUCE_SUM_F32(%f10, %_t)
+
+    // Lane 0 broadcasts via smem[64]
+    setp.eq.u32     %p1, %r7, 0;
+    @!%p1 bra       skip_w0;
+    mov.u64         %rd11, smem_reduce;
+    add.u64         %rd12, %rd11, 64;
+    st.shared.f32   [%rd12], %f10;
+
+skip_w0:
+    bar.sync        0;
+    mov.u64         %rd11, smem_reduce;
+    add.u64         %rd12, %rd11, 64;
+    ld.shared.f32   %f12, [%rd12];          // sum_term
+
+    // ===== Stage 2: dx[i] = y[i] * (dy[i] - sum_term) =====
+    mov.u32         %r5, %r1;
+write_loop:
+    setp.ge.u32     %p0, %r5, %r2;
+    @%p0 bra        write_done;
+
+    mul.wide.u32    %rd7, %r5, 2;
+    add.u64         %rd8, %rd4, %rd7;
+    add.u64         %rd9, %rd5, %rd7;
+    add.u64         %rd13, %rd6, %rd7;
+
+    ld.global.b16   %h0, [%rd8];
+    CVT_BF16_F32(%f0, %h0)                  // y[i]
+    ld.global.b16   %h1, [%rd9];
+    CVT_BF16_F32(%f1, %h1)                  // dy[i]
+
+    sub.f32         %f2, %f1, %f12;         // dy - sum_term
+    mul.f32         %f3, %f0, %f2;          // y * (...)
+
+    CVT_F32_BF16(%h2, %f3)
+    st.global.b16   [%rd13], %h2;
+
+    add.u32         %r5, %r5, %r4;
+    bra             write_loop;
+
+write_done:
+    ret;
+}

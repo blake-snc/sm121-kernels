@@ -1,0 +1,229 @@
+// cross_entropy_backward_bf16.ptx
+//
+// Backward pass for cross-entropy loss with logits input:
+//   loss[b] = -log(softmax(logits[b])[target[b]])
+//   dlogits[b, i] = (softmax(logits[b])[i] - 1[i==target[b]]) / batch_size
+//
+// Layout:
+//   logits: [batch, vocab] BF16
+//   targets: [batch] u32
+//   dlogits: [batch, vocab] BF16 (output)
+//
+// Each CTA = one row. Block size = 256.
+// Phase A: find row max (for stable softmax).
+// Phase B: sum exp(x - max).
+// Phase C: write dlogits[i] = (exp(x-max)/sum - 1[i==target]) / batch.
+//
+// Three reductions: max, then sum (after max known). Two passes over data.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "reduction.ptxh"
+#include "convert.ptxh"
+
+.shared .align 128 .b8 smem_reduce[128];
+
+.visible .entry cross_entropy_backward_bf16(
+    .param .u64 param_logits,
+    .param .u64 param_targets,
+    .param .u64 param_dlogits,
+    .param .u32 param_vocab,
+    .param .u32 param_batch
+)
+{
+    .reg .b32  %r<24>;
+    .reg .b64  %rd<16>;
+    .reg .f32  %f<24>;
+    .reg .b16  %h<4>;
+    .reg .pred %p<8>;
+
+    mov.u32         %r0, BLOCK_ID_X;        // row (batch idx)
+    mov.u32         %r1, THREAD_ID;
+    mov.u32         %r4, %ntid.x;
+
+    ld.param.u64    %rd0, [param_logits];
+    ld.param.u64    %rd1, [param_targets];
+    ld.param.u64    %rd2, [param_dlogits];
+    ld.param.u32    %r2, [param_vocab];
+    ld.param.u32    %r3, [param_batch];
+
+    mul.lo.u32      %r5, %r0, %r2;
+    mul.wide.u32    %rd3, %r5, 2;
+    add.u64         %rd4, %rd0, %rd3;       // &logits[row, 0]
+    add.u64         %rd5, %rd2, %rd3;       // &dlogits[row, 0]
+
+    // Load target for this row
+    mul.wide.u32    %rd6, %r0, 4;
+    add.u64         %rd7, %rd1, %rd6;
+    ld.global.u32   %r6, [%rd7];            // target[row]
+
+    // ===== Phase A: row max =====
+    mov.f32         %f10, 0FFF800000;       // -inf
+
+    mov.u32         %r7, %r1;
+max_loop:
+    setp.ge.u32     %p0, %r7, %r2;
+    @%p0 bra        max_done;
+    mul.wide.u32    %rd8, %r7, 2;
+    add.u64         %rd9, %rd4, %rd8;
+    ld.global.b16   %h0, [%rd9];
+    CVT_BF16_F32(%f0, %h0)
+    max.f32         %f10, %f10, %f0;
+    add.u32         %r7, %r7, %r4;
+    bra             max_loop;
+max_done:
+    .reg .b32 %_t;
+    // Warp max reduce
+    shfl.sync.bfly.b32 %_t, %f10, 16, 31, FULL_MASK;
+    .reg .f32 %_tf;
+    mov.b32         %_tf, %_t;
+    max.f32         %f10, %f10, %_tf;
+    shfl.sync.bfly.b32 %_t, %f10, 8, 31, FULL_MASK;
+    mov.b32         %_tf, %_t;
+    max.f32         %f10, %f10, %_tf;
+    shfl.sync.bfly.b32 %_t, %f10, 4, 31, FULL_MASK;
+    mov.b32         %_tf, %_t;
+    max.f32         %f10, %f10, %_tf;
+    shfl.sync.bfly.b32 %_t, %f10, 2, 31, FULL_MASK;
+    mov.b32         %_tf, %_t;
+    max.f32         %f10, %f10, %_tf;
+    shfl.sync.bfly.b32 %_t, %f10, 1, 31, FULL_MASK;
+    mov.b32         %_tf, %_t;
+    max.f32         %f10, %f10, %_tf;
+
+    WARP_ID(%r8, %r1)
+    LANE_ID(%r9, %r1)
+
+    setp.eq.u32     %p1, %r9, 0;
+    @!%p1 bra       wmax_skip;
+    mul.wide.u32    %rd10, %r8, 4;
+    mov.u64         %rd11, smem_reduce;
+    add.u64         %rd12, %rd11, %rd10;
+    st.shared.f32   [%rd12], %f10;
+wmax_skip:
+    bar.sync        0;
+
+    shr.u32         %r10, %r4, 5;           // num_warps
+    setp.lt.u32     %p2, %r8, 1;
+    @!%p2 bra       skip_wmax_red;
+    setp.lt.u32     %p3, %r9, %r10;
+    @%p3 bra        load_max_p;
+    mov.f32         %f10, 0FFF800000;
+    bra             do_max_red;
+load_max_p:
+    mul.wide.u32    %rd10, %r9, 4;
+    mov.u64         %rd11, smem_reduce;
+    add.u64         %rd12, %rd11, %rd10;
+    ld.shared.f32   %f10, [%rd12];
+do_max_red:
+    shfl.sync.bfly.b32 %_t, %f10, 16, 31, FULL_MASK;
+    mov.b32 %_tf, %_t; max.f32 %f10, %f10, %_tf;
+    shfl.sync.bfly.b32 %_t, %f10, 8,  31, FULL_MASK;
+    mov.b32 %_tf, %_t; max.f32 %f10, %f10, %_tf;
+    shfl.sync.bfly.b32 %_t, %f10, 4,  31, FULL_MASK;
+    mov.b32 %_tf, %_t; max.f32 %f10, %f10, %_tf;
+    shfl.sync.bfly.b32 %_t, %f10, 2,  31, FULL_MASK;
+    mov.b32 %_tf, %_t; max.f32 %f10, %f10, %_tf;
+    shfl.sync.bfly.b32 %_t, %f10, 1,  31, FULL_MASK;
+    mov.b32 %_tf, %_t; max.f32 %f10, %f10, %_tf;
+
+    setp.eq.u32     %p1, %r9, 0;
+    @!%p1 bra       skip_wmax_red;
+    mov.u64         %rd11, smem_reduce;
+    add.u64         %rd12, %rd11, 64;
+    st.shared.f32   [%rd12], %f10;          // broadcast max
+skip_wmax_red:
+    bar.sync        0;
+    mov.u64         %rd11, smem_reduce;
+    add.u64         %rd12, %rd11, 64;
+    ld.shared.f32   %f11, [%rd12];          // row_max
+
+    // ===== Phase B: sum exp(x - max) =====
+    mov.f32         %f12, 0.0;
+    mov.u32         %r7, %r1;
+sum_loop:
+    setp.ge.u32     %p0, %r7, %r2;
+    @%p0 bra        sum_done;
+    mul.wide.u32    %rd8, %r7, 2;
+    add.u64         %rd9, %rd4, %rd8;
+    ld.global.b16   %h0, [%rd9];
+    CVT_BF16_F32(%f0, %h0)
+    sub.f32         %f1, %f0, %f11;
+    // exp(z) = ex2(z * log2(e))
+    mov.f32         %f2, 0F3FB8AA3B;        // log2(e)
+    mul.f32         %f3, %f1, %f2;
+    ex2.approx.ftz.f32 %f4, %f3;
+    add.f32         %f12, %f12, %f4;
+    add.u32         %r7, %r7, %r4;
+    bra             sum_loop;
+sum_done:
+    WARP_REDUCE_SUM_F32(%f12, %_t)
+    setp.eq.u32     %p1, %r9, 0;
+    @!%p1 bra       wsum_skip;
+    mul.wide.u32    %rd10, %r8, 4;
+    mov.u64         %rd11, smem_reduce;
+    add.u64         %rd12, %rd11, %rd10;
+    st.shared.f32   [%rd12], %f12;
+wsum_skip:
+    bar.sync        0;
+    setp.lt.u32     %p2, %r8, 1;
+    @!%p2 bra       skip_wsum_red;
+    setp.lt.u32     %p3, %r9, %r10;
+    @%p3 bra        load_sum_p;
+    mov.f32         %f12, 0.0;
+    bra             do_sum_red;
+load_sum_p:
+    mul.wide.u32    %rd10, %r9, 4;
+    mov.u64         %rd11, smem_reduce;
+    add.u64         %rd12, %rd11, %rd10;
+    ld.shared.f32   %f12, [%rd12];
+do_sum_red:
+    WARP_REDUCE_SUM_F32(%f12, %_t)
+    setp.eq.u32     %p1, %r9, 0;
+    @!%p1 bra       skip_wsum_red;
+    mov.u64         %rd11, smem_reduce;
+    add.u64         %rd12, %rd11, 68;
+    st.shared.f32   [%rd12], %f12;
+skip_wsum_red:
+    bar.sync        0;
+    mov.u64         %rd11, smem_reduce;
+    add.u64         %rd12, %rd11, 68;
+    ld.shared.f32   %f13, [%rd12];          // row_sum
+
+    rcp.approx.f32  %f14, %f13;             // 1/sum
+    cvt.rn.f32.u32  %f15, %r3;              // batch as f32
+    rcp.approx.f32  %f16, %f15;             // 1/batch
+
+    // ===== Phase C: write dlogits =====
+    mov.u32         %r7, %r1;
+write_loop:
+    setp.ge.u32     %p0, %r7, %r2;
+    @%p0 bra        write_done;
+    mul.wide.u32    %rd8, %r7, 2;
+    add.u64         %rd9, %rd4, %rd8;
+    add.u64         %rd13, %rd5, %rd8;
+    ld.global.b16   %h0, [%rd9];
+    CVT_BF16_F32(%f0, %h0)
+    sub.f32         %f1, %f0, %f11;
+    mov.f32         %f2, 0F3FB8AA3B;
+    mul.f32         %f3, %f1, %f2;
+    ex2.approx.ftz.f32 %f4, %f3;
+    mul.f32         %f5, %f4, %f14;         // softmax = exp / sum
+
+    // Subtract 1 if i == target
+    setp.eq.u32     %p4, %r7, %r6;
+    @%p4 sub.f32    %f5, %f5, 1.0;
+
+    mul.f32         %f6, %f5, %f16;         // / batch
+
+    CVT_F32_BF16(%h2, %f6)
+    st.global.b16   [%rd13], %h2;
+
+    add.u32         %r7, %r7, %r4;
+    bra             write_loop;
+write_done:
+    ret;
+}

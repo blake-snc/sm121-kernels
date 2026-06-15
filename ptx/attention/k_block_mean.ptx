@@ -1,0 +1,138 @@
+// k_block_mean.ptx
+//
+// Compute mean of K over fixed-size blocks for NSA / MoBA sparse attention
+// selection. Block-mean K is used to score candidate blocks cheaply before
+// committing to fine-grained attention on top-K blocks.
+//
+// Input:   K: [B, Skv, H, D=128] BF16
+// Output:  K_mean: [B, num_blocks, H, D] BF16
+//   where num_blocks = ceil(Skv / block_size)
+//
+// Grid: (num_blocks, num_heads, batch). Block: (32, 1, 1).
+// Each thread handles 4 dims of D (32 × 4 = 128).
+// Values that fall off the end (when Skv not a multiple of block_size) are
+// skipped — mean divides by actual count.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+#define D 128
+
+.visible .entry k_block_mean(
+    .param .u64 param_K,
+    .param .u64 param_out,
+    .param .u32 param_batch,
+    .param .u32 param_num_heads,
+    .param .u32 param_seq_kv,
+    .param .u32 param_block_size
+)
+{
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<12>;
+    .reg .f32 %f<12>;
+    .reg .b16 %h<4>;
+    .reg .pred %p<4>;
+
+    mov.u32     %r0, %tid.x;              // 0..31
+    mov.u32     %r1, %ctaid.x;             // block_idx
+    mov.u32     %r2, %ctaid.y;             // head
+    mov.u32     %r3, %ctaid.z;             // batch
+
+    ld.param.u64 %rd0, [param_K];
+    ld.param.u64 %rd1, [param_out];
+    ld.param.u32 %r4, [param_num_heads];
+    ld.param.u32 %r5, [param_seq_kv];
+    ld.param.u32 %r6, [param_block_size];
+
+    // Compute block token range: [start, end)
+    mul.lo.u32  %r7, %r1, %r6;              // start = block * block_size
+    add.u32     %r8, %r7, %r6;              // end_unclamped = start + block_size
+    min.u32     %r8, %r8, %r5;              // clamp to seq_kv
+    sub.u32     %r9, %r8, %r7;              // count = end - start
+
+    // K position stride in bytes = H*D*2
+    mul.lo.u32  %r10, %r4, D;
+    shl.b32     %r10, %r10, 1;
+
+    // Base: &K[b, start, h, 0] = K + ((b*Skv + start)*H + h)*D*2
+    mul.lo.u32  %r11, %r3, %r5;
+    add.u32     %r11, %r11, %r7;
+    mul.lo.u32  %r11, %r11, %r4;
+    add.u32     %r11, %r11, %r2;
+    mul.lo.u32  %r12, %r11, D;
+    mul.wide.u32 %rd2, %r12, 2;
+    add.u64     %rd3, %rd0, %rd2;
+
+    // Per-thread offset within a position: thread_d*4*2 = t*8
+    shl.b32     %r13, %r0, 3;
+    cvt.u64.u32 %rd4, %r13;
+
+    // Accumulators for this thread's 4 dims
+    mov.f32     %f1, 0.0;
+    mov.f32     %f2, 0.0;
+    mov.f32     %f3, 0.0;
+    mov.f32     %f4, 0.0;
+
+    // Loop over positions in block
+    mov.u32     %r14, 0;
+pos_loop:
+    setp.ge.u32 %p1, %r14, %r9;
+    @%p1 bra    pos_done;
+
+    // addr = &K[...start + pos...] + t*8
+    mul.lo.u32  %r15, %r14, %r10;           // pos * stride
+    cvt.u64.u32 %rd5, %r15;
+    add.u64     %rd6, %rd3, %rd5;
+    add.u64     %rd6, %rd6, %rd4;
+    ld.global.v2.b32 {%r16, %r17}, [%rd6];
+    mov.b32     {%h0, %h1}, %r16;
+    mov.b32     {%h2, %h3}, %r17;
+    CVT_BF16_F32(%f5, %h0)
+    CVT_BF16_F32(%f6, %h1)
+    CVT_BF16_F32(%f7, %h2)
+    CVT_BF16_F32(%f8, %h3)
+    add.f32     %f1, %f1, %f5;
+    add.f32     %f2, %f2, %f6;
+    add.f32     %f3, %f3, %f7;
+    add.f32     %f4, %f4, %f8;
+
+    add.u32     %r14, %r14, 1;
+    bra         pos_loop;
+pos_done:
+
+    // Divide by count
+    cvt.rn.f32.u32 %f9, %r9;
+    rcp.approx.f32 %f9, %f9;
+    mul.f32     %f1, %f1, %f9;
+    mul.f32     %f2, %f2, %f9;
+    mul.f32     %f3, %f3, %f9;
+    mul.f32     %f4, %f4, %f9;
+
+    // Output address: &out[b, block, h, t*4]
+    //   = out + ((b*num_blocks + block)*H + h)*D*2 + t*8
+    add.u32     %r18, %r5, %r6;
+    sub.u32     %r18, %r18, 1;
+    div.u32     %r18, %r18, %r6;            // num_blocks
+    mul.lo.u32  %r19, %r3, %r18;            // b * num_blocks
+    add.u32     %r19, %r19, %r1;            // + block
+    mul.lo.u32  %r19, %r19, %r4;            // * H
+    add.u32     %r19, %r19, %r2;            // + h
+    mul.lo.u32  %r19, %r19, D;
+    mul.wide.u32 %rd7, %r19, 2;
+    add.u64     %rd8, %rd1, %rd7;
+    add.u64     %rd8, %rd8, %rd4;
+
+    cvt.rn.bf16.f32 %h0, %f1;
+    cvt.rn.bf16.f32 %h1, %f2;
+    mov.b32     %r16, {%h0, %h1};
+    cvt.rn.bf16.f32 %h0, %f3;
+    cvt.rn.bf16.f32 %h1, %f4;
+    mov.b32     %r17, {%h0, %h1};
+    st.global.v2.b32 [%rd8], {%r16, %r17};
+
+    ret;
+}

@@ -1,0 +1,153 @@
+// quant_bf16_to_mxfp8.ptx
+//
+// Microscaling FP8 E4M3 quantization (OCP MX standard): 32-element blocks
+// with UE8M0 (exponent-only, no mantissa) scales.
+//
+// Operation (per 32-element block):
+//   abs_max    = max(|x[block]|)
+//   max_exp    = extract_fp32_exp(abs_max)     // biased exponent (0..255)
+//   scale_exp  = max(max_exp - 8, 1)            // UE8M0 byte (E4M3 emax = 8)
+//   inv_scale  = 2^(127 - scale_exp)            // FP32 via bit manipulation
+//   out[i]     = round_to_e4m3(x[i] * inv_scale)
+//   scales[block] = (u8)scale_exp               // UE8M0 encoded byte
+//
+// Layout:
+//   x: [num_rows, hidden_dim] bf16  (hidden_dim multiple of 32)
+//   out: [num_rows, hidden_dim] fp8_e4m3 (u8)
+//   scales: [num_rows, hidden_dim/32] u8 (UE8M0)
+//
+// Grid: (num_rows, num_blocks, 1). Block: (8, 1, 1) threads per 32-element
+// block — each thread handles 4 elements.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "reduction.ptxh"
+#include "convert.ptxh"
+
+#define MX_BLOCK 32
+// FP8 E4M3 emax = 8 (max normal = 448 = 1.11(bin) * 2^8).
+// UE8M0 scale = 2^(byte - 127), so byte = scale_exp + 127.
+// For max_abs with fp32 biased exp E, we want scale_exp = E - 127 - 8 unbiased,
+// which encoded as biased UE8M0 is (E - 127 - 8) + 127 = E - 8.
+#define UE8M0_BIAS_SUB 8
+
+.visible .entry quant_bf16_to_mxfp8(
+    .param .u64 param_x,         // [num_rows, hidden] bf16
+    .param .u64 param_out,       // [num_rows, hidden] fp8_e4m3 (u8)
+    .param .u64 param_scales,    // [num_rows, hidden/32] u8 (UE8M0)
+    .param .u32 param_hidden
+)
+{
+    .reg .b32 %r<28>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<12>;
+    .reg .b16 %h<8>;
+    .reg .pred %p<4>;
+
+    mov.u32         %r0, BLOCK_ID_X;           // row
+    mov.u32         %r1, BLOCK_ID_Y;           // block
+    mov.u32         %r2, THREAD_ID;            // lane 0..7
+
+    ld.param.u64    %rd0, [param_x];
+    ld.param.u64    %rd1, [param_out];
+    ld.param.u64    %rd2, [param_scales];
+    ld.param.u32    %r3, [param_hidden];
+
+    // Flat byte offsets
+    mul.lo.u32      %r4, %r0, %r3;
+    shl.b32         %r5, %r1, 5;               // block * 32
+    add.u32         %r4, %r4, %r5;             // row-major idx of block start
+    mul.wide.u32    %rd3, %r4, 2;
+    add.u64         %rd4, %rd0, %rd3;          // &x[row, block*32]
+    mul.wide.u32    %rd5, %r4, 1;
+    add.u64         %rd6, %rd1, %rd5;          // &out[row, block*32]
+
+    shl.b32         %r6, %r2, 2;               // lane * 4
+
+    mul.wide.u32    %rd7, %r6, 2;
+    add.u64         %rd8, %rd4, %rd7;
+    ld.global.v2.b32 {%r10, %r11}, [%rd8];
+    mov.b32         {%h0, %h1}, %r10;
+    mov.b32         {%h2, %h3}, %r11;
+    CVT_BF16_F32(%f0, %h0)
+    CVT_BF16_F32(%f1, %h1)
+    CVT_BF16_F32(%f2, %h2)
+    CVT_BF16_F32(%f3, %h3)
+
+    // Local abs_max
+    abs.f32         %f4, %f0;
+    abs.f32         %f5, %f1;
+    abs.f32         %f6, %f2;
+    abs.f32         %f7, %f3;
+    max.f32         %f8, %f4, %f5;
+    max.f32         %f9, %f6, %f7;
+    max.f32         %f8, %f8, %f9;             // lane's abs_max
+
+    // Cross-8-lane reduce (only 8 lanes in this CTA — do butterfly with shfl)
+    // Butterfly over {4, 2, 1}
+    .reg .b32 _sh;
+    shfl.sync.bfly.b32 _sh, %f8, 4, 31, 0xFFFFFFFF;
+    mov.b32         %f9, _sh;
+    max.f32         %f8, %f8, %f9;
+    shfl.sync.bfly.b32 _sh, %f8, 2, 31, 0xFFFFFFFF;
+    mov.b32         %f9, _sh;
+    max.f32         %f8, %f8, %f9;
+    shfl.sync.bfly.b32 _sh, %f8, 1, 31, 0xFFFFFFFF;
+    mov.b32         %f9, _sh;
+    max.f32         %f8, %f8, %f9;
+    // %f8 now holds the block's abs_max (all 8 lanes agree)
+
+    // Extract biased exponent from abs_max (FP32 bits 30:23).
+    // UE8M0 byte = max(biased_exp - 8, 1), clamped to [1, 254].
+    mov.b32         %r20, %f8;                 // FP32 bits
+    shr.b32         %r20, %r20, 23;
+    and.b32         %r20, %r20, 0xFF;          // biased fp32 exp
+    // Handle zero-max block: if exp == 0 (all-denormal/zero), use scale=1 (byte=127).
+    setp.eq.u32     %p0, %r20, 0;
+    sub.u32         %r21, %r20, UE8M0_BIAS_SUB;
+    @%p0 mov.u32    %r21, 127;                 // fall back: scale = 2^0 = 1
+    // Clamp to [1, 254]
+    max.u32         %r21, %r21, 1;
+    min.u32         %r21, %r21, 254;
+
+    // inv_scale as FP32: biased exp for 2^-(scale_exp-127) = 254 - scale_exp
+    // i.e., sign=0, exp_bits = (254 - scale_exp) in [0, 253], mantissa=0.
+    mov.u32         %r22, 254;
+    sub.u32         %r22, %r22, %r21;
+    shl.b32         %r22, %r22, 23;
+    mov.b32         %f10, %r22;                // inv_scale = 2^(127 - scale_exp)
+
+    // Lane 0 writes scale byte
+    setp.eq.u32     %p1, %r2, 0;
+    @%p1 bra        write_scale;
+    bra             quantize;
+
+write_scale:
+    shr.u32         %r23, %r3, 5;              // num_blocks per row = hidden/32
+    mul.lo.u32      %r24, %r0, %r23;
+    add.u32         %r24, %r24, %r1;
+    cvt.u16.u32     %h4, %r21;
+    mul.wide.u32    %rd9, %r24, 1;
+    add.u64         %rd10, %rd2, %rd9;
+    st.global.b8    [%rd10], %h4;
+
+quantize:
+    mul.f32         %f4, %f0, %f10;
+    mul.f32         %f5, %f1, %f10;
+    mul.f32         %f6, %f2, %f10;
+    mul.f32         %f7, %f3, %f10;
+
+    .reg .b16 _b0, _b1;
+    CVT_F32X2_E4M3X2(_b0, %f5, %f4)
+    CVT_F32X2_E4M3X2(_b1, %f7, %f6)
+    mov.b32         %r14, {_b0, _b1};
+
+    mul.wide.u32    %rd11, %r6, 1;
+    add.u64         %rd12, %rd6, %rd11;
+    st.global.b32   [%rd12], %r14;
+
+    ret;
+}

@@ -1,0 +1,70 @@
+// kv_append_bf16.ptx
+//
+// Append a single BF16 tile into a KV cache at a device-resident position.
+//
+//   pos = *position_ptr
+//   for i in [0, n):  dst[pos * stride + i] = src[i]
+//
+// Replaces the cuMemcpyDtoDAsync(dst + pos*stride*2, src, n*2) call that the
+// MLA decode KV append used. Position from device pointer enables CUDA Graph
+// capture (the dst offset would otherwise be host-baked into the memcpy node).
+//
+// Grid: ceil(n / 256), block 256, grid-stride loop. Single-block call works for
+// our sizes (n ≤ 512 = kv_lora; n ≤ 64 = qk_rope).
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+
+.visible .entry kv_append_bf16(
+    .param .u64 param_src,           // [n] bf16
+    .param .u64 param_dst,           // [max_pos * stride] bf16
+    .param .u64 param_position_ptr,  // u32* device — destination position
+    .param .u32 param_stride,        // elements per position slot (== n typically)
+    .param .u32 param_n              // num elements to copy
+)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<10>;
+    .reg .b16 %h<2>;
+    .reg .pred %p<2>;
+
+    mov.u32         %r0, BLOCK_ID_X;
+    mov.u32         %r1, %ntid.x;
+    mov.u32         %r2, THREAD_ID;
+    mad.lo.u32      %r3, %r0, %r1, %r2;     // tid_global
+    mov.u32         %r4, %nctaid.x;
+    mul.lo.u32      %r5, %r4, %r1;          // grid stride
+
+    ld.param.u64    %rd0, [param_src];
+    ld.param.u64    %rd1, [param_dst];
+    ld.param.u64    %rd2, [param_position_ptr];
+    ld.param.u32    %r6, [param_stride];
+    ld.param.u32    %r7, [param_n];
+
+    // Load position from device. Same value across all threads → L1 cached.
+    ld.global.u32   %r8, [%rd2];
+
+    // dst_base = dst + pos * stride * 2 bytes
+    mul.lo.u32      %r9, %r8, %r6;          // pos * stride (elements)
+    mul.wide.u32    %rd3, %r9, 2;           // bytes
+    add.u64         %rd4, %rd1, %rd3;
+
+loop:
+    setp.ge.u32     %p0, %r3, %r7;
+    @%p0 bra        done;
+
+    mul.wide.u32    %rd5, %r3, 2;
+    add.u64         %rd6, %rd0, %rd5;       // src + i
+    add.u64         %rd7, %rd4, %rd5;       // dst_base + i
+    ld.global.b16   %h0, [%rd6];
+    st.global.b16   [%rd7], %h0;
+
+    add.u32         %r3, %r3, %r5;
+    bra             loop;
+
+done:
+    ret;
+}

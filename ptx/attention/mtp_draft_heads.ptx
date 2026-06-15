@@ -1,0 +1,191 @@
+// mtp_draft_heads.ptx
+//
+// Multi-Token Prediction (MTP) draft heads for DeepSeek V3/V4 speculative decoding.
+//
+// MTP architecture: K parallel prediction heads at the end of the decoder,
+// each predicting the k-th next token. During decode, the base model produces
+// a hidden state; each head projects it through a per-head lm_head weight to
+// produce logits, then we argmax to get K draft token IDs.
+//
+// Compute (fused):
+//   for k in 0..K: logit[b, k, v] = Σ_d hidden[b, d] * W[k, v, d]
+//   draft[b, k] = argmax_v logit[b, k, v]
+//
+// Layout:
+//   hidden: [B, D_hidden] BF16
+//   W:      [K, V, D_hidden] BF16   (K draft heads × vocab × hidden dim)
+//   draft:  [B, K] u32               (output token IDs)
+//
+// This kernel fuses matmul + argmax. For V=32000-128000 and D=4096-7168,
+// the matmul dominates; we stream V in chunks and keep a running argmax.
+//
+// Grid: (K, batch). Block: (128, 1, 1).
+// Each thread handles D_hidden/128 dot-product contributions and covers
+// distinct vocab entries via outer loop.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+#define BLOCK_DIM 128
+#define NUM_WARPS 4
+
+.shared .align 4 .b8 smem_mtp_warp_best_val[16];
+.shared .align 4 .b8 smem_mtp_warp_best_idx[16];
+
+.visible .entry mtp_draft_heads(
+    .param .u64 param_hidden,
+    .param .u64 param_w,
+    .param .u64 param_draft,
+    .param .u32 param_d_hidden,
+    .param .u32 param_vocab
+)
+{
+    .reg .b32 %r<32>;
+    .reg .b64 %rd<12>;
+    .reg .f32 %f<12>;
+    .reg .b16 %h<4>;
+    .reg .pred %p<6>;
+
+    mov.u32     %r0, %tid.x;              // 0..127
+    mov.u32     %r1, %ctaid.x;             // head k
+    mov.u32     %r2, %ctaid.y;             // batch b
+
+    ld.param.u64 %rd0, [param_hidden];
+    ld.param.u64 %rd1, [param_w];
+    ld.param.u64 %rd2, [param_draft];
+    ld.param.u32 %r3, [param_d_hidden];
+    ld.param.u32 %r4, [param_vocab];
+
+    shr.b32     %r5, %r0, 5;
+    and.b32     %r6, %r0, 31;
+
+    // Hidden base: &hidden[b, 0]
+    mul.lo.u32  %r7, %r2, %r3;
+    mul.wide.u32 %rd3, %r7, 2;
+    add.u64     %rd4, %rd0, %rd3;
+
+    // W base: &W[k, 0, 0] = W + k * V * D_hidden * 2
+    mul.lo.u32  %r8, %r1, %r4;
+    mul.lo.u32  %r8, %r8, %r3;
+    mul.wide.u32 %rd3, %r8, 2;
+    add.u64     %rd5, %rd1, %rd3;
+
+    // Track running best over vocab
+    mov.b32     %f1, 0xFF800000;           // best_val = -inf
+    mov.u32     %r10, 0xFFFFFFFF;           // best_idx
+
+    // Outer loop: each thread scans its own strided subset of vocab
+    mov.u32     %r20, %r0;                  // current vocab
+vocab_loop:
+    setp.ge.u32 %p1, %r20, %r4;
+    @%p1 bra    vocab_done;
+
+    // W row for this vocab: &W[k, v, 0] = W_base + v * D_hidden * 2
+    mul.lo.u32  %r21, %r20, %r3;
+    mul.wide.u32 %rd3, %r21, 2;
+    add.u64     %rd6, %rd5, %rd3;
+
+    // Dot product hidden · W[k, v, :]
+    mov.f32     %f2, 0.0;
+    mov.u32     %r22, 0;
+dot_loop:
+    setp.ge.u32 %p2, %r22, %r3;
+    @%p2 bra    dot_done;
+    mul.wide.u32 %rd3, %r22, 2;
+    .reg .b64 _addr_h, _addr_w;
+    add.u64     _addr_h, %rd4, %rd3;
+    add.u64     _addr_w, %rd6, %rd3;
+    ld.global.b16 %h0, [_addr_h];
+    ld.global.b16 %h1, [_addr_w];
+    CVT_BF16_F32(%f3, %h0)
+    CVT_BF16_F32(%f4, %h1)
+    fma.rn.f32  %f2, %f3, %f4, %f2;
+    add.u32     %r22, %r22, 1;
+    bra         dot_loop;
+dot_done:
+
+    // Update running best
+    setp.gt.f32 %p3, %f2, %f1;
+    @%p3 mov.f32 %f1, %f2;
+    @%p3 mov.u32 %r10, %r20;
+
+    add.u32     %r20, %r20, BLOCK_DIM;
+    bra         vocab_loop;
+vocab_done:
+
+    // Warp-level argmax (track value + idx)
+    shfl.sync.bfly.b32 %f3|%p5, %f1, 0x10, 0x1f, 0xffffffff;
+    shfl.sync.bfly.b32 %r11|%p5, %r10, 0x10, 0x1f, 0xffffffff;
+    setp.gt.f32 %p3, %f3, %f1;
+    @%p3 mov.f32 %f1, %f3;
+    @%p3 mov.u32 %r10, %r11;
+    shfl.sync.bfly.b32 %f3|%p5, %f1, 0x08, 0x1f, 0xffffffff;
+    shfl.sync.bfly.b32 %r11|%p5, %r10, 0x08, 0x1f, 0xffffffff;
+    setp.gt.f32 %p3, %f3, %f1;
+    @%p3 mov.f32 %f1, %f3;
+    @%p3 mov.u32 %r10, %r11;
+    shfl.sync.bfly.b32 %f3|%p5, %f1, 0x04, 0x1f, 0xffffffff;
+    shfl.sync.bfly.b32 %r11|%p5, %r10, 0x04, 0x1f, 0xffffffff;
+    setp.gt.f32 %p3, %f3, %f1;
+    @%p3 mov.f32 %f1, %f3;
+    @%p3 mov.u32 %r10, %r11;
+    shfl.sync.bfly.b32 %f3|%p5, %f1, 0x02, 0x1f, 0xffffffff;
+    shfl.sync.bfly.b32 %r11|%p5, %r10, 0x02, 0x1f, 0xffffffff;
+    setp.gt.f32 %p3, %f3, %f1;
+    @%p3 mov.f32 %f1, %f3;
+    @%p3 mov.u32 %r10, %r11;
+    shfl.sync.bfly.b32 %f3|%p5, %f1, 0x01, 0x1f, 0xffffffff;
+    shfl.sync.bfly.b32 %r11|%p5, %r10, 0x01, 0x1f, 0xffffffff;
+    setp.gt.f32 %p3, %f3, %f1;
+    @%p3 mov.f32 %f1, %f3;
+    @%p3 mov.u32 %r10, %r11;
+
+    // Cross-warp reduction via SMEM
+    setp.eq.u32 %p3, %r6, 0;
+    shl.b32     %r12, %r5, 2;
+    mov.u32     %r13, smem_mtp_warp_best_val;
+    add.u32     %r13, %r13, %r12;
+    mov.u32     %r14, smem_mtp_warp_best_idx;
+    add.u32     %r14, %r14, %r12;
+    @%p3 st.shared.f32 [%r13], %f1;
+    @%p3 st.shared.u32 [%r14], %r10;
+    bar.sync 0;
+
+    setp.lt.u32 %p4, %r0, NUM_WARPS;
+    mov.b32     %f1, 0xFF800000;
+    mov.u32     %r10, 0xFFFFFFFF;
+    @%p4 shl.b32 %r12, %r0, 2;
+    @%p4 mov.u32 %r13, smem_mtp_warp_best_val;
+    @%p4 add.u32 %r13, %r13, %r12;
+    @%p4 mov.u32 %r14, smem_mtp_warp_best_idx;
+    @%p4 add.u32 %r14, %r14, %r12;
+    @%p4 ld.shared.f32 %f1, [%r13];
+    @%p4 ld.shared.u32 %r10, [%r14];
+
+    shfl.sync.bfly.b32 %f3|%p5, %f1, 0x02, 0x1f, 0xffffffff;
+    shfl.sync.bfly.b32 %r11|%p5, %r10, 0x02, 0x1f, 0xffffffff;
+    setp.gt.f32 %p3, %f3, %f1;
+    @%p3 mov.f32 %f1, %f3;
+    @%p3 mov.u32 %r10, %r11;
+    shfl.sync.bfly.b32 %f3|%p5, %f1, 0x01, 0x1f, 0xffffffff;
+    shfl.sync.bfly.b32 %r11|%p5, %r10, 0x01, 0x1f, 0xffffffff;
+    setp.gt.f32 %p3, %f3, %f1;
+    @%p3 mov.f32 %f1, %f3;
+    @%p3 mov.u32 %r10, %r11;
+
+    // Thread 0 writes draft[b, k]
+    setp.eq.u32 %p3, %r0, 0;
+    // Output offset = (b * gridDim.x + k) * 4
+    mov.u32     %r25, %nctaid.x;           // K
+    mul.lo.u32  %r26, %r2, %r25;
+    add.u32     %r26, %r26, %r1;
+    mul.wide.u32 %rd7, %r26, 4;
+    add.u64     %rd8, %rd2, %rd7;
+    @%p3 st.global.u32 [%rd8], %r10;
+
+    ret;
+}

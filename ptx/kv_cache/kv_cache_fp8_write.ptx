@@ -1,0 +1,133 @@
+// kv_cache_fp8_write.ptx
+//
+// Fused BF16→FP8 quantization + KV-cache write.
+// Writes one new token's K/V into a paged FP8 cache at given slot positions.
+//
+// Layouts:
+//   new_k, new_v: [B, H, D=128] BF16 (current token's K and V per batch-head)
+//   k_cache, v_cache: [num_pages, page_size, H, D] FP8 E4M3
+//   page_indices: [B] u32 (which physical page to write to per batch)
+//   slot_in_page: [B] u32 (which slot within the page, 0..page_size)
+//   k_scale, v_scale: f32 (dequant-side scale; write value = bf16_val / scale)
+//
+// Grid: (num_heads, batch). Block: (32, 1, 1) — one warp; thread t writes 4 dims.
+// D=128 → 32 threads × 4 dims = 128 perfectly.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+#define D 128
+
+.visible .entry kv_cache_fp8_write(
+    .param .u64 param_new_k,
+    .param .u64 param_new_v,
+    .param .u64 param_k_cache,
+    .param .u64 param_v_cache,
+    .param .u64 param_page_indices,
+    .param .u64 param_slot_in_page,
+    .param .u32 param_num_heads,
+    .param .u32 param_page_size,
+    .param .f32 param_k_scale,
+    .param .f32 param_v_scale
+)
+{
+    .reg .b32 %r<32>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<16>;
+    .reg .b16 %h<8>;
+
+    mov.u32     %r0, %tid.x;           // 0..31
+    mov.u32     %r1, %ctaid.x;         // head
+    mov.u32     %r2, %ctaid.y;         // batch
+
+    ld.param.u64 %rd0, [param_new_k];
+    ld.param.u64 %rd1, [param_new_v];
+    ld.param.u64 %rd2, [param_k_cache];
+    ld.param.u64 %rd3, [param_v_cache];
+    ld.param.u64 %rd4, [param_page_indices];
+    ld.param.u64 %rd5, [param_slot_in_page];
+    ld.param.u32 %r3, [param_num_heads];
+    ld.param.u32 %r4, [param_page_size];
+    ld.param.f32 %f10, [param_k_scale];
+    ld.param.f32 %f11, [param_v_scale];
+
+    // Reciprocal: we multiply by 1/scale to divide.
+    rcp.approx.f32 %f10, %f10;
+    rcp.approx.f32 %f11, %f11;
+
+    // Load page + slot for this batch
+    mul.wide.u32 %rd6, %r2, 4;
+    add.u64     %rd7, %rd4, %rd6;
+    ld.global.u32 %r5, [%rd7];          // page_idx
+    add.u64     %rd7, %rd5, %rd6;
+    ld.global.u32 %r6, [%rd7];          // slot
+
+    // Source address: new_k + (b*H + h)*D*2 + t*4*2 (= t*8, 4 BF16)
+    mul.lo.u32  %r7, %r2, %r3;
+    add.u32     %r7, %r7, %r1;          // b*H + h
+    mul.lo.u32  %r8, %r7, D;
+    mul.wide.u32 %rd8, %r8, 2;
+    shl.b32     %r9, %r0, 3;
+    cvt.u64.u32 %rd9, %r9;
+    add.u64     %rd10, %rd0, %rd8;
+    add.u64     %rd10, %rd10, %rd9;    // &new_k[b,h,t*4]
+    add.u64     %rd11, %rd1, %rd8;
+    add.u64     %rd11, %rd11, %rd9;    // &new_v[b,h,t*4]
+
+    // Destination address in cache:
+    //   cache + (page_idx * page_size + slot) * H * D + h * D + t*4
+    // (cache element = 1 byte FP8)
+    mul.lo.u32  %r10, %r5, %r4;
+    add.u32     %r10, %r10, %r6;        // page_row = page_idx*page_size + slot
+    mul.lo.u32  %r11, %r10, %r3;
+    add.u32     %r11, %r11, %r1;        // row*H + h
+    mul.lo.u32  %r11, %r11, D;
+    shl.b32     %r12, %r0, 2;           // t*4 bytes (since FP8=1B)
+    add.u32     %r11, %r11, %r12;
+    cvt.u64.u32 %rd12, %r11;
+    add.u64     %rd13, %rd2, %rd12;    // &k_cache[...]
+    add.u64     %rd14, %rd3, %rd12;    // &v_cache[...]
+
+    // K: load 4 BF16, dequant-scale, convert to FP8, pack, store
+    ld.global.v2.b32 {%r20, %r21}, [%rd10];
+    mov.b32     {%h0, %h1}, %r20;
+    mov.b32     {%h2, %h3}, %r21;
+    CVT_BF16_F32(%f0, %h0)
+    CVT_BF16_F32(%f1, %h1)
+    CVT_BF16_F32(%f2, %h2)
+    CVT_BF16_F32(%f3, %h3)
+    mul.f32     %f0, %f0, %f10;
+    mul.f32     %f1, %f1, %f10;
+    mul.f32     %f2, %f2, %f10;
+    mul.f32     %f3, %f3, %f10;
+    // Paired FP32 → FP8 E4M3 (two at a time)
+    .reg .b16 _p01, _p23;
+    cvt.rn.satfinite.e4m3x2.f32 _p01, %f1, %f0;   // {lo=f0, hi=f1}
+    cvt.rn.satfinite.e4m3x2.f32 _p23, %f3, %f2;
+    // Pack to 32-bit and store
+    mov.b32     %r22, {_p01, _p23};
+    st.global.b32 [%rd13], %r22;
+
+    // V: same dance
+    ld.global.v2.b32 {%r20, %r21}, [%rd11];
+    mov.b32     {%h0, %h1}, %r20;
+    mov.b32     {%h2, %h3}, %r21;
+    CVT_BF16_F32(%f0, %h0)
+    CVT_BF16_F32(%f1, %h1)
+    CVT_BF16_F32(%f2, %h2)
+    CVT_BF16_F32(%f3, %h3)
+    mul.f32     %f0, %f0, %f11;
+    mul.f32     %f1, %f1, %f11;
+    mul.f32     %f2, %f2, %f11;
+    mul.f32     %f3, %f3, %f11;
+    cvt.rn.satfinite.e4m3x2.f32 _p01, %f1, %f0;
+    cvt.rn.satfinite.e4m3x2.f32 _p23, %f3, %f2;
+    mov.b32     %r22, {_p01, _p23};
+    st.global.b32 [%rd14], %r22;
+
+    ret;
+}

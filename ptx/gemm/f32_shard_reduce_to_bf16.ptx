@@ -1,0 +1,94 @@
+// f32_shard_reduce_to_bf16.ptx
+//
+// Companion to gemv_bf16_split_k_det. Sums the per-shard partials produced
+// by that kernel and casts the result to BF16 in one pass.
+//
+// Input:  stage_f32[num_shards, N] — laid out shard-major, contiguous N
+// Output: out_bf16[N]
+//
+// One thread per output column. The num_shards loop is short (≤ 16 in
+// practice) so an unrolled-by-runtime loop is fine. Reads are strided by
+// N across shards but the working set per thread is only num_shards × 4
+// bytes — L1-cache-friendly. This kernel runs once per GEMV after the
+// det split-K finishes; total cost is ~N×num_shards f32 reads + N f32
+// adds + N bf16 stores. Tiny compared to the matmul itself.
+//
+// Grid: (ceil(N / 256), 1, 1)
+// Block: 256 threads
+// SMEM: 0
+// Constraints: none on N (no alignment required).
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+
+.visible .entry f32_shard_reduce_to_bf16(
+    .param .u64 param_stage_f32,   // [num_shards, N] f32
+    .param .u64 param_out_bf16,    // [N] bf16
+    .param .u32 param_n,
+    .param .u32 param_num_shards
+)
+{
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<8>;
+    .reg .f32 %f<4>;
+    .reg .b16 %h<2>;
+    .reg .pred %p<4>;
+
+    mov.u32         %r0, %ctaid.x;
+    mov.u32         %r1, %tid.x;
+    mov.u32         %r2, %ntid.x;             // 256
+    mad.lo.u32      %r3, %r0, %r2, %r1;       // n = block*256 + tid
+
+    ld.param.u64    %rd0, [param_stage_f32];
+    ld.param.u64    %rd1, [param_out_bf16];
+    ld.param.u32    %r4, [param_n];
+    ld.param.u32    %r5, [param_num_shards];
+
+    setp.ge.u32     %p0, %r3, %r4;
+    @%p0 bra        ret;
+
+    // sum = 0.0
+    mov.f32         %f0, 0.0;
+
+    // Per-shard pointer increment in bytes = N * 4
+    shl.b32         %r6, %r4, 2;               // N * 4
+    cvt.u64.u32     %rd2, %r6;
+
+    // First slot: stage_f32[0, n] = base + n * 4
+    mul.wide.u32    %rd3, %r3, 4;
+    add.u64         %rd4, %rd0, %rd3;
+
+    mov.u32         %r7, 0;                    // shard counter
+shard_loop:
+    setp.ge.u32     %p1, %r7, %r5;
+    @%p1 bra        shard_done;
+
+    ld.global.f32   %f1, [%rd4];
+    add.f32         %f0, %f0, %f1;
+
+    add.u64         %rd4, %rd4, %rd2;          // advance by N floats
+    add.u32         %r7, %r7, 1;
+    bra             shard_loop;
+
+shard_done:
+    // Cast f32 → bf16 (round-to-nearest-even, mirroring the existing f32_to_bf16 kernel).
+    mov.b32         %r10, %f0;
+    // Round-to-nearest-even truncation: bias = 0x7FFF + ((mantissa & 0x10000) >> 16)
+    and.b32         %r11, %r10, 0x10000;
+    shr.b32         %r11, %r11, 16;
+    add.u32         %r11, %r11, 0x7FFF;
+    add.u32         %r12, %r10, %r11;
+    shr.b32         %r12, %r12, 16;
+    cvt.u16.u32     %h0, %r12;
+
+    // out_bf16[n]
+    mul.wide.u32    %rd5, %r3, 2;
+    add.u64         %rd6, %rd1, %rd5;
+    st.global.b16   [%rd6], %h0;
+
+ret:
+    ret;
+}

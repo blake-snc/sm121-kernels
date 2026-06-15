@@ -1,0 +1,5 @@
+# Generated PTX variants are reproducible artifacts of scripts/gen_ptx_variants.sh
+# from ptx/attention/templates/. The template + manifest are the source of truth;
+# the cubin-identity gate (scripts/check_codegen_identity.sh) proves these match the
+# hand-written ptx/attention/*.ptx byte-for-byte. Do not commit the outputs.
+*.ptx

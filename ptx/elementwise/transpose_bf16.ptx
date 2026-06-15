@@ -1,0 +1,136 @@
+// transpose_bf16.ptx
+//
+// Out-of-place 2-D BF16 matrix transpose: dst[N, M] = src[M, N].
+//
+// Used by the MMA backward GEMM dispatchers: dA = dC @ B^T is computed as
+// gemm_mma(dC, transpose(B)) without writing a B-transposed-MMA kernel.
+//
+// Block-tiled for coalesced loads + stores. 32x32 SMEM tile (with +1 pad to
+// avoid bank conflicts on the 32-wide stores), 32 threads per row, 1 row per
+// CTA worker.
+//
+// Grid: (ceil(N / 32), ceil(M / 32), 1)  — block.x indexes columns of src
+// Block: (32, 8, 1)                        — 32x8 = 256 threads per CTA
+// Each block reads a 32x32 tile from src and writes its transpose to dst.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+
+#define TILE 32
+
+.visible .entry transpose_bf16(
+    .param .u64 param_src,      // [M, N] bf16 row-major
+    .param .u64 param_dst,      // [N, M] bf16 row-major
+    .param .u32 param_M,
+    .param .u32 param_N
+)
+{
+    .reg .b32  %r<24>;
+    .reg .b64  %rd<10>;
+    .reg .b16  %sh<2>;
+    .reg .pred %p<4>;
+
+    // 32 cols x 33 rows of bf16 = 33*32*2 = 2112 bytes (pad avoids bank conflicts).
+    .shared .align 4 .b8 smem[2112];
+
+    mov.u32         %r0, %ctaid.x;          // tile_n (which 32-wide block of N)
+    mov.u32         %r1, %ctaid.y;          // tile_m (which 32-wide block of M)
+    mov.u32         %r2, %tid.x;            // x in 0..31 (col within tile)
+    mov.u32         %r3, %tid.y;            // y in 0..7 (row stride)
+
+    ld.param.u64    %rd0, [param_src];
+    ld.param.u64    %rd1, [param_dst];
+    ld.param.u32    %r4, [param_M];
+    ld.param.u32    %r5, [param_N];
+
+    // ── Load 32x32 tile from src into SMEM ──────────────────────────────
+    // Each thread covers TILE/blockDim.y = 4 rows: y, y+8, y+16, y+24.
+    shl.b32         %r6, %r1, 5;            // m_base = tile_m * 32
+    shl.b32         %r7, %r0, 5;            // n_base = tile_n * 32
+
+    mov.u32         %r8, smem;              // smem base
+
+    // Process 4 rows per thread.
+    mov.u32         %r9, 0;                 // row iter
+load_loop:
+    setp.ge.u32     %p0, %r9, 4;
+    @%p0 bra        load_done;
+
+    // local row in tile = y + iter*8
+    shl.b32         %r10, %r9, 3;
+    add.u32         %r11, %r3, %r10;        // local_row in [0, 32)
+
+    // global m = m_base + local_row
+    add.u32         %r12, %r6, %r11;
+    // global n = n_base + x
+    add.u32         %r13, %r7, %r2;
+
+    setp.ge.u32     %p1, %r12, %r4;
+    setp.ge.u32     %p2, %r13, %r5;
+    or.pred         %p1, %p1, %p2;
+
+    // src offset: (m * N + n) * 2
+    mad.lo.u32      %r14, %r12, %r5, %r13;
+    mul.wide.u32    %rd2, %r14, 2;
+    add.u64         %rd3, %rd0, %rd2;
+
+    mov.b16         %sh0, 0;
+    @!%p1 ld.global.b16 %sh0, [%rd3];
+
+    // smem offset: (local_row * 33 + x) * 2 (use 33-stride to dodge banks)
+    mul.lo.u32      %r15, %r11, 33;
+    add.u32         %r16, %r15, %r2;
+    shl.b32         %r17, %r16, 1;
+    add.u32         %r18, %r8, %r17;
+    st.shared.b16   [%r18], %sh0;
+
+    add.u32         %r9, %r9, 1;
+    bra             load_loop;
+
+load_done:
+    bar.sync        0;
+
+    // ── Store transposed: dst[n_base+x, m_base+local_row] = smem[local_row, x] ──
+    // We want dst[n_base + (y + iter*8), m_base + x] for each iter. The SMEM
+    // we read for this is smem[x, y + iter*8] — i.e., transpose lookup.
+
+    mov.u32         %r9, 0;
+store_loop:
+    setp.ge.u32     %p0, %r9, 4;
+    @%p0 bra        store_done;
+
+    shl.b32         %r10, %r9, 3;
+    add.u32         %r11, %r3, %r10;        // local_row_in_DST_tile (i.e., col in src tile)
+
+    // global n = n_base + local_row_DST
+    add.u32         %r12, %r7, %r11;
+    // global m = m_base + x
+    add.u32         %r13, %r6, %r2;
+
+    setp.ge.u32     %p1, %r12, %r5;
+    setp.ge.u32     %p2, %r13, %r4;
+    or.pred         %p1, %p1, %p2;
+
+    // SMEM read: smem[x, local_row_DST] -> offset (x * 33 + local_row_DST) * 2
+    mul.lo.u32      %r15, %r2, 33;
+    add.u32         %r16, %r15, %r11;
+    shl.b32         %r17, %r16, 1;
+    add.u32         %r18, %r8, %r17;
+    ld.shared.b16   %sh0, [%r18];
+
+    // dst offset: (n * M + m) * 2
+    mad.lo.u32      %r19, %r12, %r4, %r13;
+    mul.wide.u32    %rd2, %r19, 2;
+    add.u64         %rd3, %rd1, %rd2;
+
+    @!%p1 st.global.b16 [%rd3], %sh0;
+
+    add.u32         %r9, %r9, 1;
+    bra             store_loop;
+
+store_done:
+    ret;
+}

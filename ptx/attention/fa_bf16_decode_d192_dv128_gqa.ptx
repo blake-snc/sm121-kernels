@@ -1,0 +1,249 @@
+// fa_bf16_decode_d192_dv128_gqa.ptx
+//
+// Asymmetric K/V flash-attention DECODE kernel (Sq=1) with d_qk=192 and
+// d_v=128. Adapted from `fa_bf16_decode_d128_gqa.ptx` for the case where
+// the QK inner-product dimension differs from the V/output dimension —
+// the layout DeepSeek V3-style attention produces when K is
+// `concat(k_nope, k_rope)` with sizes 128+64=192 and V stays at 128.
+//
+// Layout:
+//   Q       : [B, H, D_QK]                       BF16  (D_QK = 192)
+//   K       : [B, num_kv_heads, kv_stride, D_QK] BF16  (D_QK = 192)
+//   V       : [B, num_kv_heads, kv_stride, D_V ] BF16  (D_V  = 128)
+//   O       : [B, H, D_V]                        BF16
+//   scale   : f32  (typically 1/sqrt(D_QK))
+//
+// kv_stride is the maximum sequence length the cache was allocated for; the
+// kernel iterates k in 0..seq_kv (the actual valid length) and uses
+// kv_stride for the per-head offset (matches the d=128 sibling).
+//
+// Block: (192, 1, 1) — 6 warps. Threads 0..191 all participate in Q/K load
+// and the QK reduction. Threads 0..127 (d_v in [0, 128)) additionally hold
+// the V accumulator and store the output O[d_v]. Threads 128..191 (d_qk
+// only) keep their O accumulator at 0; their store is skipped.
+//
+// Grid: (num_q_heads, batch_size).
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+#define D_QK 192
+#define D_V  128
+
+// SMEM: 6 warp partials × 4 bytes = 24 bytes for reduction, plus 4 bytes
+// for the broadcast score. Pad to 1 KB for parity with sibling kernels.
+.shared .align 128 .b8 smem_d192_dv128_decode[1024];
+
+#define OFF_SCORE   0
+#define OFF_RED     64
+
+.visible .entry fa_bf16_decode_d192_dv128_gqa(
+    .param .u64 param_Q,
+    .param .u64 param_K,
+    .param .u64 param_V,
+    .param .u64 param_O,
+    .param .u32 param_num_heads,        // num_q_heads
+    .param .u32 param_num_kv_heads,
+    .param .u32 param_seq_kv,
+    .param .u32 param_kv_stride,        // max_seq (cache stride per kv_head)
+    .param .f32 param_scale
+)
+{
+    .reg .b32  %r<70>;
+    .reg .b64  %rd<24>;
+    .reg .f32  %f<32>;
+    .reg .b16  %h<8>;
+    .reg .pred %p<8>;
+
+    mov.u32      %r0, %tid.x;                 // d_qk (0..191)
+    mov.u32      %r1, %ctaid.x;               // q_head
+    mov.u32      %r2, %ctaid.y;               // batch
+    shr.b32      %r3, %r0, 5;                 // warp_id (0..5)
+    and.b32      %r4, %r0, 31;                // lane (0..31)
+
+    ld.param.u64 %rd0, [param_Q];
+    ld.param.u64 %rd1, [param_K];
+    ld.param.u64 %rd2, [param_V];
+    ld.param.u64 %rd3, [param_O];
+    ld.param.u32 %r10, [param_num_heads];
+    ld.param.u32 %r50, [param_num_kv_heads];
+    ld.param.u32 %r11, [param_seq_kv];
+    ld.param.u32 %r53, [param_kv_stride];
+    ld.param.f32 %f20, [param_scale];
+
+    // GQA: kv_head = q_head / (num_q_heads / num_kv_heads)
+    div.u32      %r51, %r10, %r50;
+    div.u32      %r52, %r1, %r51;
+
+    // Q base: batch * num_q_heads * D_QK + q_head * D_QK, in BF16 elements.
+    mul.lo.u32   %r12, %r2, %r10;
+    mul.lo.u32   %r12, %r12, D_QK;
+    mul.lo.u32   %r13, %r1, D_QK;
+    add.u32      %r12, %r12, %r13;
+    mul.wide.u32 %rd4, %r12, 2;
+    add.u64      %rd4, %rd0, %rd4;            // &Q[batch, q_head, 0] BF16
+
+    // O base: batch * num_q_heads * D_V + q_head * D_V (different dim!)
+    mul.lo.u32   %r18, %r2, %r10;
+    mul.lo.u32   %r18, %r18, D_V;
+    mul.lo.u32   %r19, %r1, D_V;
+    add.u32      %r18, %r18, %r19;
+    mul.wide.u32 %rd6, %r18, 2;
+    add.u64      %rd6, %rd3, %rd6;            // &O[batch, q_head, 0] BF16
+
+    // K base: batch * num_kv_heads * kv_stride * D_QK + kv_head * kv_stride * D_QK
+    mul.lo.u32   %r14, %r50, %r53;
+    mul.lo.u32   %r14, %r14, D_QK;
+    mul.lo.u32   %r15, %r2, %r14;
+    mul.lo.u32   %r16, %r53, D_QK;
+    mul.lo.u32   %r17, %r52, %r16;
+    add.u32      %r15, %r15, %r17;
+    mul.wide.u32 %rd5, %r15, 2;
+    add.u64      %rd16, %rd1, %rd5;           // &K[batch, kv_head, 0, 0]
+
+    // V base: batch * num_kv_heads * kv_stride * D_V + kv_head * kv_stride * D_V
+    mul.lo.u32   %r22, %r50, %r53;
+    mul.lo.u32   %r22, %r22, D_V;
+    mul.lo.u32   %r23, %r2, %r22;
+    mul.lo.u32   %r24, %r53, D_V;
+    mul.lo.u32   %r25, %r52, %r24;
+    add.u32      %r23, %r23, %r25;
+    mul.wide.u32 %rd8, %r23, 2;
+    add.u64      %rd17, %rd2, %rd8;           // &V[batch, kv_head, 0, 0]
+
+    // === Load Q[d_qk] for this thread (kept in register %f0). ===
+    // All 192 threads load their Q dim — needed for the QK partial reduction.
+    shl.b32      %r20, %r0, 1;
+    cvt.u64.u32  %rd7, %r20;
+    add.u64      %rd7, %rd4, %rd7;
+    ld.global.b16 %h0, [%rd7];
+    CVT_BF16_F32(%f0, %h0)
+
+    mov.u32      %r21, smem_d192_dv128_decode;
+
+    // === Init online-softmax state ===
+    mov.f32      %f25, 0fFF800000;            // m_i = -inf
+    mov.f32      %f26, 0.0;                   // l_i = 0
+    mov.f32      %f27, 0.0;                   // O_acc[d_v] = 0 (d_v threads only;
+                                              //   threads 128..191 keep this at 0
+                                              //   and skip the store)
+
+    // Threads 0..127 are the V-accumulator threads. Predicate flag for the V
+    // phase + final O store.
+    setp.lt.u32  %p3, %r0, D_V;
+
+    bar.sync 0;
+
+    // === KV loop: k = 0 .. seq_kv-1 ===
+    mov.u32      %r30, 0;
+kv_loop:
+    setp.ge.u32  %p0, %r30, %r11;
+    @%p0 bra     kv_done;
+
+    // K[kv_head, k, d_qk] BF16 = base + (k*D_QK + d_qk) * 2
+    mul.lo.u32   %r31, %r30, D_QK;
+    add.u32      %r31, %r31, %r0;
+    shl.b32      %r31, %r31, 1;
+    cvt.u64.u32  %rd9, %r31;
+    add.u64      %rd9, %rd16, %rd9;
+    ld.global.b16 %h1, [%rd9];
+
+    .reg .f32 _kv_qk;
+    CVT_BF16_F32(_kv_qk, %h1)
+
+    .reg .f32 _qk;
+    mul.f32      _qk, %f0, _kv_qk;
+
+    // Warp-level reduction (5 butterflies → all lanes have warp sum)
+    .reg .f32 _t;
+    shfl.sync.bfly.b32 _t|%p1, _qk, 0x10, 0x1f, 0xffffffff; add.f32 _qk, _qk, _t;
+    shfl.sync.bfly.b32 _t|%p1, _qk, 0x08, 0x1f, 0xffffffff; add.f32 _qk, _qk, _t;
+    shfl.sync.bfly.b32 _t|%p1, _qk, 0x04, 0x1f, 0xffffffff; add.f32 _qk, _qk, _t;
+    shfl.sync.bfly.b32 _t|%p1, _qk, 0x02, 0x1f, 0xffffffff; add.f32 _qk, _qk, _t;
+    shfl.sync.bfly.b32 _t|%p1, _qk, 0x01, 0x1f, 0xffffffff; add.f32 _qk, _qk, _t;
+
+    // Lane 0 of each warp writes its partial to SMEM_RED[warp_id]
+    add.u32      %r33, %r21, OFF_RED;
+    setp.eq.u32  %p2, %r4, 0;
+    shl.b32      %r34, %r3, 2;
+    add.u32      %r35, %r33, %r34;
+    @%p2 st.shared.f32 [%r35], _qk;
+
+    bar.sync 0;
+
+    // Thread 0 reduces the 6 warp-partials, scales, broadcasts via SMEM_SCORE
+    setp.ne.u32  %p2, %r0, 0;
+    @%p2 bra     score_ready;
+    .reg .f32 _w0, _w1, _w2, _w3, _w4, _w5, _sum;
+    ld.shared.f32 _w0, [%r33];
+    ld.shared.f32 _w1, [%r33 + 4];
+    ld.shared.f32 _w2, [%r33 + 8];
+    ld.shared.f32 _w3, [%r33 + 12];
+    ld.shared.f32 _w4, [%r33 + 16];
+    ld.shared.f32 _w5, [%r33 + 20];
+    add.f32      _sum, _w0, _w1;
+    add.f32      _sum, _sum, _w2;
+    add.f32      _sum, _sum, _w3;
+    add.f32      _sum, _sum, _w4;
+    add.f32      _sum, _sum, _w5;
+    mul.f32      _sum, _sum, %f20;            // * scale
+    add.u32      %r36, %r21, OFF_SCORE;
+    st.shared.f32 [%r36], _sum;
+score_ready:
+
+    bar.sync 0;
+
+    .reg .f32 _score;
+    add.u32      %r36, %r21, OFF_SCORE;
+    ld.shared.f32 _score, [%r36];
+
+    // Online softmax update
+    .reg .f32 _m_new, _alpha, _p;
+    max.f32      _m_new, %f25, _score;
+    sub.f32      _alpha, %f25, _m_new;
+    ex2.approx.f32 _alpha, _alpha;
+    sub.f32      _p, _score, _m_new;
+    ex2.approx.f32 _p, _p;
+
+    fma.rn.f32   %f26, %f26, _alpha, _p;      // l_i (all threads compute; only used by d_v thread set in store)
+    mul.f32      %f27, %f27, _alpha;          // O_acc rescale (no-op for d_qk-only threads since %f27=0)
+
+    // V[kv_head, k, d_v] BF16 — only d_v threads (tid < 128) load and accumulate.
+    @%p3 mul.lo.u32 %r31, %r30, D_V;
+    @%p3 add.u32    %r31, %r31, %r0;
+    @%p3 shl.b32    %r31, %r31, 1;
+    @%p3 cvt.u64.u32 %rd9, %r31;
+    @%p3 add.u64    %rd9, %rd17, %rd9;
+    .reg .f32 _v_val;
+    mov.f32      _v_val, 0.0;
+    @%p3 ld.global.b16 %h1, [%rd9];
+    @%p3 cvt.u32.u16 %r37, %h1;               // helper register; CVT_BF16_F32 expects b16
+    @%p3 CVT_BF16_F32(_v_val, %h1)
+
+    @%p3 fma.rn.f32 %f27, _p, _v_val, %f27;   // O_acc[d_v] += p * V[k, d_v]
+
+    mov.f32      %f25, _m_new;
+
+    add.u32      %r30, %r30, 1;
+    bra          kv_loop;
+kv_done:
+
+    // === Final normalize and write (d_v threads only) ===
+    rcp.approx.f32 %f28, %f26;
+    mul.f32      %f27, %f27, %f28;
+
+    @!%p3 bra    skip_store;
+    .reg .b16 _o_bf16;
+    CVT_F32_BF16(_o_bf16, %f27)
+    shl.b32      %r40, %r0, 1;
+    cvt.u64.u32  %rd11, %r40;
+    add.u64      %rd12, %rd6, %rd11;
+    st.global.b16 [%rd12], _o_bf16;
+skip_store:
+
+    ret;
+}

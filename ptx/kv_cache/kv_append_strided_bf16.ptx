@@ -1,0 +1,75 @@
+// kv_append_strided_bf16.ptx
+//
+// Strided append into a head-major KV cache.
+//
+// Layout:
+//   src_k, src_v : [n_kv * head_dim]              BF16 (compact new row)
+//   dst_k, dst_v : [n_kv, max_seq, head_dim]      BF16 (cache, head-major)
+//
+// Per kv_head h, copies src_*[h*head_dim .. (h+1)*head_dim] into
+// dst_*[h*max_seq*head_dim + position*head_dim ..].
+//
+// Replaces 2 * n_kv dtod-async memcpys (one per K/V head) with a single
+// kernel launch. For Qwen3-1.7B (n_kv=8, 28 layers), this collapses
+// 448 launches/token into 28.
+//
+// Grid: (n_kv, 1, 1)        - one CTA per kv_head
+// Block: (head_dim, 1, 1)   - one thread per element (head_dim <= 1024)
+// Each thread does 2 BF16 stores (one K, one V).
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+.visible .entry kv_append_strided_bf16(
+    .param .u64 param_src_k,
+    .param .u64 param_src_v,
+    .param .u64 param_dst_k,
+    .param .u64 param_dst_v,
+    .param .u32 param_position,
+    .param .u32 param_max_seq,
+    .param .u32 param_head_dim
+)
+{
+    .reg .b32 %r<10>;
+    .reg .b64 %rd<10>;
+    .reg .b16 %h<2>;
+
+    mov.u32       %r0, %tid.x;       // d (0..head_dim-1)
+    mov.u32       %r1, %ctaid.x;     // h (0..n_kv-1)
+
+    ld.param.u64  %rd0, [param_src_k];
+    ld.param.u64  %rd1, [param_src_v];
+    ld.param.u64  %rd2, [param_dst_k];
+    ld.param.u64  %rd3, [param_dst_v];
+    ld.param.u32  %r2, [param_position];
+    ld.param.u32  %r3, [param_max_seq];
+    ld.param.u32  %r4, [param_head_dim];
+
+    // src offset (BF16 elements) = h * head_dim + d
+    mul.lo.u32    %r5, %r1, %r4;
+    add.u32       %r5, %r5, %r0;
+    mul.wide.u32  %rd4, %r5, 2;
+
+    // dst offset (BF16 elements) = h * max_seq * head_dim + position * head_dim + d
+    mul.lo.u32    %r6, %r1, %r3;
+    mul.lo.u32    %r6, %r6, %r4;
+    mul.lo.u32    %r7, %r2, %r4;
+    add.u32       %r6, %r6, %r7;
+    add.u32       %r6, %r6, %r0;
+    mul.wide.u32  %rd5, %r6, 2;
+
+    // src_k[off] -> dst_k[off]
+    add.u64       %rd6, %rd0, %rd4;
+    add.u64       %rd7, %rd2, %rd5;
+    ld.global.b16 %h0, [%rd6];
+    st.global.b16 [%rd7], %h0;
+
+    // src_v[off] -> dst_v[off]
+    add.u64       %rd6, %rd1, %rd4;
+    add.u64       %rd7, %rd3, %rd5;
+    ld.global.b16 %h1, [%rd6];
+    st.global.b16 [%rd7], %h1;
+
+    ret;
+}

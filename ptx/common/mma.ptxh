@@ -1,0 +1,67 @@
+// mma.ptxh
+// MMA instruction wrappers for SM121a (MMAv2: mma.sync.aligned)
+
+#ifndef SPARK_MMA_PTXH
+#define SPARK_MMA_PTXH
+
+// BF16 MMA: m16n8k16, row.col layout, f32 accumulation
+// In-place accumulate: D registers = C registers (accumulate into same regs)
+// d0..d3: .f32 accumulator regs (read as C, written as D)
+// a0..a3: .b32 A-operand regs (each holds 2 bf16)
+// b0,b1:  .b32 B-operand regs (each holds 2 bf16)
+#define MMA_BF16_M16N8K16(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1) \
+    mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 \
+        {d0, d1, d2, d3}, {a0, a1, a2, a3}, {b0, b1}, {d0, d1, d2, d3};
+
+// FP8 MMA: m16n8k32, row.col layout, f32 accumulation
+//
+// Register layout (validated on SM121a):
+//   A fragment (row-major, 16 rows x 32 cols):
+//     a0 = {K0,  K1,  K2,  K3 } of upper row group
+//     a1 = {K0,  K1,  K2,  K3 } of lower row group
+//     a2 = {K16, K17, K18, K19} of upper row group
+//     a3 = {K16, K17, K18, K19} of lower row group
+//     NOTE: K-halves interleave as {upper_k0, lower_k0, upper_k16, lower_k16}
+//
+//   B fragment (col-major, 8 cols x 32 rows):
+//     b0 = 4 bytes from K first half (K0..K15)
+//     b1 = 4 bytes from K second half (K16..K31)
+//     NOTE: K-split (NOT N-split like standard m16n8k32)
+//
+//   D fragment (f32 accumulator): same layout as BF16 MMA
+//     d0 = row0_col0, d1 = row0_col1, d2 = row8_col0, d3 = row8_col1
+//
+// a0..a3: .b32 A-operand regs (each holds 4 e4m3)
+// b0,b1:  .b32 B-operand regs (each holds 4 e4m3)
+#define MMA_FP8_M16N8K32(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1) \
+    mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 \
+        {d0, d1, d2, d3}, {a0, a1, a2, a3}, {b0, b1}, {d0, d1, d2, d3};
+
+// NVFP4 block-scaled MMA: m16n8k32, row.col, f32 accumulation with UE8M0 scales
+// K=32 means 32 bytes = 64 e2m1 elements per K-step.
+// Register layout identical to FP8 m16n8k32 (inherits SM80 int8 layout).
+// a0..a3: .b32 A-operand regs (nibble-packed e2m1)
+// b0,b1:  .b32 B-operand regs (nibble-packed e2m1)
+// sfa:    .b32 scale factor for A fragment (UE8M0 zero-extended to u32)
+// sfb:    .b32 scale factor for B fragment (UE8M0 zero-extended to u32)
+// bid/tid are all zero (CUTLASS convention).
+#define MMA_NVFP4_M16N8K32(d0, d1, d2, d3, a0, a1, a2, a3, b0, b1, sfa, sfb) \
+    mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e2m1.e2m1.f32.ue8m0 \
+        {d0, d1, d2, d3}, {a0, a1, a2, a3}, {b0, b1}, {d0, d1, d2, d3}, \
+        {sfa}, {0, 0}, {sfb}, {0, 0};
+
+// Load FP8 B fragment from row-major shared memory.
+// Loads 4 bytes at stride-32 addresses and packs into a .b32 register.
+// dst:  output .b32 register
+// addr: shared memory address of first byte (u32)
+// t0..t3: temporary .b32 registers
+#define LOAD_FP8_B_FRAG(dst, addr, t0, t1, t2, t3) \
+    ld.shared.u8 t0, [addr]; \
+    ld.shared.u8 t1, [addr + 32]; \
+    ld.shared.u8 t2, [addr + 64]; \
+    ld.shared.u8 t3, [addr + 96]; \
+    bfi.b32 dst, t1, t0, 8, 8; \
+    bfi.b32 dst, t2, dst, 16, 8; \
+    bfi.b32 dst, t3, dst, 24, 8;
+
+#endif // SPARK_MMA_PTXH

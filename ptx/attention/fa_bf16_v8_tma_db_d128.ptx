@@ -1,0 +1,757 @@
+// fa_bf16_v8_tma_db_d128.ptx
+//
+// Flash Attention V8: TMA + double-buffered KV.
+// 5 warps (160 threads): warps 0-3 = MMA, warp 4 = DMA.
+// Br=64, Bc=64, D=128. Grid: (ceil(seq_q/64), num_heads, batch). Block: (160,1,1).
+//
+// Double-buffer: K0/K1 and V0/V1 alternate each KV block iteration.
+// DMA prefetches next block while MMA computes current block.
+// Per-buffer mbarriers (K0/K1, V0/V1, DONE0/DONE1) avoid phase confusion.
+// Requires dynamic SMEM (90KB > 48KB default).
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+#include "mma.ptxh"
+#include "reduction.ptxh"
+
+#define BR 64
+#define BC 64
+#define D  128
+#define NUM_MMA_WARPS 4
+#define DMA_WARP_ID   4
+
+// SMEM layout (90224 bytes total, ~88 KB)
+#define SMEM_Q            0                    // 64*128*2 = 16384
+#define SMEM_K0           16384                // 64*128*2 = 16384
+#define SMEM_K1           32768                // 64*128*2 = 16384
+#define SMEM_V0           49152                // 64*128*2 = 16384
+#define SMEM_V1           65536                // 64*128*2 = 16384
+#define SMEM_P            81920                // 64*64*2  = 8192
+#define SMEM_MBAR_Q       90112                // 16 bytes
+#define SMEM_MBAR_K0      90128                // 16 bytes
+#define SMEM_MBAR_K1      90144                // 16 bytes  (= MBAR_K0 + 16)
+#define SMEM_MBAR_V0      90160                // 16 bytes
+#define SMEM_MBAR_V1      90176                // 16 bytes  (= MBAR_V0 + 16)
+#define SMEM_MBAR_DONE0   90192                // 16 bytes
+#define SMEM_MBAR_DONE1   90208                // 16 bytes  (= MBAR_DONE0 + 16)
+#define SMEM_TOTAL        90224
+
+#define LOG2E 1.4426950408889634
+
+// Dynamic shared memory (>48KB requires cuFuncSetAttribute)
+.extern .shared .align 128 .b8 smem[];
+
+.visible .entry flash_attn_bf16_v8_tma_db_d128(
+    .param .u64 param_Q_tma_ptr,
+    .param .u64 param_K_tma_ptr,
+    .param .u64 param_V_tma_ptr,
+    .param .u64 param_O,
+    .param .u32 param_seq_q,
+    .param .u32 param_seq_kv,
+    .param .u32 param_num_heads,
+    .param .f32 param_scale
+)
+{
+    .reg .b32  %r<180>;
+    .reg .b64  %rd<32>;
+    .reg .f32  %f<200>;
+    .reg .b16  %h<8>;
+    .reg .pred %p<16>;
+
+    mov.u32         %r0, %tid.x;
+    shr.b32         %r1, %r0, 5;             // warp_id
+    and.b32         %r2, %r0, 31;            // lane
+
+    mov.u32         %r3, %ctaid.x;           // q_block
+    mov.u32         %r4, %ctaid.y;           // head
+    mov.u32         %r5, %ctaid.z;           // batch
+
+    ld.param.u32    %r6, [param_seq_q];
+    ld.param.u32    %r7, [param_seq_kv];
+    ld.param.u32    %r8, [param_num_heads];
+    ld.param.f32    %f196, [param_scale];
+
+    // Thread 0: init 7 mbarriers
+    setp.eq.u32     %p0, %r0, 0;
+    @%p0 mbarrier.init.shared.b64 [smem + SMEM_MBAR_Q], 1;
+    @%p0 mbarrier.init.shared.b64 [smem + SMEM_MBAR_K0], 1;
+    @%p0 mbarrier.init.shared.b64 [smem + SMEM_MBAR_K1], 1;
+    @%p0 mbarrier.init.shared.b64 [smem + SMEM_MBAR_V0], 1;
+    @%p0 mbarrier.init.shared.b64 [smem + SMEM_MBAR_V1], 1;
+    @%p0 mbarrier.init.shared.b64 [smem + SMEM_MBAR_DONE0], NUM_MMA_WARPS;
+    @%p0 mbarrier.init.shared.b64 [smem + SMEM_MBAR_DONE1], NUM_MMA_WARPS;
+    fence.mbarrier_init.release.cluster;
+    bar.sync 0;
+
+    // Global row offsets
+    mul.lo.u32      %r9, %r5, %r8;
+    add.u32         %r9, %r9, %r4;           // batch*H + head
+    mul.lo.u32      %r10, %r9, %r6;
+    shl.b32         %r11, %r3, 6;            // q_block * 64
+    add.u32         %r10, %r10, %r11;        // Q global row
+    mul.lo.u32      %r12, %r9, %r7;         // KV global row base
+
+    // TMA descriptors
+    ld.param.u64    %rd0, [param_Q_tma_ptr];
+    ld.param.u64    %rd1, [param_K_tma_ptr];
+    ld.param.u64    %rd2, [param_V_tma_ptr];
+
+    // Branch: warp 4 = DMA, warps 0-3 = MMA
+    setp.eq.u32     %p1, %r1, DMA_WARP_ID;
+    @%p1 bra        dma_path;
+
+    // ================================================================
+    // MMA WARP PATH (warps 0-3)
+    // ================================================================
+
+    // Compute MMA thread decomposition
+    shr.b32         %r13, %r2, 2;            // groupID = lane / 4
+    and.b32         %r14, %r2, 3;            // tidInGroup = lane % 4
+
+    // Wait Q
+mma_wait_q:
+    mbarrier.try_wait.parity.shared.b64 %p2, [smem + SMEM_MBAR_Q], 0;
+    @!%p2 bra mma_wait_q;
+
+    // ldmatrix Q -- each MMA warp loads from SMEM_Q + warp_id * 4096
+    setp.lt.u32     %p3, %r2, 16;
+    @%p3 mov.u32    %r20, %r2;
+    @!%p3 sub.u32   %r20, %r2, 16;
+    mul.lo.u32      %r21, %r20, 256;        // row * 256
+    @%p3 mov.u32    %r22, 0;
+    @!%p3 mov.u32   %r22, 16;               // half offset
+    mov.u32         %r23, smem;
+    mul.lo.u32      %r26, %r1, 4096;        // warp_id * 4096
+    add.u32         %r24, %r23, SMEM_Q;
+    add.u32         %r24, %r24, %r26;       // + warp offset
+    add.u32         %r24, %r24, %r21;       // + row offset
+    add.u32         %r24, %r24, %r22;       // + half offset
+
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r30, %r31, %r32, %r33}, [%r24];
+    add.u32         %r25, %r24, 32;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r34, %r35, %r36, %r37}, [%r25];
+    add.u32         %r25, %r25, 32;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r38, %r39, %r40, %r41}, [%r25];
+    add.u32         %r25, %r25, 32;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r42, %r43, %r44, %r45}, [%r25];
+    add.u32         %r25, %r25, 32;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r46, %r47, %r48, %r49}, [%r25];
+    add.u32         %r25, %r25, 32;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r50, %r51, %r52, %r53}, [%r25];
+    add.u32         %r25, %r25, 32;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r54, %r55, %r56, %r57}, [%r25];
+    add.u32         %r25, %r25, 32;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r58, %r59, %r60, %r61}, [%r25];
+
+    // ================================================================
+    // Initialize O accumulators and softmax state
+    // ================================================================
+    mov.f32 %f0, 0.0;   mov.f32 %f1, 0.0;   mov.f32 %f2, 0.0;   mov.f32 %f3, 0.0;
+    mov.f32 %f4, 0.0;   mov.f32 %f5, 0.0;   mov.f32 %f6, 0.0;   mov.f32 %f7, 0.0;
+    mov.f32 %f8, 0.0;   mov.f32 %f9, 0.0;   mov.f32 %f10, 0.0;  mov.f32 %f11, 0.0;
+    mov.f32 %f12, 0.0;  mov.f32 %f13, 0.0;  mov.f32 %f14, 0.0;  mov.f32 %f15, 0.0;
+    mov.f32 %f16, 0.0;  mov.f32 %f17, 0.0;  mov.f32 %f18, 0.0;  mov.f32 %f19, 0.0;
+    mov.f32 %f20, 0.0;  mov.f32 %f21, 0.0;  mov.f32 %f22, 0.0;  mov.f32 %f23, 0.0;
+    mov.f32 %f24, 0.0;  mov.f32 %f25, 0.0;  mov.f32 %f26, 0.0;  mov.f32 %f27, 0.0;
+    mov.f32 %f28, 0.0;  mov.f32 %f29, 0.0;  mov.f32 %f30, 0.0;  mov.f32 %f31, 0.0;
+    mov.f32 %f32, 0.0;  mov.f32 %f33, 0.0;  mov.f32 %f34, 0.0;  mov.f32 %f35, 0.0;
+    mov.f32 %f36, 0.0;  mov.f32 %f37, 0.0;  mov.f32 %f38, 0.0;  mov.f32 %f39, 0.0;
+    mov.f32 %f40, 0.0;  mov.f32 %f41, 0.0;  mov.f32 %f42, 0.0;  mov.f32 %f43, 0.0;
+    mov.f32 %f44, 0.0;  mov.f32 %f45, 0.0;  mov.f32 %f46, 0.0;  mov.f32 %f47, 0.0;
+    mov.f32 %f48, 0.0;  mov.f32 %f49, 0.0;  mov.f32 %f50, 0.0;  mov.f32 %f51, 0.0;
+    mov.f32 %f52, 0.0;  mov.f32 %f53, 0.0;  mov.f32 %f54, 0.0;  mov.f32 %f55, 0.0;
+    mov.f32 %f56, 0.0;  mov.f32 %f57, 0.0;  mov.f32 %f58, 0.0;  mov.f32 %f59, 0.0;
+    mov.f32 %f60, 0.0;  mov.f32 %f61, 0.0;  mov.f32 %f62, 0.0;  mov.f32 %f63, 0.0;
+
+    mov.b32         %f192, 0xff800000;        // row_max[0] = -inf
+    mov.b32         %f193, 0xff800000;        // row_max[1] = -inf
+    mov.f32         %f194, 0.0;               // row_sum[0] = 0
+    mov.f32         %f195, 0.0;               // row_sum[1] = 0
+
+    // Precompute lane-dependent K ldmatrix offsets (base is per-stage)
+    and.b32         %r71, %r2, 7;            // sub_lane = lane % 8
+    shr.b32         %r72, %r2, 3;
+    and.b32         %r72, %r72, 1;           // half = (lane/8) % 2
+    mul.lo.u32      %r73, %r71, 256;         // sub_lane * 256
+    shl.b32         %r74, %r72, 4;           // half * 16
+
+    // Precompute V ldmatrix lane offset
+    and.b32         %r130, %r2, 15;          // lane % 16
+    mul.lo.u32      %r131, %r130, 256;       // (lane%16) * 256
+
+    // P store addresses (MMA C-operand layout)
+    mul.lo.u32      %r140, %r1, 2048;       // warp_id * 2048
+    add.u32         %r115, %r23, SMEM_P;
+    add.u32         %r115, %r115, %r140;    // + warp offset
+    mul.lo.u32      %r116, %r13, 128;
+    shl.b32         %r117, %r14, 2;
+    add.u32         %r111, %r115, %r116;
+    add.u32         %r111, %r111, %r117;
+    add.u32         %r112, %r111, 1024;      // +8*128
+
+    // P ldmatrix addresses
+    @%p3 mul.lo.u32 %r118, %r2, 128;
+    @!%p3 sub.u32   %r118, %r2, 16;
+    @!%p3 mul.lo.u32 %r118, %r118, 128;
+    @!%p3 add.u32   %r118, %r118, 16;
+    add.u32         %r119, %r115, %r118;
+
+    // ================================================================
+    // KV BLOCK LOOP -- double-buffered
+    // ================================================================
+    add.u32         %r120, %r7, 63;
+    shr.b32         %r120, %r120, 6;         // num_kv_blocks
+
+    mov.u32         %r121, 0;                // kv_block = 0
+    mov.u32         %r150, 0;                // stage = 0
+    mov.u32         %r151, 0;                // k0_phase = 0
+    mov.u32         %r152, 0;                // k1_phase = 0
+    mov.u32         %r153, 0;                // v0_phase = 0
+    mov.u32         %r154, 0;                // v1_phase = 0
+
+kv_loop:
+    setp.ge.u32     %p7, %r121, %r120;
+    @%p7 bra        kv_done;
+
+    // ---- Compute K ldmatrix base for this stage ----
+    mul.lo.u32      %r170, %r150, 16384;     // stage * 16384
+    add.u32         %r75, %r23, SMEM_K0;
+    add.u32         %r75, %r75, %r170;       // K base = smem + SMEM_K0 + stage*16384
+    add.u32         %r75, %r75, %r73;        // + (lane%8)*256
+    add.u32         %r75, %r75, %r74;        // + ((lane/8)%2)*16
+
+    // ---- Compute K mbar addr and select K wait phase ----
+    mul.lo.u32      %r171, %r150, 16;        // stage * 16
+    add.u32         %r157, %r23, SMEM_MBAR_K0;
+    add.u32         %r157, %r157, %r171;     // K mbar = MBAR_K0 + stage*16
+    setp.eq.u32     %p14, %r150, 0;
+    selp.u32        %r155, %r151, %r152, %p14;  // k_phase = k0 or k1
+
+    // Wait K
+mma_wait_k:
+    mbarrier.try_wait.parity.shared.b64 %p4, [%r157], %r155;
+    @!%p4 bra mma_wait_k;
+
+    // Zero S accumulators
+    mov.f32 %f64, 0.0;  mov.f32 %f65, 0.0;  mov.f32 %f66, 0.0;  mov.f32 %f67, 0.0;
+    mov.f32 %f68, 0.0;  mov.f32 %f69, 0.0;  mov.f32 %f70, 0.0;  mov.f32 %f71, 0.0;
+    mov.f32 %f72, 0.0;  mov.f32 %f73, 0.0;  mov.f32 %f74, 0.0;  mov.f32 %f75, 0.0;
+    mov.f32 %f76, 0.0;  mov.f32 %f77, 0.0;  mov.f32 %f78, 0.0;  mov.f32 %f79, 0.0;
+    mov.f32 %f80, 0.0;  mov.f32 %f81, 0.0;  mov.f32 %f82, 0.0;  mov.f32 %f83, 0.0;
+    mov.f32 %f84, 0.0;  mov.f32 %f85, 0.0;  mov.f32 %f86, 0.0;  mov.f32 %f87, 0.0;
+    mov.f32 %f88, 0.0;  mov.f32 %f89, 0.0;  mov.f32 %f90, 0.0;  mov.f32 %f91, 0.0;
+    mov.f32 %f92, 0.0;  mov.f32 %f93, 0.0;  mov.f32 %f94, 0.0;  mov.f32 %f95, 0.0;
+
+    // Full QK GEMM: 8 kc x 8 ng = 64 MMA
+    #define QK_NG8(q0,q1,q2,q3, kb) \
+        ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%r100, %r101}, [kb]; \
+        MMA_BF16_M16N8K16(%f64,%f65,%f66,%f67, q0,q1,q2,q3, %r100,%r101) \
+        add.u32 %r82, kb, 2048; \
+        ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%r100, %r101}, [%r82]; \
+        MMA_BF16_M16N8K16(%f68,%f69,%f70,%f71, q0,q1,q2,q3, %r100,%r101) \
+        add.u32 %r82, %r82, 2048; \
+        ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%r100, %r101}, [%r82]; \
+        MMA_BF16_M16N8K16(%f72,%f73,%f74,%f75, q0,q1,q2,q3, %r100,%r101) \
+        add.u32 %r82, %r82, 2048; \
+        ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%r100, %r101}, [%r82]; \
+        MMA_BF16_M16N8K16(%f76,%f77,%f78,%f79, q0,q1,q2,q3, %r100,%r101) \
+        add.u32 %r82, %r82, 2048; \
+        ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%r100, %r101}, [%r82]; \
+        MMA_BF16_M16N8K16(%f80,%f81,%f82,%f83, q0,q1,q2,q3, %r100,%r101) \
+        add.u32 %r82, %r82, 2048; \
+        ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%r100, %r101}, [%r82]; \
+        MMA_BF16_M16N8K16(%f84,%f85,%f86,%f87, q0,q1,q2,q3, %r100,%r101) \
+        add.u32 %r82, %r82, 2048; \
+        ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%r100, %r101}, [%r82]; \
+        MMA_BF16_M16N8K16(%f88,%f89,%f90,%f91, q0,q1,q2,q3, %r100,%r101) \
+        add.u32 %r82, %r82, 2048; \
+        ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%r100, %r101}, [%r82]; \
+        MMA_BF16_M16N8K16(%f92,%f93,%f94,%f95, q0,q1,q2,q3, %r100,%r101)
+
+    QK_NG8(%r30,%r31,%r32,%r33, %r75)
+    add.u32         %r76, %r75, 32;
+    QK_NG8(%r34,%r35,%r36,%r37, %r76)
+    add.u32         %r76, %r76, 32;
+    QK_NG8(%r38,%r39,%r40,%r41, %r76)
+    add.u32         %r76, %r76, 32;
+    QK_NG8(%r42,%r43,%r44,%r45, %r76)
+    add.u32         %r76, %r76, 32;
+    QK_NG8(%r46,%r47,%r48,%r49, %r76)
+    add.u32         %r76, %r76, 32;
+    QK_NG8(%r50,%r51,%r52,%r53, %r76)
+    add.u32         %r76, %r76, 32;
+    QK_NG8(%r54,%r55,%r56,%r57, %r76)
+    add.u32         %r76, %r76, 32;
+    QK_NG8(%r58,%r59,%r60,%r61, %r76)
+
+    // Apply scale
+    mul.f32 %f64, %f64, %f196;  mul.f32 %f65, %f65, %f196;
+    mul.f32 %f66, %f66, %f196;  mul.f32 %f67, %f67, %f196;
+    mul.f32 %f68, %f68, %f196;  mul.f32 %f69, %f69, %f196;
+    mul.f32 %f70, %f70, %f196;  mul.f32 %f71, %f71, %f196;
+    mul.f32 %f72, %f72, %f196;  mul.f32 %f73, %f73, %f196;
+    mul.f32 %f74, %f74, %f196;  mul.f32 %f75, %f75, %f196;
+    mul.f32 %f76, %f76, %f196;  mul.f32 %f77, %f77, %f196;
+    mul.f32 %f78, %f78, %f196;  mul.f32 %f79, %f79, %f196;
+    mul.f32 %f80, %f80, %f196;  mul.f32 %f81, %f81, %f196;
+    mul.f32 %f82, %f82, %f196;  mul.f32 %f83, %f83, %f196;
+    mul.f32 %f84, %f84, %f196;  mul.f32 %f85, %f85, %f196;
+    mul.f32 %f86, %f86, %f196;  mul.f32 %f87, %f87, %f196;
+    mul.f32 %f88, %f88, %f196;  mul.f32 %f89, %f89, %f196;
+    mul.f32 %f90, %f90, %f196;  mul.f32 %f91, %f91, %f196;
+    mul.f32 %f92, %f92, %f196;  mul.f32 %f93, %f93, %f196;
+    mul.f32 %f94, %f94, %f196;  mul.f32 %f95, %f95, %f196;
+
+    // ================================================================
+    // Online softmax
+    // ================================================================
+    mov.f32         %f96, %f64;
+    max.f32         %f96, %f96, %f65;
+    max.f32         %f96, %f96, %f68;  max.f32         %f96, %f96, %f69;
+    max.f32         %f96, %f96, %f72;  max.f32         %f96, %f96, %f73;
+    max.f32         %f96, %f96, %f76;  max.f32         %f96, %f96, %f77;
+    max.f32         %f96, %f96, %f80;  max.f32         %f96, %f96, %f81;
+    max.f32         %f96, %f96, %f84;  max.f32         %f96, %f96, %f85;
+    max.f32         %f96, %f96, %f88;  max.f32         %f96, %f96, %f89;
+    max.f32         %f96, %f96, %f92;  max.f32         %f96, %f96, %f93;
+
+    mov.f32         %f97, %f66;
+    max.f32         %f97, %f97, %f67;
+    max.f32         %f97, %f97, %f70;  max.f32         %f97, %f97, %f71;
+    max.f32         %f97, %f97, %f74;  max.f32         %f97, %f97, %f75;
+    max.f32         %f97, %f97, %f78;  max.f32         %f97, %f97, %f79;
+    max.f32         %f97, %f97, %f82;  max.f32         %f97, %f97, %f83;
+    max.f32         %f97, %f97, %f86;  max.f32         %f97, %f97, %f87;
+    max.f32         %f97, %f97, %f90;  max.f32         %f97, %f97, %f91;
+    max.f32         %f97, %f97, %f94;  max.f32         %f97, %f97, %f95;
+
+    GROUP4_REDUCE_MAX_F32(%f96, %f98)
+    GROUP4_REDUCE_MAX_F32(%f97, %f98)
+
+    max.f32         %f99, %f192, %f96;
+    max.f32         %f100, %f193, %f97;
+
+    // NaN guard
+    mov.b32 %f98, 0xff800000; setp.eq.f32 %p10, %f99, %f98;
+    @%p10 mov.f32   %f99, 0f00000000;
+    mov.b32 %f98, 0xff800000; setp.eq.f32 %p10, %f100, %f98;
+    @%p10 mov.f32   %f100, 0f00000000;
+
+    // Correction factors: exp(old_max - new_max), always <= 0, clamp for ptxas
+    sub.f32         %f101, %f192, %f99;
+    mul.f32         %f101, %f101, LOG2E;
+    max.f32         %f101, %f101, 0fC2FA0000;
+    ex2.approx.ftz.f32  %f101, %f101;
+    sub.f32         %f102, %f193, %f100;
+    mul.f32         %f102, %f102, LOG2E;
+    max.f32         %f102, %f102, 0fC2FA0000;
+    ex2.approx.ftz.f32  %f102, %f102;
+
+    // Rescale O accumulators
+    mul.f32 %f0, %f0, %f101;    mul.f32 %f1, %f1, %f101;
+    mul.f32 %f2, %f2, %f102;    mul.f32 %f3, %f3, %f102;
+    mul.f32 %f4, %f4, %f101;    mul.f32 %f5, %f5, %f101;
+    mul.f32 %f6, %f6, %f102;    mul.f32 %f7, %f7, %f102;
+    mul.f32 %f8, %f8, %f101;    mul.f32 %f9, %f9, %f101;
+    mul.f32 %f10, %f10, %f102;  mul.f32 %f11, %f11, %f102;
+    mul.f32 %f12, %f12, %f101;  mul.f32 %f13, %f13, %f101;
+    mul.f32 %f14, %f14, %f102;  mul.f32 %f15, %f15, %f102;
+    mul.f32 %f16, %f16, %f101;  mul.f32 %f17, %f17, %f101;
+    mul.f32 %f18, %f18, %f102;  mul.f32 %f19, %f19, %f102;
+    mul.f32 %f20, %f20, %f101;  mul.f32 %f21, %f21, %f101;
+    mul.f32 %f22, %f22, %f102;  mul.f32 %f23, %f23, %f102;
+    mul.f32 %f24, %f24, %f101;  mul.f32 %f25, %f25, %f101;
+    mul.f32 %f26, %f26, %f102;  mul.f32 %f27, %f27, %f102;
+    mul.f32 %f28, %f28, %f101;  mul.f32 %f29, %f29, %f101;
+    mul.f32 %f30, %f30, %f102;  mul.f32 %f31, %f31, %f102;
+    mul.f32 %f32, %f32, %f101;  mul.f32 %f33, %f33, %f101;
+    mul.f32 %f34, %f34, %f102;  mul.f32 %f35, %f35, %f102;
+    mul.f32 %f36, %f36, %f101;  mul.f32 %f37, %f37, %f101;
+    mul.f32 %f38, %f38, %f102;  mul.f32 %f39, %f39, %f102;
+    mul.f32 %f40, %f40, %f101;  mul.f32 %f41, %f41, %f101;
+    mul.f32 %f42, %f42, %f102;  mul.f32 %f43, %f43, %f102;
+    mul.f32 %f44, %f44, %f101;  mul.f32 %f45, %f45, %f101;
+    mul.f32 %f46, %f46, %f102;  mul.f32 %f47, %f47, %f102;
+    mul.f32 %f48, %f48, %f101;  mul.f32 %f49, %f49, %f101;
+    mul.f32 %f50, %f50, %f102;  mul.f32 %f51, %f51, %f102;
+    mul.f32 %f52, %f52, %f101;  mul.f32 %f53, %f53, %f101;
+    mul.f32 %f54, %f54, %f102;  mul.f32 %f55, %f55, %f102;
+    mul.f32 %f56, %f56, %f101;  mul.f32 %f57, %f57, %f101;
+    mul.f32 %f58, %f58, %f102;  mul.f32 %f59, %f59, %f102;
+    mul.f32 %f60, %f60, %f101;  mul.f32 %f61, %f61, %f101;
+    mul.f32 %f62, %f62, %f102;  mul.f32 %f63, %f63, %f102;
+
+    // Rescale row_sum
+    mul.f32         %f194, %f194, %f101;
+    mul.f32         %f195, %f195, %f102;
+
+    // Update running max
+    mov.f32         %f192, %f99;
+    mov.f32         %f193, %f100;
+
+    // ================================================================
+    // Compute P = exp(S - max), accumulate row_sum, store P to SMEM
+    // ================================================================
+    // Clamp ex2 input to [-125, 0] to prevent ptxas from inserting range reduction
+    // (S - max) * LOG2E is always <= 0, so max with -125 is safe (2^-125 ~= 0)
+    #define EXP_CLAMP_EX2(s, mx) \
+        sub.f32 s, s, mx;  mul.f32 s, s, LOG2E;  max.f32 s, s, 0fC2FA0000;  ex2.approx.ftz.f32 s, s;
+
+    #define EXP_STORE_NG(s0,s1,s2,s3, max0, max1, paddr0, paddr1, ng_off) \
+        EXP_CLAMP_EX2(s0, max0)  EXP_CLAMP_EX2(s1, max0) \
+        EXP_CLAMP_EX2(s2, max1)  EXP_CLAMP_EX2(s3, max1) \
+        add.f32 %f194, %f194, s0;  add.f32 %f194, %f194, s1; \
+        add.f32 %f195, %f195, s2;  add.f32 %f195, %f195, s3; \
+        cvt.rn.bf16.f32 %h0, s0;  cvt.rn.bf16.f32 %h1, s1; \
+        mov.b32 %r100, {%h0, %h1}; \
+        st.shared.b32 [paddr0 + ng_off], %r100; \
+        cvt.rn.bf16.f32 %h0, s2;  cvt.rn.bf16.f32 %h1, s3; \
+        mov.b32 %r100, {%h0, %h1}; \
+        st.shared.b32 [paddr1 + ng_off], %r100;
+
+    EXP_STORE_NG(%f64,%f65,%f66,%f67, %f99, %f100, %r111, %r112, 0)
+    EXP_STORE_NG(%f68,%f69,%f70,%f71, %f99, %f100, %r111, %r112, 16)
+    EXP_STORE_NG(%f72,%f73,%f74,%f75, %f99, %f100, %r111, %r112, 32)
+    EXP_STORE_NG(%f76,%f77,%f78,%f79, %f99, %f100, %r111, %r112, 48)
+    EXP_STORE_NG(%f80,%f81,%f82,%f83, %f99, %f100, %r111, %r112, 64)
+    EXP_STORE_NG(%f84,%f85,%f86,%f87, %f99, %f100, %r111, %r112, 80)
+    EXP_STORE_NG(%f88,%f89,%f90,%f91, %f99, %f100, %r111, %r112, 96)
+    EXP_STORE_NG(%f92,%f93,%f94,%f95, %f99, %f100, %r111, %r112, 112)
+
+    // Ensure P stores visible before ldmatrix reads
+    fence.acq_rel.gpu;
+
+    // ================================================================
+    // Wait for V via mbarrier (per-stage buffer)
+    // ================================================================
+    add.u32         %r158, %r23, SMEM_MBAR_V0;
+    add.u32         %r158, %r158, %r171;     // + stage*16 -> MBAR_V0 or MBAR_V1
+    selp.u32        %r156, %r153, %r154, %p14;  // v_phase = v0 or v1
+
+mma_wait_v:
+    mbarrier.try_wait.parity.shared.b64 %p8, [%r158], %r156;
+    @!%p8 bra mma_wait_v;
+
+    // ================================================================
+    // PV GEMM: O += P * V  (16x64) x (64x128) = 16x128
+    // ================================================================
+    // Compute V ldmatrix base for this stage
+    add.u32         %r110, %r23, SMEM_V0;
+    add.u32         %r110, %r110, %r170;     // + stage*16384
+    add.u32         %r110, %r110, %r131;     // + (lane%16)*256
+
+    #define PV_NG16(p0,p1,p2,p3, vb) \
+        ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [vb]; \
+        MMA_BF16_M16N8K16(%f0,%f1,%f2,%f3, p0,p1,p2,p3, %r104,%r105) \
+        add.u32 %r82, vb, 16; \
+        ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r82]; \
+        MMA_BF16_M16N8K16(%f4,%f5,%f6,%f7, p0,p1,p2,p3, %r104,%r105) \
+        add.u32 %r82, vb, 32; \
+        ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r82]; \
+        MMA_BF16_M16N8K16(%f8,%f9,%f10,%f11, p0,p1,p2,p3, %r104,%r105) \
+        add.u32 %r82, vb, 48; \
+        ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r82]; \
+        MMA_BF16_M16N8K16(%f12,%f13,%f14,%f15, p0,p1,p2,p3, %r104,%r105) \
+        add.u32 %r82, vb, 64; \
+        ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r82]; \
+        MMA_BF16_M16N8K16(%f16,%f17,%f18,%f19, p0,p1,p2,p3, %r104,%r105) \
+        add.u32 %r82, vb, 80; \
+        ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r82]; \
+        MMA_BF16_M16N8K16(%f20,%f21,%f22,%f23, p0,p1,p2,p3, %r104,%r105) \
+        add.u32 %r82, vb, 96; \
+        ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r82]; \
+        MMA_BF16_M16N8K16(%f24,%f25,%f26,%f27, p0,p1,p2,p3, %r104,%r105) \
+        add.u32 %r82, vb, 112; \
+        ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r82]; \
+        MMA_BF16_M16N8K16(%f28,%f29,%f30,%f31, p0,p1,p2,p3, %r104,%r105) \
+        add.u32 %r82, vb, 128; \
+        ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r82]; \
+        MMA_BF16_M16N8K16(%f32,%f33,%f34,%f35, p0,p1,p2,p3, %r104,%r105) \
+        add.u32 %r82, vb, 144; \
+        ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r82]; \
+        MMA_BF16_M16N8K16(%f36,%f37,%f38,%f39, p0,p1,p2,p3, %r104,%r105) \
+        add.u32 %r82, vb, 160; \
+        ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r82]; \
+        MMA_BF16_M16N8K16(%f40,%f41,%f42,%f43, p0,p1,p2,p3, %r104,%r105) \
+        add.u32 %r82, vb, 176; \
+        ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r82]; \
+        MMA_BF16_M16N8K16(%f44,%f45,%f46,%f47, p0,p1,p2,p3, %r104,%r105) \
+        add.u32 %r82, vb, 192; \
+        ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r82]; \
+        MMA_BF16_M16N8K16(%f48,%f49,%f50,%f51, p0,p1,p2,p3, %r104,%r105) \
+        add.u32 %r82, vb, 208; \
+        ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r82]; \
+        MMA_BF16_M16N8K16(%f52,%f53,%f54,%f55, p0,p1,p2,p3, %r104,%r105) \
+        add.u32 %r82, vb, 224; \
+        ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r82]; \
+        MMA_BF16_M16N8K16(%f56,%f57,%f58,%f59, p0,p1,p2,p3, %r104,%r105) \
+        add.u32 %r82, vb, 240; \
+        ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r82]; \
+        MMA_BF16_M16N8K16(%f60,%f61,%f62,%f63, p0,p1,p2,p3, %r104,%r105)
+
+    // kp=0
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r106, %r107, %r108, %r109}, [%r119];
+    PV_NG16(%r106,%r107,%r108,%r109, %r110)
+
+    // kp=1
+    add.u32 %r83, %r119, 32;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r106, %r107, %r108, %r109}, [%r83];
+    add.u32 %r84, %r110, 4096;
+    PV_NG16(%r106,%r107,%r108,%r109, %r84)
+
+    // kp=2
+    add.u32 %r83, %r119, 64;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r106, %r107, %r108, %r109}, [%r83];
+    add.u32 %r84, %r110, 8192;
+    PV_NG16(%r106,%r107,%r108,%r109, %r84)
+
+    // kp=3
+    add.u32 %r83, %r119, 96;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r106, %r107, %r108, %r109}, [%r83];
+    add.u32 %r84, %r110, 12288;
+    PV_NG16(%r106,%r107,%r108,%r109, %r84)
+
+    // Signal DONE[stage]: each MMA warp's lane 0 arrives
+    add.u32         %r159, %r23, SMEM_MBAR_DONE0;
+    add.u32         %r159, %r159, %r171;     // + stage*16
+    setp.eq.u32     %p13, %r2, 0;
+    @%p13 mbarrier.arrive.shared.b64 _, [%r159];
+
+    // Toggle phases for current stage
+    @%p14 xor.b32   %r151, %r151, 1;        // toggle k0_phase
+    @!%p14 xor.b32  %r152, %r152, 1;        // toggle k1_phase
+    @%p14 xor.b32   %r153, %r153, 1;        // toggle v0_phase
+    @!%p14 xor.b32  %r154, %r154, 1;        // toggle v1_phase
+
+    // Advance KV block and toggle stage
+    add.u32         %r121, %r121, 1;
+    xor.b32         %r150, %r150, 1;
+    bra             kv_loop;
+
+kv_done:
+    // ================================================================
+    // Epilogue: O /= row_sum, convert to bf16, store
+    // ================================================================
+    GROUP4_REDUCE_SUM_F32(%f194, %f98)
+    GROUP4_REDUCE_SUM_F32(%f195, %f98)
+
+    // Clamp zero row_sum to 1.0
+    setp.eq.f32     %p10, %f194, 0f00000000;
+    @%p10 mov.f32   %f194, 0f3f800000;
+    setp.eq.f32     %p10, %f195, 0f00000000;
+    @%p10 mov.f32   %f195, 0f3f800000;
+
+    rcp.approx.f32  %f101, %f194;
+    rcp.approx.f32  %f102, %f195;
+
+    // Normalize O
+    mul.f32 %f0, %f0, %f101;    mul.f32 %f1, %f1, %f101;
+    mul.f32 %f2, %f2, %f102;    mul.f32 %f3, %f3, %f102;
+    mul.f32 %f4, %f4, %f101;    mul.f32 %f5, %f5, %f101;
+    mul.f32 %f6, %f6, %f102;    mul.f32 %f7, %f7, %f102;
+    mul.f32 %f8, %f8, %f101;    mul.f32 %f9, %f9, %f101;
+    mul.f32 %f10, %f10, %f102;  mul.f32 %f11, %f11, %f102;
+    mul.f32 %f12, %f12, %f101;  mul.f32 %f13, %f13, %f101;
+    mul.f32 %f14, %f14, %f102;  mul.f32 %f15, %f15, %f102;
+    mul.f32 %f16, %f16, %f101;  mul.f32 %f17, %f17, %f101;
+    mul.f32 %f18, %f18, %f102;  mul.f32 %f19, %f19, %f102;
+    mul.f32 %f20, %f20, %f101;  mul.f32 %f21, %f21, %f101;
+    mul.f32 %f22, %f22, %f102;  mul.f32 %f23, %f23, %f102;
+    mul.f32 %f24, %f24, %f101;  mul.f32 %f25, %f25, %f101;
+    mul.f32 %f26, %f26, %f102;  mul.f32 %f27, %f27, %f102;
+    mul.f32 %f28, %f28, %f101;  mul.f32 %f29, %f29, %f101;
+    mul.f32 %f30, %f30, %f102;  mul.f32 %f31, %f31, %f102;
+    mul.f32 %f32, %f32, %f101;  mul.f32 %f33, %f33, %f101;
+    mul.f32 %f34, %f34, %f102;  mul.f32 %f35, %f35, %f102;
+    mul.f32 %f36, %f36, %f101;  mul.f32 %f37, %f37, %f101;
+    mul.f32 %f38, %f38, %f102;  mul.f32 %f39, %f39, %f102;
+    mul.f32 %f40, %f40, %f101;  mul.f32 %f41, %f41, %f101;
+    mul.f32 %f42, %f42, %f102;  mul.f32 %f43, %f43, %f102;
+    mul.f32 %f44, %f44, %f101;  mul.f32 %f45, %f45, %f101;
+    mul.f32 %f46, %f46, %f102;  mul.f32 %f47, %f47, %f102;
+    mul.f32 %f48, %f48, %f101;  mul.f32 %f49, %f49, %f101;
+    mul.f32 %f50, %f50, %f102;  mul.f32 %f51, %f51, %f102;
+    mul.f32 %f52, %f52, %f101;  mul.f32 %f53, %f53, %f101;
+    mul.f32 %f54, %f54, %f102;  mul.f32 %f55, %f55, %f102;
+    mul.f32 %f56, %f56, %f101;  mul.f32 %f57, %f57, %f101;
+    mul.f32 %f58, %f58, %f102;  mul.f32 %f59, %f59, %f102;
+    mul.f32 %f60, %f60, %f101;  mul.f32 %f61, %f61, %f101;
+    mul.f32 %f62, %f62, %f102;  mul.f32 %f63, %f63, %f102;
+
+    // ================================================================
+    // Store O to global memory
+    // ================================================================
+    ld.param.u64    %rd3, [param_O];
+
+    mul.lo.u32      %r141, %r1, 16;
+    add.u32         %r124, %r11, %r141;
+    add.u32         %r124, %r124, %r13;
+    add.u32         %r125, %r124, 8;
+
+    setp.lt.u32     %p11, %r124, %r6;
+    setp.lt.u32     %p12, %r125, %r6;
+
+    sub.u32         %r126, %r10, %r11;
+
+    add.u32         %r127, %r126, %r124;
+    mul.lo.u32      %r128, %r127, 256;
+    cvt.u64.u32     %rd4, %r128;
+    add.u64         %rd5, %rd3, %rd4;
+
+    add.u32         %r127, %r126, %r125;
+    mul.lo.u32      %r128, %r127, 256;
+    cvt.u64.u32     %rd4, %r128;
+    add.u64         %rd6, %rd3, %rd4;
+
+    shl.b32         %r129, %r14, 2;
+    cvt.u64.u32     %rd7, %r129;
+
+    #define STORE_NG(f0,f1,f2,f3, col_off) \
+        add.u64 %rd8, %rd5, %rd7; \
+        add.u64 %rd8, %rd8, col_off; \
+        cvt.rn.bf16.f32 %h0, f0;  cvt.rn.bf16.f32 %h1, f1; \
+        mov.b32 %r100, {%h0, %h1}; \
+        @%p11 st.global.b32 [%rd8], %r100; \
+        add.u64 %rd8, %rd6, %rd7; \
+        add.u64 %rd8, %rd8, col_off; \
+        cvt.rn.bf16.f32 %h0, f2;  cvt.rn.bf16.f32 %h1, f3; \
+        mov.b32 %r100, {%h0, %h1}; \
+        @%p12 st.global.b32 [%rd8], %r100;
+
+    STORE_NG(%f0,%f1,%f2,%f3, 0)
+    STORE_NG(%f4,%f5,%f6,%f7, 16)
+    STORE_NG(%f8,%f9,%f10,%f11, 32)
+    STORE_NG(%f12,%f13,%f14,%f15, 48)
+    STORE_NG(%f16,%f17,%f18,%f19, 64)
+    STORE_NG(%f20,%f21,%f22,%f23, 80)
+    STORE_NG(%f24,%f25,%f26,%f27, 96)
+    STORE_NG(%f28,%f29,%f30,%f31, 112)
+    STORE_NG(%f32,%f33,%f34,%f35, 128)
+    STORE_NG(%f36,%f37,%f38,%f39, 144)
+    STORE_NG(%f40,%f41,%f42,%f43, 160)
+    STORE_NG(%f44,%f45,%f46,%f47, 176)
+    STORE_NG(%f48,%f49,%f50,%f51, 192)
+    STORE_NG(%f52,%f53,%f54,%f55, 208)
+    STORE_NG(%f56,%f57,%f58,%f59, 224)
+    STORE_NG(%f60,%f61,%f62,%f63, 240)
+
+    ret;
+
+    // ================================================================
+    // DMA WARP (warp 4): TMA loads Q, K, V with double-buffering
+    // ================================================================
+dma_path:
+    and.b32         %r96, %r0, 31;           // lane within DMA warp
+    setp.eq.u32     %p6, %r96, 0;
+    mov.u32         %r83, 0;                 // coord_x = 0
+    mov.u32         %r84, smem;
+
+    // Load Q (one-shot)
+    add.u32         %r85, %r84, SMEM_MBAR_Q;
+    add.u32         %r86, %r84, SMEM_Q;
+    @%p6 mbarrier.arrive.expect_tx.shared.b64 _, [%r85], (BR * D * 2);
+    @%p6 cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
+        [%r86], [%rd0, {%r83, %r10}], [%r85];
+
+    add.u32         %r87, %r7, 63;
+    shr.b32         %r87, %r87, 6;           // num_kv_blocks
+
+    // Prefetch block 0 -> buf0
+    mov.u32         %r90, %r12;              // kv_row for block 0
+
+    add.u32         %r91, %r84, SMEM_MBAR_K0;
+    add.u32         %r92, %r84, SMEM_K0;
+    @%p6 mbarrier.arrive.expect_tx.shared.b64 _, [%r91], (BC * D * 2);
+    @%p6 cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
+        [%r92], [%rd1, {%r83, %r90}], [%r91];
+
+    add.u32         %r93, %r84, SMEM_MBAR_V0;
+    add.u32         %r94, %r84, SMEM_V0;
+    @%p6 mbarrier.arrive.expect_tx.shared.b64 _, [%r93], (BC * D * 2);
+    @%p6 cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
+        [%r94], [%rd2, {%r83, %r90}], [%r93];
+
+    // Prefetch block 1 -> buf1 (if available)
+    setp.gt.u32     %p9, %r87, 1;
+    @!%p9 bra       dma_prefetch_done;
+
+    add.u32         %r90, %r12, 64;          // kv_row for block 1
+
+    add.u32         %r91, %r84, SMEM_MBAR_K1;
+    add.u32         %r92, %r84, SMEM_K1;
+    @%p6 mbarrier.arrive.expect_tx.shared.b64 _, [%r91], (BC * D * 2);
+    @%p6 cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
+        [%r92], [%rd1, {%r83, %r90}], [%r91];
+
+    add.u32         %r93, %r84, SMEM_MBAR_V1;
+    add.u32         %r94, %r84, SMEM_V1;
+    @%p6 mbarrier.arrive.expect_tx.shared.b64 _, [%r93], (BC * D * 2);
+    @%p6 cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
+        [%r94], [%rd2, {%r83, %r90}], [%r93];
+
+dma_prefetch_done:
+    // Remaining blocks: 2..N-1
+    mov.u32         %r88, 2;                 // kv_block = 2
+    mov.u32         %r155, 0;                // done0_phase = 0
+    mov.u32         %r156, 0;                // done1_phase = 0
+
+dma_rest_loop:
+    setp.ge.u32     %p9, %r88, %r87;
+    @%p9 bra        dma_done;
+
+    // buf = kv_block & 1
+    and.b32         %r150, %r88, 1;
+
+    // Compute DONE mbar addr = MBAR_DONE0 + buf*16
+    mul.lo.u32      %r160, %r150, 16;
+    add.u32         %r159, %r84, SMEM_MBAR_DONE0;
+    add.u32         %r159, %r159, %r160;
+
+    // Select done_phase for this buf
+    setp.eq.u32     %p10, %r150, 0;
+    selp.u32        %r161, %r155, %r156, %p10;
+
+    // Wait DONE[buf] -- MMA finished reading this buffer
+dma_wait_done:
+    mbarrier.try_wait.parity.shared.b64 %p11, [%r159], %r161;
+    @!%p11 bra dma_wait_done;
+
+    // Toggle done_phase for this buf
+    @%p10 xor.b32   %r155, %r155, 1;
+    @!%p10 xor.b32  %r156, %r156, 1;
+
+    // kv_row = kv_base + kv_block * 64
+    shl.b32         %r89, %r88, 6;
+    add.u32         %r90, %r12, %r89;
+
+    // Compute K dst = SMEM_K0 + buf*16384, K mbar = MBAR_K0 + buf*16
+    mul.lo.u32      %r170, %r150, 16384;
+    add.u32         %r92, %r84, SMEM_K0;
+    add.u32         %r92, %r92, %r170;
+    add.u32         %r91, %r84, SMEM_MBAR_K0;
+    add.u32         %r91, %r91, %r160;       // reuse buf*16
+
+    @%p6 mbarrier.arrive.expect_tx.shared.b64 _, [%r91], (BC * D * 2);
+    @%p6 cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
+        [%r92], [%rd1, {%r83, %r90}], [%r91];
+
+    // Compute V dst = SMEM_V0 + buf*16384, V mbar = MBAR_V0 + buf*16
+    add.u32         %r94, %r84, SMEM_V0;
+    add.u32         %r94, %r94, %r170;       // reuse buf*16384
+    add.u32         %r93, %r84, SMEM_MBAR_V0;
+    add.u32         %r93, %r93, %r160;       // reuse buf*16
+
+    @%p6 mbarrier.arrive.expect_tx.shared.b64 _, [%r93], (BC * D * 2);
+    @%p6 cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
+        [%r94], [%rd2, {%r83, %r90}], [%r93];
+
+    add.u32         %r88, %r88, 1;
+    bra             dma_rest_loop;
+
+dma_done:
+    ret;
+}

@@ -1,0 +1,141 @@
+// permute_thd_htd_bf16.ptx
+//
+// Transpose a 3-D BF16 tensor between the two common attention layouts:
+//
+//   THD: [T, H, D]  (varlen / packed: heads are inner, T is outer)
+//   HTD: [H, T, D]  (per-head contiguous: heads are outer)
+//
+// Two entry points (same algorithm, different stride math):
+//   permute_thd_to_htd_bf16: src [T, H, D] -> dst [H, T, D]
+//   permute_htd_to_thd_bf16: src [H, T, D] -> dst [T, H, D]
+//
+// Used by the varlen FA backward orchestrator to reshape per-sequence
+// chunks so the existing [B, H, S, D] backward orchestrator can be
+// reused without per-head strided gathers.
+//
+// Grid: (T, H, 1), Block: (256, 1, 1). Threads process up to D elements
+// each via grid-stride within the inner D dim. Vectorized 2-BF16 loads
+// when D is even.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+
+// THD -> HTD: src[t, h, d] -> dst[h, t, d]
+//   src stride: t * H * D + h * D + d
+//   dst stride: h * T * D + t * D + d
+.visible .entry permute_thd_to_htd_bf16(
+    .param .u64 param_src,
+    .param .u64 param_dst,
+    .param .u32 param_t,
+    .param .u32 param_h,
+    .param .u32 param_d
+)
+{
+    .reg .b32 %r<14>;
+    .reg .b64 %rd<10>;
+    .reg .b16 %sh<2>;
+    .reg .pred %p<2>;
+
+    mov.u32         %r0, %ctaid.x;          // t
+    mov.u32         %r1, %ctaid.y;          // h
+    mov.u32         %r2, THREAD_ID;
+    mov.u32         %r3, %ntid.x;
+
+    ld.param.u64    %rd0, [param_src];
+    ld.param.u64    %rd1, [param_dst];
+    ld.param.u32    %r4, [param_t];
+    ld.param.u32    %r5, [param_h];
+    ld.param.u32    %r6, [param_d];
+
+    // src offset for this (t, h, 0): t*H*D + h*D = (t*H + h) * D
+    mad.lo.u32      %r7, %r0, %r5, %r1;     // t*H + h
+    mul.lo.u32      %r8, %r7, %r6;          // (t*H + h) * D
+    mul.wide.u32    %rd2, %r8, 2;
+    add.u64         %rd3, %rd0, %rd2;       // &src[t, h, 0]
+
+    // dst offset for this (h, t, 0): h*T*D + t*D = (h*T + t) * D
+    mad.lo.u32      %r9, %r1, %r4, %r0;     // h*T + t
+    mul.lo.u32      %r10, %r9, %r6;
+    mul.wide.u32    %rd4, %r10, 2;
+    add.u64         %rd5, %rd1, %rd4;       // &dst[h, t, 0]
+
+    // Each thread copies elements d = tid, tid+block, ... d < D.
+    mov.u32         %r11, %r2;              // d = tid
+
+inner_loop:
+    setp.ge.u32     %p0, %r11, %r6;
+    @%p0 bra        inner_done;
+
+    mul.wide.u32    %rd6, %r11, 2;
+    add.u64         %rd7, %rd3, %rd6;
+    add.u64         %rd8, %rd5, %rd6;
+    ld.global.b16   %sh0, [%rd7];
+    st.global.b16   [%rd8], %sh0;
+
+    add.u32         %r11, %r11, %r3;
+    bra             inner_loop;
+
+inner_done:
+    ret;
+}
+
+// HTD -> THD: src[h, t, d] -> dst[t, h, d]
+//   src stride: h * T * D + t * D + d
+//   dst stride: t * H * D + h * D + d
+.visible .entry permute_htd_to_thd_bf16(
+    .param .u64 param_src,
+    .param .u64 param_dst,
+    .param .u32 param_t,
+    .param .u32 param_h,
+    .param .u32 param_d
+)
+{
+    .reg .b32 %r<14>;
+    .reg .b64 %rd<10>;
+    .reg .b16 %sh<2>;
+    .reg .pred %p<2>;
+
+    mov.u32         %r0, %ctaid.x;          // t
+    mov.u32         %r1, %ctaid.y;          // h
+    mov.u32         %r2, THREAD_ID;
+    mov.u32         %r3, %ntid.x;
+
+    ld.param.u64    %rd0, [param_src];
+    ld.param.u64    %rd1, [param_dst];
+    ld.param.u32    %r4, [param_t];
+    ld.param.u32    %r5, [param_h];
+    ld.param.u32    %r6, [param_d];
+
+    // src offset for (h, t, 0): h*T*D + t*D
+    mad.lo.u32      %r7, %r1, %r4, %r0;
+    mul.lo.u32      %r8, %r7, %r6;
+    mul.wide.u32    %rd2, %r8, 2;
+    add.u64         %rd3, %rd0, %rd2;
+
+    // dst offset for (t, h, 0): t*H*D + h*D
+    mad.lo.u32      %r9, %r0, %r5, %r1;
+    mul.lo.u32      %r10, %r9, %r6;
+    mul.wide.u32    %rd4, %r10, 2;
+    add.u64         %rd5, %rd1, %rd4;
+
+    mov.u32         %r11, %r2;
+
+inner_loop2:
+    setp.ge.u32     %p0, %r11, %r6;
+    @%p0 bra        inner_done2;
+
+    mul.wide.u32    %rd6, %r11, 2;
+    add.u64         %rd7, %rd3, %rd6;
+    add.u64         %rd8, %rd5, %rd6;
+    ld.global.b16   %sh0, [%rd7];
+    st.global.b16   [%rd8], %sh0;
+
+    add.u32         %r11, %r11, %r3;
+    bra             inner_loop2;
+
+inner_done2:
+    ret;
+}

@@ -1,0 +1,297 @@
+// linear_attn_y_inter_mma.ptx
+//
+// MMA-accelerated linear attention inter-chunk output:
+//   Y_inter = Q @ S^T
+// Q: [B, H, C=32, D=128] BF16; S: [B, H, D, D] FP16; Y_inter: [B, H, C, D] FP32.
+//
+// Together with linear_attn_state_update_mma, this captures ~80% of per-chunk
+// FLOPS in MMA. Caller adds Y_intra (scalar) + Y_inter and converts to BF16.
+//
+// MMA shapes (mma.sync.aligned.m16n8k16.row.col):
+//   A = Q    [M=32,  K=128]  row-major (matches Q storage)
+//   B = S^T  [K=128, N=128]  col-major
+//     → S downcast to BF16 + transposed in SMEM (S_T) so [r, c] in S_T = S[c, r]
+//   D = Y_inter [M=32, N=128] FP32 → written to global directly
+//
+// Layout: 4 warps in 2×2, each warp 16×64.
+//   mg=1, ng=8, k_tiles=8 → 64 MMAs/warp, 32 fp32 accum/thread.
+//
+// SMEM (40 KB):
+//   S_T:  32 KB at offset     0  ([D, D] BF16 transposed; FP32→BF16 downcast)
+//   Q:    8 KB  at offset 32768  ([C, D] BF16 row-major)
+//
+// Precision note: downcasting S FP32→BF16 loses ~16 mantissa bits per chunk.
+// Y is converted to BF16 anyway at the end so the loss happens at the same
+// point. State S itself stays FP32 in global; only the SMEM staging is BF16.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+#include "mma.ptxh"
+
+#define D 128
+#define C 32
+
+#define SMEM_S_T   0
+#define SMEM_Q     32768
+#define SMEM_TOTAL 40960
+
+.extern .shared .align 128 .b8 lin_yinter_smem[];
+
+.visible .entry linear_attn_y_inter_mma(
+    .param .u64 param_q,
+    .param .u64 param_s,
+    .param .u64 param_y,         // [B, H, C, D] FP32 output
+    .param .u32 param_num_heads
+)
+{
+    .reg .b32  %r<96>;
+    .reg .b64  %rd<32>;
+    .reg .f32  %f<48>;
+    .reg .b16  %h<16>;
+    .reg .pred %p<8>;
+
+    mov.u32     %r0, %tid.x;            // tid [0..127]
+    mov.u32     %r1, %ctaid.x;          // head
+    mov.u32     %r2, %ctaid.y;          // batch
+
+    ld.param.u64 %rd0, [param_q];
+    ld.param.u64 %rd1, [param_s];
+    ld.param.u64 %rd2, [param_y];
+    ld.param.u32 %r3, [param_num_heads];
+
+    mul.lo.u32  %r4, %r2, %r3;
+    add.u32     %r4, %r4, %r1;          // bh
+
+    mov.u32     %r5, lin_yinter_smem;
+
+    shr.b32     %r6, %r0, 5;            // warp_id
+    and.b32     %r7, %r0, 31;           // lane
+    shr.b32     %r8, %r6, 1;            // warp_m
+    and.b32     %r9, %r6, 1;            // warp_n
+
+    // === Load S [D, D] FP16 → S_T BF16 transposed in SMEM ===
+    // S[r, c] in global → S_T[c, r] BF16 in SMEM at offset (c*D + r)*2.
+    // Per thread t: handle row t. Read 128 FP16 from S[t, :] (32 v4.u16 contiguous),
+    // widen to f32, then downcast to BF16 in pairs (cvt.rn.bf16x2.f32).
+
+    mul.lo.u32  %r10, %r4, D;
+    mul.lo.u32  %r10, %r10, D;
+    mul.wide.u32 %rd10, %r10, 2;        // FP16 state: bh*D*D*2
+    add.u64     %rd11, %rd1, %rd10;     // S base for this bh (FP16)
+
+    mul.lo.u32  %r11, %r0, D;
+    shl.b32     %r12, %r11, 1;          // tid * D * 2 (FP16)
+    cvt.u64.u32 %rd12, %r12;
+    add.u64     %rd13, %rd11, %rd12;    // S[tid, 0..D] addr (FP16)
+
+    mov.u32     %r13, 0;
+load_s_loop:
+    setp.ge.u32 %p0, %r13, 32;          // 128 FP16 / 4 per v4.u16 = 32 iters
+    @%p0 bra    load_s_done;
+    shl.b32     %r14, %r13, 3;          // i * 8 bytes (4 u16)
+    cvt.u64.u32 %rd14, %r14;
+    add.u64     %rd15, %rd13, %rd14;
+    .reg .b16 _hf0, _hf1, _hf2, _hf3;
+    .reg .f32 _f0, _f1, _f2, _f3;
+    ld.global.v4.u16 {_hf0, _hf1, _hf2, _hf3}, [%rd15];
+    cvt.f32.f16 _f0, _hf0;
+    cvt.f32.f16 _f1, _hf1;
+    cvt.f32.f16 _f2, _hf2;
+    cvt.f32.f16 _f3, _hf3;
+
+    // Convert (f1, f0) → b32 BF16 pair; (f3, f2) → b32 BF16 pair
+    .reg .b32 _bf01, _bf23;
+    cvt.rn.bf16x2.f32 _bf01, _f1, _f0;
+    cvt.rn.bf16x2.f32 _bf23, _f3, _f2;
+
+    // Extract individual BF16
+    .reg .b16 _h0, _h1, _h2, _h3;
+    mov.b32     {_h0, _h1}, _bf01;
+    mov.b32     {_h2, _h3}, _bf23;
+
+    // Write to S_T[c, t] for c = i*4 .. i*4+3
+    shl.b32     %r15, %r13, 2;          // i * 4 = first c in this iter
+    add.u32     %r16, %r5, SMEM_S_T;
+    // S_T[c, t] at offset (c*D + t)*2
+    mul.lo.u32  %r17, %r15, D;
+    add.u32     %r17, %r17, %r0;
+    shl.b32     %r17, %r17, 1;          // bytes
+    add.u32     %r17, %r16, %r17;       // S_T[i*4, tid] addr
+    st.shared.b16 [%r17], _h0;
+    add.u32     %r17, %r17, 256;        // +D*2 = 256 bytes (next c)
+    st.shared.b16 [%r17], _h1;
+    add.u32     %r17, %r17, 256;
+    st.shared.b16 [%r17], _h2;
+    add.u32     %r17, %r17, 256;
+    st.shared.b16 [%r17], _h3;
+
+    add.u32     %r13, %r13, 1;
+    bra         load_s_loop;
+load_s_done:
+
+    // === Load Q [C, D] BF16 ===
+    mul.lo.u32  %r10, %r4, C;
+    mul.lo.u32  %r10, %r10, D;
+    mul.wide.u32 %rd16, %r10, 2;
+    add.u64     %rd17, %rd0, %rd16;     // Q base
+
+    add.u32     %r18, %r5, SMEM_Q;
+    mov.u32     %r13, 0;
+load_q_loop:
+    setp.ge.u32 %p0, %r13, C;
+    @%p0 bra    load_q_done;
+    mul.lo.u32  %r19, %r13, D;
+    add.u32     %r19, %r19, %r0;
+    mul.wide.u32 %rd18, %r19, 2;
+    add.u64     %rd19, %rd17, %rd18;
+    ld.global.b16 %h0, [%rd19];
+    shl.b32     %r20, %r19, 1;
+    add.u32     %r21, %r18, %r20;
+    st.shared.b16 [%r21], %h0;
+    add.u32     %r13, %r13, 1;
+    bra         load_q_loop;
+load_q_done:
+
+    bar.sync 0;
+
+    // === Init 32 fp32 accumulators ===
+    mov.f32 %f0,  0.0; mov.f32 %f1,  0.0; mov.f32 %f2,  0.0; mov.f32 %f3,  0.0;
+    mov.f32 %f4,  0.0; mov.f32 %f5,  0.0; mov.f32 %f6,  0.0; mov.f32 %f7,  0.0;
+    mov.f32 %f8,  0.0; mov.f32 %f9,  0.0; mov.f32 %f10, 0.0; mov.f32 %f11, 0.0;
+    mov.f32 %f12, 0.0; mov.f32 %f13, 0.0; mov.f32 %f14, 0.0; mov.f32 %f15, 0.0;
+    mov.f32 %f16, 0.0; mov.f32 %f17, 0.0; mov.f32 %f18, 0.0; mov.f32 %f19, 0.0;
+    mov.f32 %f20, 0.0; mov.f32 %f21, 0.0; mov.f32 %f22, 0.0; mov.f32 %f23, 0.0;
+    mov.f32 %f24, 0.0; mov.f32 %f25, 0.0; mov.f32 %f26, 0.0; mov.f32 %f27, 0.0;
+    mov.f32 %f28, 0.0; mov.f32 %f29, 0.0; mov.f32 %f30, 0.0; mov.f32 %f31, 0.0;
+
+    // === ldmatrix base addresses ===
+    // A = Q: stride = D*2 = 256 bytes/row.
+    //   Lane lt < 16: addr = base + lt*256
+    //   Lane lt >= 16: addr = base + (lt-16)*256 + 16
+    //   Per warp_m: + warp_m*16*256 = warp_m*4096
+
+    setp.lt.u32 %p2, %r7, 16;
+    @%p2 mul.lo.u32 %r22, %r7, 256;
+    @!%p2 sub.u32   %r22, %r7, 16;
+    @!%p2 mad.lo.u32 %r22, %r22, 256, 16;
+    shl.b32     %r23, %r8, 12;          // warp_m * 4096
+    add.u32     %r22, %r22, %r23;
+    add.u32     %r22, %r22, %r5;
+    add.u32     %r24, %r22, SMEM_Q;     // ldm_a base, K-tile 0
+
+    // B = S_T: stride = D*2 = 256 bytes/row.
+    //   Lane lt < 16: addr = base + lt*256 (with .trans for col-major B)
+    //   Per warp_n: + warp_n*64*2 = warp_n*128 bytes (N-col offset)
+
+    and.b32     %r25, %r7, 15;
+    shl.b32     %r26, %r25, 8;          // (lane%16) * 256
+    shl.b32     %r27, %r9, 7;           // warp_n * 128
+    add.u32     %r26, %r26, %r27;
+    add.u32     %r26, %r26, %r5;
+    add.u32     %r28, %r26, SMEM_S_T;   // ldm_b base, K-tile 0, ng=0
+
+    // === K-loop (8 K-tiles) ===
+    // Per iter: load 1 A frag, 8 B frags, do 8 MMAs.
+
+    mov.u32     %r29, 0;                // k_tile counter
+k_loop:
+    setp.ge.u32 %p3, %r29, 8;
+    @%p3 bra    k_done;
+
+    // K-tile offset:
+    //   A: + k_tile * 32 bytes (16 BF16 K-cols)
+    //   B: + k_tile * 16 * 256 = k_tile * 4096 bytes (16 K-rows)
+    shl.b32     %r30, %r29, 5;          // k * 32
+    shl.b32     %r31, %r29, 12;         // k * 4096
+    add.u32     %r32, %r24, %r30;       // A addr for this K-tile
+    add.u32     %r33, %r28, %r31;       // B addr base for this K-tile, ng=0
+
+    .reg .b32 _a0, _a1, _a2, _a3;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {_a0, _a1, _a2, _a3}, [%r32];
+
+    .reg .b32 _b0_0, _b0_1, _b1_0, _b1_1, _b2_0, _b2_1, _b3_0, _b3_1;
+    .reg .b32 _b4_0, _b4_1, _b5_0, _b5_1, _b6_0, _b6_1, _b7_0, _b7_1;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {_b0_0, _b0_1}, [%r33];
+    add.u32     %r34, %r33, 16;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {_b1_0, _b1_1}, [%r34];
+    add.u32     %r34, %r33, 32;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {_b2_0, _b2_1}, [%r34];
+    add.u32     %r34, %r33, 48;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {_b3_0, _b3_1}, [%r34];
+    add.u32     %r34, %r33, 64;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {_b4_0, _b4_1}, [%r34];
+    add.u32     %r34, %r33, 80;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {_b5_0, _b5_1}, [%r34];
+    add.u32     %r34, %r33, 96;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {_b6_0, _b6_1}, [%r34];
+    add.u32     %r34, %r33, 112;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {_b7_0, _b7_1}, [%r34];
+
+    MMA_BF16_M16N8K16(%f0,  %f1,  %f2,  %f3,  _a0, _a1, _a2, _a3, _b0_0, _b0_1)
+    MMA_BF16_M16N8K16(%f4,  %f5,  %f6,  %f7,  _a0, _a1, _a2, _a3, _b1_0, _b1_1)
+    MMA_BF16_M16N8K16(%f8,  %f9,  %f10, %f11, _a0, _a1, _a2, _a3, _b2_0, _b2_1)
+    MMA_BF16_M16N8K16(%f12, %f13, %f14, %f15, _a0, _a1, _a2, _a3, _b3_0, _b3_1)
+    MMA_BF16_M16N8K16(%f16, %f17, %f18, %f19, _a0, _a1, _a2, _a3, _b4_0, _b4_1)
+    MMA_BF16_M16N8K16(%f20, %f21, %f22, %f23, _a0, _a1, _a2, _a3, _b5_0, _b5_1)
+    MMA_BF16_M16N8K16(%f24, %f25, %f26, %f27, _a0, _a1, _a2, _a3, _b6_0, _b6_1)
+    MMA_BF16_M16N8K16(%f28, %f29, %f30, %f31, _a0, _a1, _a2, _a3, _b7_0, _b7_1)
+
+    add.u32     %r29, %r29, 1;
+    bra         k_loop;
+k_done:
+
+    // === Store Y_inter [C, D] FP32 to global ===
+    // Per (mg=0, ng), thread (group, tip) writes 4 fp32:
+    //   Y[r0, c0..c0+1], Y[r1, c0..c0+1]
+    //   r0 = warp_m*16 + group, r1 = r0 + 8
+    //   c0 = warp_n*64 + ng*8 + 2*tip
+
+    shr.b32     %r40, %r7, 2;           // group
+    and.b32     %r41, %r7, 3;           // tip
+    shl.b32     %r42, %r8, 4;           // warp_m * 16
+    add.u32     %r42, %r42, %r40;       // base_row_d0
+    shl.b32     %r43, %r9, 6;           // warp_n * 64
+    shl.b32     %r44, %r41, 1;          // tip * 2
+    add.u32     %r43, %r43, %r44;       // base_col_d0
+
+    // Global Y base
+    mul.lo.u32  %r45, %r4, C;
+    mul.lo.u32  %r45, %r45, D;
+    mul.wide.u32 %rd16, %r45, 4;
+    add.u64     %rd17, %rd2, %rd16;     // Y base for this bh
+
+#define STORE_Y_QUAD(ng_off, fa, fb, fc, fd) \
+    { \
+        .reg .u32 _r0, _r1, _c0, _addr; \
+        .reg .u64 _gptr; \
+        add.u32 _r0, %r42, 0; \
+        add.u32 _r1, _r0, 8; \
+        add.u32 _c0, %r43, ng_off; \
+        mad.lo.u32 _addr, _r0, D, _c0; \
+        mul.wide.u32 _gptr, _addr, 4; \
+        add.u64 _gptr, _gptr, %rd17; \
+        st.global.f32 [_gptr],     fa; \
+        st.global.f32 [_gptr + 4], fb; \
+        mad.lo.u32 _addr, _r1, D, _c0; \
+        mul.wide.u32 _gptr, _addr, 4; \
+        add.u64 _gptr, _gptr, %rd17; \
+        st.global.f32 [_gptr],     fc; \
+        st.global.f32 [_gptr + 4], fd; \
+    }
+
+    STORE_Y_QUAD( 0, %f0,  %f1,  %f2,  %f3)
+    STORE_Y_QUAD( 8, %f4,  %f5,  %f6,  %f7)
+    STORE_Y_QUAD(16, %f8,  %f9,  %f10, %f11)
+    STORE_Y_QUAD(24, %f12, %f13, %f14, %f15)
+    STORE_Y_QUAD(32, %f16, %f17, %f18, %f19)
+    STORE_Y_QUAD(40, %f20, %f21, %f22, %f23)
+    STORE_Y_QUAD(48, %f24, %f25, %f26, %f27)
+    STORE_Y_QUAD(56, %f28, %f29, %f30, %f31)
+#undef STORE_Y_QUAD
+
+    ret;
+}

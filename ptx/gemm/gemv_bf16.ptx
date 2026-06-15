@@ -1,0 +1,120 @@
+// gemv_bf16.ptx
+//
+// BF16 matrix-vector product: out[N] = x[K] @ B[K, N]   (row-major B).
+// Specialised for the M=1 decode shape that the scalar gemm_bf16 wastes
+// most of its threads on (16x16 tile with only 1 active row).
+//
+// Block: 256 threads, 1D. Grid: (ceil(N / 256), 1, 1).
+// Each thread computes ONE output column. X[0..K] is staged into SMEM
+// once per block; B accesses are coalesced across the warp (threads in
+// the same warp read 32 consecutive output cols at the same K row).
+//
+// SMEM budget: K * 2 bytes for the X tile. For K up to ~48000 this fits
+// in 99 KB on SM121a.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+// 96 KB SMEM region for staging the X vector. Supports K up to 49152.
+.extern .shared .align 16 .b8 smem_x_dyn[];
+
+.visible .entry gemv_bf16(
+    .param .u64 param_x,        // [K] bf16
+    .param .u64 param_b,        // [K, N] bf16  (row-major)
+    .param .u64 param_out,      // [N] bf16
+    .param .u32 param_n,
+    .param .u32 param_k
+)
+{
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<12>;
+    .reg .f32 %f<6>;
+    .reg .b16 %h<4>;
+    .reg .pred %p<4>;
+
+    mov.u32         %r0, %ctaid.x;            // block_idx
+    mov.u32         %r1, %tid.x;              // tid in [0..255]
+    mov.u32         %r2, %ntid.x;             // 256
+
+    // out_col = block_idx * 256 + tid
+    mul.lo.u32      %r3, %r0, %r2;
+    add.u32         %r4, %r3, %r1;
+
+    ld.param.u64    %rd0, [param_x];
+    ld.param.u64    %rd1, [param_b];
+    ld.param.u64    %rd2, [param_out];
+    ld.param.u32    %r5, [param_n];
+    ld.param.u32    %r6, [param_k];
+
+    // ----- Cooperatively load X[0..K] into smem -----
+    // Each thread strides through K with step 256.
+    mov.u32         %r7, smem_x_dyn;
+    mov.u32         %r8, %r1;                 // i = tid
+
+load_loop:
+    setp.ge.u32     %p0, %r8, %r6;
+    @%p0 bra        load_done;
+
+    // gmem: x_ptr + i * 2
+    mul.wide.u32    %rd3, %r8, 2;
+    add.u64         %rd4, %rd0, %rd3;
+    ld.global.b16   %h0, [%rd4];
+
+    // smem: smem_x + i * 2
+    shl.b32         %r9, %r8, 1;
+    add.u32         %r10, %r7, %r9;
+    st.shared.b16   [%r10], %h0;
+
+    add.u32         %r8, %r8, %r2;
+    bra             load_loop;
+
+load_done:
+    bar.sync        0;
+
+    // ----- Bounds check on out col -----
+    setp.ge.u32     %p1, %r4, %r5;
+    @%p1 bra        ret;
+
+    // ----- K reduction -----
+    mov.f32         %f0, 0.0;
+    mov.u32         %r11, 0;                  // k = 0
+
+k_loop:
+    setp.ge.u32     %p2, %r11, %r6;
+    @%p2 bra        k_done;
+
+    // Load X[k] from smem
+    shl.b32         %r12, %r11, 1;            // k * 2
+    add.u32         %r13, %r7, %r12;
+    ld.shared.b16   %h0, [%r13];
+    CVT_BF16_F32(%f1, %h0)
+
+    // Load B[k, out_col] from gmem
+    // offset = (k * N + out_col) * 2
+    mul.lo.u32      %r14, %r11, %r5;
+    add.u32         %r14, %r14, %r4;
+    mul.wide.u32    %rd5, %r14, 2;
+    add.u64         %rd6, %rd1, %rd5;
+    ld.global.b16   %h1, [%rd6];
+    CVT_BF16_F32(%f2, %h1)
+
+    // FMA
+    fma.rn.f32      %f0, %f1, %f2, %f0;
+
+    add.u32         %r11, %r11, 1;
+    bra             k_loop;
+
+k_done:
+    // ----- Store output -----
+    CVT_F32_BF16(%h2, %f0)
+    mul.wide.u32    %rd7, %r4, 2;
+    add.u64         %rd8, %rd2, %rd7;
+    st.global.b16   [%rd8], %h2;
+
+ret:
+    ret;
+}

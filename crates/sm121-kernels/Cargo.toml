@@ -1,0 +1,56 @@
+[package]
+name = "sm121-kernels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+build = "build.rs"
+rust-version = "1.87"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+cudarc.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+ndarray = "0.16"
+ndarray-npy = "0.9"
+half = "2"
+anyhow = "1"
+
+[features]
+default = []
+c-api = []
+# Superseded flash-attention optimization generations (v8/v11/v12a/v13/v17/v18/v20
+# and the pre-v3 CpAsync baselines). Kept for benchmarking and history, gated out
+# of the default public API surface. Off by default.
+experimental = []
+
+# Crate-wide clippy policy. These are deliberate, behavior-neutral style choices
+# for a hand-written kernel library, not latent bugs:
+#   * too_many_arguments / type_complexity: kernel dispatch fns mirror the raw
+#     PTX entry-point ABI (many device pointers + dims); grouping into structs
+#     would obscure the 1:1 mapping to the .ptx signatures.
+#   * needless_range_loop: index-parallel loops mirror PTX thread/tile indexing
+#     and read more clearly alongside the kernels they validate.
+#   * manual_clamp: `.min(hi).max(1)` launch-grid sizing is intentional and
+#     clearer than `.clamp(1, hi)` next to the grid math.
+#   * large_enum_variant: dispatch enums hold large by-value payloads on
+#     purpose to avoid heap allocation on the hot path.
+#   * doc_lazy_continuation / doc_overindented_list_items: cosmetic rustdoc
+#     formatting in the extensive kernel docs.
+[lints.clippy]
+too_many_arguments = "allow"
+type_complexity = "allow"
+needless_range_loop = "allow"
+manual_clamp = "allow"
+large_enum_variant = "allow"
+doc_lazy_continuation = "allow"
+doc_overindented_list_items = "allow"
+duplicated_attributes = "allow"

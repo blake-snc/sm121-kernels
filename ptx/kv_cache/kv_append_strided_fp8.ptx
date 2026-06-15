@@ -1,0 +1,108 @@
+// kv_append_strided_fp8.ptx
+//
+// Fused BF16->FP8 quantize + strided append into a head-major FP8 KV cache.
+//
+// Layout:
+//   src_k, src_v: [n_kv * head_dim]                 BF16 (compact new row)
+//   dst_k, dst_v: [n_kv, max_seq, head_dim]         FP8 e4m3 (1 byte/elem)
+//   k_scale, v_scale: f32  (dequant scale; write value = bf16 / scale)
+//
+// Grid:  (n_kv, 1, 1)              - one CTA per kv_head
+// Block: (head_dim/2, 1, 1)        - one thread per pair (head_dim must be even)
+//
+// Each thread quantizes 2 BF16 -> 2 FP8 e4m3 (packed in one b16) for K and V.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+.visible .entry kv_append_strided_fp8(
+    .param .u64 param_src_k,        // BF16
+    .param .u64 param_src_v,        // BF16
+    .param .u64 param_dst_k,        // FP8
+    .param .u64 param_dst_v,        // FP8
+    .param .u32 param_position,
+    .param .u32 param_max_seq,
+    .param .u32 param_head_dim,
+    .param .f32 param_k_scale,
+    .param .f32 param_v_scale
+)
+{
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<12>;
+    .reg .f32 %f<8>;
+    .reg .b16 %h<8>;
+
+    mov.u32       %r0, %tid.x;       // pair index in 0..head_dim/2
+    mov.u32       %r1, %ctaid.x;     // h in 0..n_kv-1
+
+    ld.param.u64  %rd0, [param_src_k];
+    ld.param.u64  %rd1, [param_src_v];
+    ld.param.u64  %rd2, [param_dst_k];
+    ld.param.u64  %rd3, [param_dst_v];
+    ld.param.u32  %r2, [param_position];
+    ld.param.u32  %r3, [param_max_seq];
+    ld.param.u32  %r4, [param_head_dim];
+    ld.param.f32  %f0, [param_k_scale];
+    ld.param.f32  %f1, [param_v_scale];
+
+    // Reciprocal: write value = bf16 * (1/scale), so dequant later does fp8 * scale.
+    rcp.approx.f32 %f0, %f0;
+    rcp.approx.f32 %f1, %f1;
+
+    // Pair offset within the head: 2 * pair_idx (in BF16 elements).
+    shl.b32       %r5, %r0, 1;       // pair_idx * 2 (elements)
+
+    // src element index = h * head_dim + pair_idx*2
+    mul.lo.u32    %r6, %r1, %r4;
+    add.u32       %r6, %r6, %r5;
+    // src byte offset = src_elem * 2
+    mul.wide.u32  %rd4, %r6, 2;
+
+    // dst element index = h * max_seq * head_dim + position * head_dim + pair_idx*2
+    mul.lo.u32    %r7, %r1, %r3;
+    mul.lo.u32    %r7, %r7, %r4;
+    mul.lo.u32    %r8, %r2, %r4;
+    add.u32       %r7, %r7, %r8;
+    add.u32       %r7, %r7, %r5;
+    // dst byte offset = dst_elem * 1 (FP8 is 1 byte)
+    cvt.u64.u32   %rd5, %r7;
+
+    // ---- K path ----
+    add.u64       %rd6, %rd0, %rd4;
+    ld.global.b16 %h0, [%rd6];        // K[h, pair*2]
+    ld.global.b16 %h1, [%rd6 + 2];    // K[h, pair*2 + 1]
+    CVT_BF16_F32(%f2, %h0)
+    CVT_BF16_F32(%f3, %h1)
+    mul.f32       %f2, %f2, %f0;      // / k_scale
+    mul.f32       %f3, %f3, %f0;
+    // cvt.rn.satfinite.e4m3x2.f32 takes (f32_lo, f32_hi) -> packed b16 of two e4m3
+    cvt.rn.satfinite.e4m3x2.f32 %h2, %f3, %f2;
+    // %h2 holds two FP8 bytes [byte0=f2, byte1=f3]. Store as 2 separate u8.
+    .reg .b8 _b0, _b1;
+    mov.b16       {_b0, _b1}, %h2;
+
+    add.u64       %rd7, %rd2, %rd5;   // dst_k FP8 byte addr
+    st.global.u8  [%rd7],     _b0;
+    st.global.u8  [%rd7 + 1], _b1;
+
+    // ---- V path ----
+    add.u64       %rd6, %rd1, %rd4;
+    ld.global.b16 %h0, [%rd6];
+    ld.global.b16 %h1, [%rd6 + 2];
+    CVT_BF16_F32(%f2, %h0)
+    CVT_BF16_F32(%f3, %h1)
+    mul.f32       %f2, %f2, %f1;
+    mul.f32       %f3, %f3, %f1;
+    cvt.rn.satfinite.e4m3x2.f32 %h3, %f3, %f2;
+    mov.b16       {_b0, _b1}, %h3;
+
+    add.u64       %rd7, %rd3, %rd5;
+    st.global.u8  [%rd7],     _b0;
+    st.global.u8  [%rd7 + 1], _b1;
+
+    ret;
+}

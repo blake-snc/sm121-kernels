@@ -1,0 +1,286 @@
+// rmsnorm_bf16.ptx
+//
+// RMS Normalization for BF16 tensors.
+// out[i] = (x[i] / rms) * weight[i]
+// where rms = sqrt(mean(x^2) + eps)
+//
+// One CTA per row. Block size = 256 threads.
+// Each thread processes hidden_dim / 256 elements in groups of 4 (vectorized).
+// Uses ld.global.v2.b32 / st.global.v2.b32 for 4x BF16 throughput.
+// Uses warp butterfly reduction + cross-warp reduction via shared memory.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "reduction.ptxh"
+#include "convert.ptxh"
+
+// Shared memory for cross-warp reduction (8 warps * 4 bytes = 32 bytes)
+// Plus broadcast slot (4 bytes) = 36 bytes, aligned to 128.
+.shared .align 128 .b8 smem_reduce[128];
+
+.visible .entry rmsnorm_bf16(
+    .param .u64 param_x,        // input: [num_rows, hidden_dim] bf16
+    .param .u64 param_out,      // output: [num_rows, hidden_dim] bf16
+    .param .u64 param_weight,   // weight: [hidden_dim] bf16
+    .param .u32 param_hidden,   // hidden_dim
+    .param .f32 param_eps       // epsilon
+)
+{
+    .reg .b32 %r<32>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<16>;
+    .reg .b16 %h<8>;
+    .reg .pred %p<4>;
+
+    // Row index = block ID
+    mov.u32         %r0, BLOCK_ID_X;
+
+    // Thread ID
+    mov.u32         %r1, THREAD_ID;
+
+    // Load params
+    ld.param.u64    %rd0, [param_x];
+    ld.param.u64    %rd1, [param_out];
+    ld.param.u64    %rd2, [param_weight];
+    ld.param.u32    %r2, [param_hidden];
+    ld.param.f32    %f0, [param_eps];
+
+    // Row offset in bytes: row_idx * hidden_dim * 2 (bf16 = 2 bytes)
+    mul.lo.u32      %r3, %r0, %r2;
+    mul.wide.u32    %rd3, %r3, 2;
+    add.u64         %rd4, %rd0, %rd3;      // &x[row, 0]
+    add.u64         %rd5, %rd1, %rd3;      // &out[row, 0]
+
+    // Number of threads
+    mov.u32         %r4, %ntid.x;
+
+    // Vectorized loop setup: 4 bf16 values per thread per iteration
+    // vec_stride = blockDim.x * 4 (elements per chunk)
+    shl.b32         %r20, %r4, 2;
+    // vec_limit = hidden_dim rounded down to multiple of vec_stride
+    // Since blockDim.x is a power of 2, vec_stride is also a power of 2
+    sub.u32         %r21, %r20, 1;
+    not.b32         %r21, %r21;
+    and.b32         %r22, %r2, %r21;       // vec_limit
+
+    // ========= Stage 1: Accumulate sum of squares =========
+    mov.f32         %f1, 0.0;              // sum_sq accumulator
+
+    // Vectorized sum-of-squares loop
+    // Each thread starts at tid * 4, strides by vec_stride
+    shl.b32         %r5, %r1, 2;           // i = tid * 4
+
+sum_sq_vec_loop:
+    setp.ge.u32     %p0, %r5, %r22;
+    @%p0 bra        sum_sq_vec_done;
+
+    // Load 4 bf16 values via v2.b32 (8 bytes = 2 x 32-bit = 4 x 16-bit)
+    mul.wide.u32    %rd6, %r5, 2;
+    add.u64         %rd7, %rd4, %rd6;
+    ld.global.v2.b32 {%r10, %r11}, [%rd7];
+
+    // Extract 4 bf16 values from 2 u32 registers
+    mov.b32         {%h0, %h1}, %r10;      // elements 0, 1
+    mov.b32         {%h2, %h3}, %r11;      // elements 2, 3
+
+    // Convert to f32 and accumulate x^2
+    CVT_BF16_F32(%f2, %h0)
+    FMA_F32(%f1, %f2, %f2, %f1)
+    CVT_BF16_F32(%f3, %h1)
+    FMA_F32(%f1, %f3, %f3, %f1)
+    CVT_BF16_F32(%f2, %h2)
+    FMA_F32(%f1, %f2, %f2, %f1)
+    CVT_BF16_F32(%f3, %h3)
+    FMA_F32(%f1, %f3, %f3, %f1)
+
+    add.u32         %r5, %r5, %r20;
+    bra             sum_sq_vec_loop;
+
+sum_sq_vec_done:
+    // Scalar tail: handle remaining elements [vec_limit, hidden_dim)
+    // Strided: i = vec_limit + tid, stride by blockDim.x
+    add.u32         %r5, %r22, %r1;
+
+sum_sq_tail:
+    setp.ge.u32     %p0, %r5, %r2;
+    @%p0 bra        sum_sq_done;
+
+    mul.wide.u32    %rd6, %r5, 2;
+    add.u64         %rd7, %rd4, %rd6;
+    ld.global.b16   %h0, [%rd7];
+    CVT_BF16_F32(%f2, %h0)
+    FMA_F32(%f1, %f2, %f2, %f1)
+
+    add.u32         %r5, %r5, %r4;
+    bra             sum_sq_tail;
+
+sum_sq_done:
+
+    // ========= Stage 2: Warp-level reduction =========
+    WARP_REDUCE_SUM_F32(%f1, %f3)
+
+    // ========= Stage 3: Cross-warp reduction via shared memory =========
+    WARP_ID(%r6, %r1)
+    LANE_ID(%r7, %r1)
+
+    // Lane 0 of each warp writes to smem[warp_id]
+    setp.eq.u32     %p1, %r7, 0;
+    @%p1 bra        write_smem;
+    bra             skip_write;
+
+write_smem:
+    mul.wide.u32    %rd8, %r6, 4;
+    mov.u64         %rd9, smem_reduce;
+    add.u64         %rd10, %rd9, %rd8;
+    st.shared.f32   [%rd10], %f1;
+
+skip_write:
+    bar.sync        0;
+
+    // First warp gathers all partial sums
+    shr.u32         %r8, %r4, 5;           // num_warps
+
+    setp.lt.u32     %p2, %r6, 1;           // only warp 0
+    @%p2 bra        warp0_reduce;
+    bra             after_reduce;
+
+warp0_reduce:
+    setp.lt.u32     %p3, %r7, %r8;
+    @%p3 bra        load_partial;
+    mov.f32         %f1, 0.0;
+    bra             do_final_reduce;
+
+load_partial:
+    mul.wide.u32    %rd8, %r7, 4;
+    mov.u64         %rd9, smem_reduce;
+    add.u64         %rd10, %rd9, %rd8;
+    ld.shared.f32   %f1, [%rd10];
+
+do_final_reduce:
+    WARP_REDUCE_SUM_F32(%f1, %f3)
+
+    // Lane 0 of warp 0: compute rms_inv and broadcast via smem
+    setp.eq.u32     %p1, %r7, 0;
+    @%p1 bra        compute_rms;
+    bra             after_reduce;
+
+compute_rms:
+    // mean_sq = sum_sq / hidden_dim
+    cvt.rn.f32.u32  %f4, %r2;
+    div.approx.f32  %f5, %f1, %f4;
+    // rms_inv = rsqrt(mean_sq + eps)
+    add.f32         %f5, %f5, %f0;
+    RSQRT_F32(%f6, %f5)
+    // Broadcast rms_inv via smem[0]
+    mov.u64         %rd9, smem_reduce;
+    st.shared.f32   [%rd9], %f6;
+
+after_reduce:
+    bar.sync        0;
+
+    // All threads read rms_inv from smem[0]
+    mov.u64         %rd9, smem_reduce;
+    ld.shared.f32   %f6, [%rd9];
+
+    // ========= Stage 4: Normalize and scale (vectorized) =========
+    shl.b32         %r5, %r1, 2;           // i = tid * 4
+
+norm_vec_loop:
+    setp.ge.u32     %p0, %r5, %r22;
+    @%p0 bra        norm_vec_done;
+
+    // Load 4 x values
+    mul.wide.u32    %rd6, %r5, 2;
+    add.u64         %rd7, %rd4, %rd6;
+    ld.global.v2.b32 {%r10, %r11}, [%rd7];
+
+    // Load 4 weight values
+    add.u64         %rd11, %rd2, %rd6;
+    ld.global.v2.b32 {%r12, %r13}, [%rd11];
+
+    // Unpack x values
+    mov.b32         {%h0, %h1}, %r10;
+    mov.b32         {%h2, %h3}, %r11;
+
+    // Unpack weight values
+    mov.b32         {%h4, %h5}, %r12;
+    mov.b32         {%h6, %h7}, %r13;
+
+    // Element 0: out = x * rms_inv * weight
+    CVT_BF16_F32(%f2, %h0)
+    CVT_BF16_F32(%f7, %h4)
+    mul.f32         %f8, %f2, %f6;
+    mul.f32         %f8, %f8, %f7;
+    CVT_F32_BF16(%h0, %f8)
+
+    // Element 1
+    CVT_BF16_F32(%f2, %h1)
+    CVT_BF16_F32(%f7, %h5)
+    mul.f32         %f8, %f2, %f6;
+    mul.f32         %f8, %f8, %f7;
+    CVT_F32_BF16(%h1, %f8)
+
+    // Pack elements 0,1
+    mov.b32         %r10, {%h0, %h1};
+
+    // Element 2
+    CVT_BF16_F32(%f2, %h2)
+    CVT_BF16_F32(%f7, %h6)
+    mul.f32         %f8, %f2, %f6;
+    mul.f32         %f8, %f8, %f7;
+    CVT_F32_BF16(%h2, %f8)
+
+    // Element 3
+    CVT_BF16_F32(%f2, %h3)
+    CVT_BF16_F32(%f7, %h7)
+    mul.f32         %f8, %f2, %f6;
+    mul.f32         %f8, %f8, %f7;
+    CVT_F32_BF16(%h3, %f8)
+
+    // Pack elements 2,3
+    mov.b32         %r11, {%h2, %h3};
+
+    // Store 4 bf16 values
+    add.u64         %rd12, %rd5, %rd6;
+    st.global.v2.b32 [%rd12], {%r10, %r11};
+
+    add.u32         %r5, %r5, %r20;
+    bra             norm_vec_loop;
+
+norm_vec_done:
+    // Scalar tail for remaining elements
+    add.u32         %r5, %r22, %r1;
+
+norm_tail:
+    setp.ge.u32     %p0, %r5, %r2;
+    @%p0 bra        norm_done;
+
+    // Load x[i]
+    mul.wide.u32    %rd6, %r5, 2;
+    add.u64         %rd7, %rd4, %rd6;
+    ld.global.b16   %h0, [%rd7];
+    CVT_BF16_F32(%f2, %h0)
+
+    // Load weight[i]
+    add.u64         %rd11, %rd2, %rd6;
+    ld.global.b16   %h1, [%rd11];
+    CVT_BF16_F32(%f7, %h1)
+
+    // out = x * rms_inv * weight
+    mul.f32         %f8, %f2, %f6;
+    mul.f32         %f8, %f8, %f7;
+
+    // Store
+    CVT_F32_BF16(%h2, %f8)
+    add.u64         %rd12, %rd5, %rd6;
+    st.global.b16   [%rd12], %h2;
+
+    add.u32         %r5, %r5, %r4;
+    bra             norm_tail;
+
+norm_done:
+    ret;
+}

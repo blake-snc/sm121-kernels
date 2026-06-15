@@ -1,0 +1,405 @@
+// gemm_nvfp4_fp8scale_grouped_mma.ptx
+//
+// Modernized NVFP4 grouped GEMM matching NVIDIA / CUTLASS convention:
+// 4-bit E2M1 values + FP8 E4M3 scales per 16-K-element block. Drop-in for
+// `quant_bf16_to_nvfp4` output (which produces FP8 scales). Versus the
+// FP32-scale variant: 4× less scale memory traffic, same BF16-intermediate
+// compute. Hardware `mma.kind::mxf8f6f4.block_scale` port is separate TODO.
+//
+// SM121a has no hardware e2m1 → fp16/f32 conversion, so FP4 is decoded via a
+// 16-entry BF16 lookup table initialized once per CTA in SMEM.
+//
+// Compute:
+//   Y_e[row, n] = Σ_k A_e[row, k] * LUT[B_e[n, k]] * scale_e[n, k/16]
+//
+// Layout:
+//   A: [total_tokens, K] BF16
+//   B: [num_experts, N, K/2] u8 (2 FP4 per byte; nibble 0 = low, nibble 1 = high)
+//   scales: [num_experts, N, K/16] FP8 E4M3 (u8)
+//   C: [total_tokens, N] BF16
+//   expert_offsets: [num_experts+1] u32
+//
+// Tile: 32×32, 1 warp, BF16 m16n8k16. Scales refresh per 16-K block.
+// K must be multiple of 16.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+#include "mma.ptxh"
+
+.visible .entry gemm_nvfp4_fp8scale_grouped_mma(
+    .param .u64 param_A,
+    .param .u64 param_B,
+    .param .u64 param_scales,
+    .param .u64 param_C,
+    .param .u64 param_expert_offsets,
+    .param .u32 param_N,
+    .param .u32 param_K
+)
+{
+    .reg .b32  %r<120>;
+    .reg .b64  %rd<18>;
+    .reg .f32  %f<40>;
+    .reg .b16  %h<8>;
+    .reg .pred %p<10>;
+
+    // SMEM layout:
+    //   [0    .. 1024) A tile (32×16 BF16)
+    //   [1024 .. 2048) B tile (16×32 BF16, post-decode)
+    //   [2048 .. 2176) scales (32 × FP32)
+    //   [2176 .. 2208) FP4 LUT (16 × BF16 = 32 B)
+    .shared .align 128 .b8 smem[2304];
+
+    mov.u32         %r40, %tid.x;
+    mov.u32         %r41, %ctaid.x;
+    mov.u32         %r42, %ctaid.y;
+    mov.u32         %r43, %ctaid.z;
+
+    ld.param.u64    %rd0, [param_A];
+    ld.param.u64    %rd1, [param_B];
+    ld.param.u64    %rd2, [param_scales];
+    ld.param.u64    %rd3, [param_C];
+    ld.param.u64    %rd4, [param_expert_offsets];
+    ld.param.u32    %r44, [param_N];
+    ld.param.u32    %r45, [param_K];
+
+    mul.wide.u32    %rd5, %r43, 4;
+    add.u64         %rd6, %rd4, %rd5;
+    ld.global.u32   %r46, [%rd6];
+    ld.global.u32   %r47, [%rd6 + 4];
+    sub.u32         %r48, %r47, %r46;
+
+    shl.b32         %r49, %r42, 5;
+    setp.ge.u32     %p0, %r49, %r48;
+    @%p0 ret;
+    shl.b32         %r50, %r41, 5;
+    setp.ge.u32     %p1, %r50, %r44;
+    @%p1 ret;
+
+    add.u32         %r51, %r46, %r49;
+    sub.u32         %r52, %r48, %r49;
+    min.u32         %r52, %r52, 32;
+
+    mul.lo.u32      %r53, %r51, %r45;
+    mul.wide.u32    %rd7, %r53, 2;
+    add.u64         %rd7, %rd0, %rd7;
+
+    // B base: [num_experts, N, K/2] bytes. K/2 bytes per col.
+    shr.b32         %r54, %r45, 1;               // K/2
+    mul.lo.u32      %r55, %r43, %r44;
+    add.u32         %r55, %r55, %r50;            // expert*N + n_off
+    mul.lo.u32      %r56, %r55, %r54;            // * (K/2) bytes per col
+    cvt.u64.u32     %rd8, %r56;
+    add.u64         %rd8, %rd1, %rd8;            // &B[expert, n_off, 0]
+
+    // Scales base: [num_experts, N, K/16] FP8 E4M3 (1 byte per scale)
+    shr.b32         %r57, %r45, 4;               // K/16
+    mul.lo.u32      %r58, %r55, %r57;
+    cvt.u64.u32     %rd9, %r58;
+    add.u64         %rd9, %rd2, %rd9;            // &scales[expert, n_off, 0] (bytes)
+
+    // Initialize 32 FP32 accumulators
+    mov.f32 %f0, 0.0;  mov.f32 %f1, 0.0;  mov.f32 %f2, 0.0;  mov.f32 %f3, 0.0;
+    mov.f32 %f4, 0.0;  mov.f32 %f5, 0.0;  mov.f32 %f6, 0.0;  mov.f32 %f7, 0.0;
+    mov.f32 %f8, 0.0;  mov.f32 %f9, 0.0;  mov.f32 %f10, 0.0; mov.f32 %f11, 0.0;
+    mov.f32 %f12, 0.0; mov.f32 %f13, 0.0; mov.f32 %f14, 0.0; mov.f32 %f15, 0.0;
+    mov.f32 %f16, 0.0; mov.f32 %f17, 0.0; mov.f32 %f18, 0.0; mov.f32 %f19, 0.0;
+    mov.f32 %f20, 0.0; mov.f32 %f21, 0.0; mov.f32 %f22, 0.0; mov.f32 %f23, 0.0;
+    mov.f32 %f24, 0.0; mov.f32 %f25, 0.0; mov.f32 %f26, 0.0; mov.f32 %f27, 0.0;
+    mov.f32 %f28, 0.0; mov.f32 %f29, 0.0; mov.f32 %f30, 0.0; mov.f32 %f31, 0.0;
+
+    mov.u32         %r60, smem;
+    add.u32         %r61, %r60, 1024;            // smem_B
+    add.u32         %r62, %r60, 2048;            // smem_scales
+    add.u32         %r101, %r60, 2176;          // FP4 LUT (16 entries × BF16)
+
+    // Initialize FP4 LUT. E2M1 decoding:
+    //   bits[3]=sign, bits[2:1]=exp (0..3), bits[0]=mant (0..1)
+    //   exp=0, mant=0: 0
+    //   exp=0, mant=1: ±0.5
+    //   exp=1, mant=0: ±1.0
+    //   exp=1, mant=1: ±1.5
+    //   exp=2, mant=0: ±2.0
+    //   exp=2, mant=1: ±3.0
+    //   exp=3, mant=0: ±4.0
+    //   exp=3, mant=1: ±6.0
+    // Only thread 0 initializes (16 writes).
+    setp.ne.u32     %p7, %r40, 0;
+    @%p7 bra      lut_done;
+    .reg .b16 _lut_v;
+    // index 0 = +0  (BF16 0x0000)
+    mov.b16 _lut_v, 0x0000;  st.shared.b16 [%r101 + 0],  _lut_v;
+    // index 1 = +0.5 (BF16 0x3F00)
+    mov.b16 _lut_v, 0x3F00;  st.shared.b16 [%r101 + 2],  _lut_v;
+    // index 2 = +1.0 (BF16 0x3F80)
+    mov.b16 _lut_v, 0x3F80;  st.shared.b16 [%r101 + 4],  _lut_v;
+    // index 3 = +1.5 (BF16 0x3FC0)
+    mov.b16 _lut_v, 0x3FC0;  st.shared.b16 [%r101 + 6],  _lut_v;
+    // index 4 = +2.0 (BF16 0x4000)
+    mov.b16 _lut_v, 0x4000;  st.shared.b16 [%r101 + 8],  _lut_v;
+    // index 5 = +3.0 (BF16 0x4040)
+    mov.b16 _lut_v, 0x4040;  st.shared.b16 [%r101 + 10], _lut_v;
+    // index 6 = +4.0 (BF16 0x4080)
+    mov.b16 _lut_v, 0x4080;  st.shared.b16 [%r101 + 12], _lut_v;
+    // index 7 = +6.0 (BF16 0x40C0)
+    mov.b16 _lut_v, 0x40C0;  st.shared.b16 [%r101 + 14], _lut_v;
+    // indices 8..15: negatives (flip sign bit)
+    mov.b16 _lut_v, 0x8000;  st.shared.b16 [%r101 + 16], _lut_v; // -0
+    mov.b16 _lut_v, 0xBF00;  st.shared.b16 [%r101 + 18], _lut_v; // -0.5
+    mov.b16 _lut_v, 0xBF80;  st.shared.b16 [%r101 + 20], _lut_v; // -1
+    mov.b16 _lut_v, 0xBFC0;  st.shared.b16 [%r101 + 22], _lut_v; // -1.5
+    mov.b16 _lut_v, 0xC000;  st.shared.b16 [%r101 + 24], _lut_v; // -2
+    mov.b16 _lut_v, 0xC040;  st.shared.b16 [%r101 + 26], _lut_v; // -3
+    mov.b16 _lut_v, 0xC080;  st.shared.b16 [%r101 + 28], _lut_v; // -4
+    mov.b16 _lut_v, 0xC0C0;  st.shared.b16 [%r101 + 30], _lut_v; // -6
+lut_done:
+    bar.sync        0;
+
+    setp.lt.u32     %p2, %r40, 16;
+    @%p2 mul.lo.u32 %r63, %r40, 32;
+    @!%p2 sub.u32   %r63, %r40, 16;
+    @!%p2 mad.lo.u32 %r63, %r63, 32, 16;
+    add.u32         %r64, %r60, %r63;
+    add.u32         %r65, %r64, 512;
+
+    and.b32         %r66, %r40, 15;
+    shl.b32         %r66, %r66, 6;
+    add.u32         %r67, %r61, %r66;
+
+    shr.b32         %r68, %r40, 2;
+    and.b32         %r69, %r40, 3;
+    shl.b32         %r70, %r69, 1;
+
+    // B decode: k_row = lane/2, n_chunk = lane%2 (covers cols 0-15 or 16-31)
+    shr.b32         %r71, %r40, 1;
+    and.b32         %r72, %r40, 1;
+    shl.b32         %r73, %r72, 4;               // n_chunk*16 (col base in elems)
+
+    // smem scales offset for 16 cols this thread needs
+    shl.b32         %r74, %r73, 2;
+    add.u32         %r74, %r62, %r74;
+
+    add.u32         %r75, %r50, %r73;
+    setp.lt.u32     %p5, %r75, %r44;
+
+    mul.lo.u32      %r76, %r40, 32;
+    add.u32         %r76, %r60, %r76;
+
+    shl.b32         %r77, %r71, 6;
+    shl.b32         %r78, %r72, 5;
+    add.u32         %r77, %r77, %r78;
+    add.u32         %r77, %r61, %r77;
+
+    setp.lt.u32     %p4, %r40, %r52;
+
+    // ==================== K BLOCK LOOP (16 elements each) ====================
+    mov.u32         %r80, 0;                     // k (global)
+    mov.u32         %r81, 0;                     // k_block (of 16)
+
+k_block_loop:
+    setp.ge.u32     %p3, %r81, %r57;
+    @%p3 bra        k_block_done;
+
+    // Load 32 col scales (FP8 E4M3 bytes) into SMEM as decoded FP32.
+    //   addr = rd9 + lane*(K/16) + k_block (1 byte per scale)
+    mul.lo.u32      %r82, %r40, %r57;
+    add.u32         %r82, %r82, %r81;
+    cvt.u64.u32     %rd10, %r82;
+    add.u64         %rd10, %rd9, %rd10;
+
+    add.u32         %r83, %r50, %r40;
+    setp.lt.u32     %p6, %r83, %r44;
+
+    .reg .f32 _scv;
+    mov.f32         _scv, 0f3F800000;            // default 1.0 for OOB lanes
+    .reg .b32 _scu8;
+    mov.b32         _scu8, 0x38;                 // FP8 E4M3 1.0 bit pattern
+    @%p6 ld.global.u8 _scu8, [%rd10];
+    // FP8 E4M3 → FP16 → FP32
+    .reg .b16 _fp8_pair, _hlo, _hhi;
+    .reg .b32 _fp16x2;
+    cvt.u16.u32     _fp8_pair, _scu8;
+    cvt.rn.f16x2.e4m3x2 _fp16x2, _fp8_pair;
+    mov.b32         {_hlo, _hhi}, _fp16x2;
+    cvt.f32.f16     _scv, _hlo;
+    shl.b32         %r84, %r40, 2;
+    add.u32         %r85, %r62, %r84;
+    st.shared.f32   [%r85], _scv;
+
+    bar.sync        0;
+
+    // === Load A tile: 32 rows × 16 cols BF16 ===
+    add.u32         %r88, %r51, %r40;
+    mul.lo.u32      %r89, %r88, %r45;
+    add.u32         %r89, %r89, %r80;
+    mul.wide.u32    %rd11, %r89, 2;
+    add.u64         %rd11, %rd0, %rd11;
+
+    .reg .b32 _a0a, _a1a, _a2a, _a3a, _a0b, _a1b, _a2b, _a3b;
+    @%p4 ld.global.v4.b32 {_a0a, _a1a, _a2a, _a3a}, [%rd11];
+    @%p4 ld.global.v4.b32 {_a0b, _a1b, _a2b, _a3b}, [%rd11 + 16];
+    @!%p4 mov.b32   _a0a, 0;
+    @!%p4 mov.b32   _a1a, 0;
+    @!%p4 mov.b32   _a2a, 0;
+    @!%p4 mov.b32   _a3a, 0;
+    @!%p4 mov.b32   _a0b, 0;
+    @!%p4 mov.b32   _a1b, 0;
+    @!%p4 mov.b32   _a2b, 0;
+    @!%p4 mov.b32   _a3b, 0;
+    st.shared.v4.b32 [%r76],      {_a0a, _a1a, _a2a, _a3a};
+    st.shared.v4.b32 [%r76 + 16], {_a0b, _a1b, _a2b, _a3b};
+
+    // === Decode 16 FP4 values for (k_row, n_chunk*16..+16) ===
+    // B layout [expert, N, K/2] bytes. Each byte = 2 FP4 (low nibble = k_lo, high = k_hi).
+    // For K-block of 16 elements, we need 8 bytes per (n_chunk*16 + col, k_block).
+    // Thread handles 16 cols × 1 k_row → 16 FP4 = 8 bytes (if 2 FP4 per byte along K).
+    //
+    // BUT: layout is [N, K/2] meaning per-N-col, K/2 bytes. So for k_row (0-15),
+    // the byte offset within a col is k_row/2 (since 2 FP4 per byte along K). The
+    // nibble within that byte is k_row%2.
+    //
+    // We process 16 (col, k_row) pairs per thread decode. k_row is fixed per thread
+    // (= lane/2). So we need 16 bytes? No: k_row is fixed, so we read 1 byte (1 nibble)
+    // per col, but the byte holds 2 K-values. We only use 1 of them.
+    //
+    // Actually simpler: read 1 byte per col, extract nibble based on k_row parity.
+    and.b32         %r102, %r71, 1;           // k_row parity (0 or 1)
+    shr.b32         %r103, %r71, 1;      // k_row / 2 (byte offset within col)
+
+    // Compute byte offset in col for current k_block:
+    //   global k for this thread's slot = k_block*16 + k_row
+    //   byte offset in col = global_k / 2
+    add.u32         %r104, %r80, %r71;          // k + k_row
+    shr.b32         %r105, %r104, 1;     // global_k / 2
+
+    // Address base for first col (n_chunk*16): &B[expert, n_off+n_chunk*16, k_byte]
+    mul.lo.u32      %r106, %r73, %r54; // n_chunk*16 × (K/2)
+    add.u32         %r107, %r106, %r105;
+    cvt.u64.u32     %rd12, %r107;
+    add.u64         %rd12, %rd8, %rd12;          // &B[expert, n_off+n_chunk*16, k_byte]
+
+    mov.u32         %r93, 0;                     // col_idx 0..15
+fp4_decode_loop:
+    setp.ge.u32     %p6, %r93, 16;
+    @%p6 bra        fp4_decode_done;
+
+    // Address: rd12 + col_idx * (K/2) (bytes)
+    mul.lo.u32      %r94, %r93, %r54;
+    cvt.u64.u32     %rd13, %r94;
+    add.u64         %rd13, %rd12, %rd13;
+
+    .reg .b32 _byte;
+    mov.b32         _byte, 0;
+    @%p5 ld.global.u8 _byte, [%rd13];
+
+    // Select nibble based on k_row parity (low=even k_row, high=odd k_row).
+    .reg .b32 _nibble;
+    setp.eq.u32     %p8, %r102, 0;
+    @%p8 and.b32 _nibble, _byte, 0xF;
+    @!%p8 shr.b32 _nibble, _byte, 4;
+    and.b32         _nibble, _nibble, 0xF;
+
+    // LUT lookup: addr = LUT + nibble * 2
+    shl.b32         %r108, _nibble, 1;
+    add.u32         %r109, %r101, %r108;
+    .reg .b16 _bf_v;
+    ld.shared.b16   _bf_v, [%r109];
+
+    // Convert BF16 → FP32 for scaling
+    .reg .f32 _fv;
+    cvt.f32.bf16    _fv, _bf_v;
+
+    // Multiply by per-col scale (loaded at block boundary).
+    shl.b32         %r95, %r93, 2;
+    add.u32         %r96, %r74, %r95;
+    .reg .f32 _sv;
+    ld.shared.f32   _sv, [%r96];
+    mul.f32         _fv, _fv, _sv;
+
+    // Convert FP32 → BF16, store to SMEM B tile
+    .reg .b16 _bv;
+    CVT_F32_BF16(_bv, _fv)
+    shl.b32         %r97, %r93, 1;
+    add.u32         %r98, %r77, %r97;
+    st.shared.b16   [%r98], _bv;
+
+    add.u32         %r93, %r93, 1;
+    bra             fp4_decode_loop;
+fp4_decode_done:
+
+    bar.sync        0;
+
+    // ldmatrix + MMA
+    .reg .b32 %rA0, %rA1, %rA2, %rA3, %rA4, %rA5, %rA6, %rA7;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%rA0, %rA1, %rA2, %rA3}, [%r64];
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%rA4, %rA5, %rA6, %rA7}, [%r65];
+
+    .reg .b32 %rB0, %rB1;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%rB0, %rB1}, [%r67];
+    MMA_BF16_M16N8K16(%f0,  %f1,  %f2,  %f3,  %rA0, %rA1, %rA2, %rA3, %rB0, %rB1)
+    MMA_BF16_M16N8K16(%f16, %f17, %f18, %f19, %rA4, %rA5, %rA6, %rA7, %rB0, %rB1)
+    add.u32         %r99, %r67, 16;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%rB0, %rB1}, [%r99];
+    MMA_BF16_M16N8K16(%f4,  %f5,  %f6,  %f7,  %rA0, %rA1, %rA2, %rA3, %rB0, %rB1)
+    MMA_BF16_M16N8K16(%f20, %f21, %f22, %f23, %rA4, %rA5, %rA6, %rA7, %rB0, %rB1)
+    add.u32         %r99, %r67, 32;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%rB0, %rB1}, [%r99];
+    MMA_BF16_M16N8K16(%f8,  %f9,  %f10, %f11, %rA0, %rA1, %rA2, %rA3, %rB0, %rB1)
+    MMA_BF16_M16N8K16(%f24, %f25, %f26, %f27, %rA4, %rA5, %rA6, %rA7, %rB0, %rB1)
+    add.u32         %r99, %r67, 48;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%rB0, %rB1}, [%r99];
+    MMA_BF16_M16N8K16(%f12, %f13, %f14, %f15, %rA0, %rA1, %rA2, %rA3, %rB0, %rB1)
+    MMA_BF16_M16N8K16(%f28, %f29, %f30, %f31, %rA4, %rA5, %rA6, %rA7, %rB0, %rB1)
+
+    bar.sync        0;
+
+    add.u32         %r80, %r80, 16;
+    add.u32         %r81, %r81, 1;
+    bra             k_block_loop;
+k_block_done:
+
+#define STORE_TILE_NVFP4(mg, ng, d0, d1, d2, d3) \
+    { .reg .b32 _row, _col, _off; \
+      .reg .b64 _p; \
+      .reg .b16 _b0, _b1; \
+      .reg .b32 _pk; \
+      .reg .pred _rin; \
+      add.u32 _row, %r51, 0; \
+      add.u32 _row, _row, mg*16; \
+      add.u32 _row, _row, %r68; \
+      add.u32 _col, %r50, ng*8; \
+      add.u32 _col, _col, %r70; \
+      setp.lt.u32 _rin, _row, %r47; \
+      mul.lo.u32 _off, _row, %r44; \
+      add.u32 _off, _off, _col; \
+      mul.wide.u32 _p, _off, 2; \
+      add.u64 _p, %rd3, _p; \
+      CVT_F32_BF16(_b0, d0) \
+      CVT_F32_BF16(_b1, d1) \
+      mov.b32 _pk, {_b0, _b1}; \
+      @_rin st.global.b32 [_p], _pk; \
+      add.u32 _row, _row, 8; \
+      setp.lt.u32 _rin, _row, %r47; \
+      mul.lo.u32 _off, _row, %r44; \
+      add.u32 _off, _off, _col; \
+      mul.wide.u32 _p, _off, 2; \
+      add.u64 _p, %rd3, _p; \
+      CVT_F32_BF16(_b0, d2) \
+      CVT_F32_BF16(_b1, d3) \
+      mov.b32 _pk, {_b0, _b1}; \
+      @_rin st.global.b32 [_p], _pk; \
+    }
+    STORE_TILE_NVFP4(0, 0, %f0,  %f1,  %f2,  %f3)
+    STORE_TILE_NVFP4(0, 1, %f4,  %f5,  %f6,  %f7)
+    STORE_TILE_NVFP4(0, 2, %f8,  %f9,  %f10, %f11)
+    STORE_TILE_NVFP4(0, 3, %f12, %f13, %f14, %f15)
+    STORE_TILE_NVFP4(1, 0, %f16, %f17, %f18, %f19)
+    STORE_TILE_NVFP4(1, 1, %f20, %f21, %f22, %f23)
+    STORE_TILE_NVFP4(1, 2, %f24, %f25, %f26, %f27)
+    STORE_TILE_NVFP4(1, 3, %f28, %f29, %f30, %f31)
+
+    ret;
+}

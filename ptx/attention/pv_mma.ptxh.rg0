@@ -1,0 +1,208 @@
+// pv_mma.ptxh.rg0 — rg0 PV GEMM: O_rg0 += P_rg0 * V
+// P ldmatrix base: %r78 (rg0), V ldmatrix base: %r120
+// O accumulators: %f0..%f63 (16 ng x 4 regs)
+// 8 kp chunks x 16 ng groups
+
+    // kp=0
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r32, %r33, %r34, %r35}, [%r78];
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r120];
+    MMA_BF16_M16N8K16(%f0, %f1, %f2, %f3, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r120, 16;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90];
+    MMA_BF16_M16N8K16(%f4, %f5, %f6, %f7, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r120, 32;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90];
+    MMA_BF16_M16N8K16(%f8, %f9, %f10, %f11, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r120, 48;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90];
+    MMA_BF16_M16N8K16(%f12, %f13, %f14, %f15, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r120, 64;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90];
+    MMA_BF16_M16N8K16(%f16, %f17, %f18, %f19, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r120, 80;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90];
+    MMA_BF16_M16N8K16(%f20, %f21, %f22, %f23, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r120, 96;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90];
+    MMA_BF16_M16N8K16(%f24, %f25, %f26, %f27, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r120, 112;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90];
+    MMA_BF16_M16N8K16(%f28, %f29, %f30, %f31, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r120, 128;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90];
+    MMA_BF16_M16N8K16(%f32, %f33, %f34, %f35, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r120, 144;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90];
+    MMA_BF16_M16N8K16(%f36, %f37, %f38, %f39, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r120, 160;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90];
+    MMA_BF16_M16N8K16(%f40, %f41, %f42, %f43, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r120, 176;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90];
+    MMA_BF16_M16N8K16(%f44, %f45, %f46, %f47, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r120, 192;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90];
+    MMA_BF16_M16N8K16(%f48, %f49, %f50, %f51, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r120, 208;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90];
+    MMA_BF16_M16N8K16(%f52, %f53, %f54, %f55, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r120, 224;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90];
+    MMA_BF16_M16N8K16(%f56, %f57, %f58, %f59, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r120, 240;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90];
+    MMA_BF16_M16N8K16(%f60, %f61, %f62, %f63, %r32, %r33, %r34, %r35, %r104, %r105)
+
+    // kp=1
+    add.u32 %r91, %r78, 32;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r32, %r33, %r34, %r35}, [%r91];
+    add.u32 %r91, %r120, 4096;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r91];
+    MMA_BF16_M16N8K16(%f0, %f1, %f2, %f3, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 16;  ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f4, %f5, %f6, %f7, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 32;  ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f8, %f9, %f10, %f11, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 48;  ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f12, %f13, %f14, %f15, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 64;  ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f16, %f17, %f18, %f19, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 80;  ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f20, %f21, %f22, %f23, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 96;  ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f24, %f25, %f26, %f27, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 112; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f28, %f29, %f30, %f31, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 128; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f32, %f33, %f34, %f35, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 144; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f36, %f37, %f38, %f39, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 160; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f40, %f41, %f42, %f43, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 176; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f44, %f45, %f46, %f47, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 192; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f48, %f49, %f50, %f51, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 208; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f52, %f53, %f54, %f55, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 224; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f56, %f57, %f58, %f59, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 240; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f60, %f61, %f62, %f63, %r32, %r33, %r34, %r35, %r104, %r105)
+
+    // kp=2
+    add.u32 %r91, %r78, 64;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r32, %r33, %r34, %r35}, [%r91];
+    add.u32 %r91, %r120, 8192;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r91];
+    MMA_BF16_M16N8K16(%f0, %f1, %f2, %f3, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 16;  ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f4, %f5, %f6, %f7, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 32;  ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f8, %f9, %f10, %f11, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 48;  ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f12, %f13, %f14, %f15, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 64;  ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f16, %f17, %f18, %f19, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 80;  ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f20, %f21, %f22, %f23, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 96;  ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f24, %f25, %f26, %f27, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 112; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f28, %f29, %f30, %f31, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 128; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f32, %f33, %f34, %f35, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 144; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f36, %f37, %f38, %f39, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 160; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f40, %f41, %f42, %f43, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 176; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f44, %f45, %f46, %f47, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 192; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f48, %f49, %f50, %f51, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 208; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f52, %f53, %f54, %f55, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 224; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f56, %f57, %f58, %f59, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 240; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f60, %f61, %f62, %f63, %r32, %r33, %r34, %r35, %r104, %r105)
+
+    // kp=3
+    add.u32 %r91, %r78, 96;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r32, %r33, %r34, %r35}, [%r91];
+    add.u32 %r91, %r120, 12288;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r91];
+    MMA_BF16_M16N8K16(%f0, %f1, %f2, %f3, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 16;  ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f4, %f5, %f6, %f7, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 32;  ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f8, %f9, %f10, %f11, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 48;  ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f12, %f13, %f14, %f15, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 64;  ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f16, %f17, %f18, %f19, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 80;  ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f20, %f21, %f22, %f23, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 96;  ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f24, %f25, %f26, %f27, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 112; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f28, %f29, %f30, %f31, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 128; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f32, %f33, %f34, %f35, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 144; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f36, %f37, %f38, %f39, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 160; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f40, %f41, %f42, %f43, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 176; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f44, %f45, %f46, %f47, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 192; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f48, %f49, %f50, %f51, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 208; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f52, %f53, %f54, %f55, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 224; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f56, %f57, %f58, %f59, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 240; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f60, %f61, %f62, %f63, %r32, %r33, %r34, %r35, %r104, %r105)
+
+    // kp=4
+    add.u32 %r91, %r78, 128;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r32, %r33, %r34, %r35}, [%r91];
+    add.u32 %r91, %r120, 16384;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r91];
+    MMA_BF16_M16N8K16(%f0, %f1, %f2, %f3, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 16;  ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f4, %f5, %f6, %f7, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 32;  ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f8, %f9, %f10, %f11, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 48;  ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f12, %f13, %f14, %f15, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 64;  ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f16, %f17, %f18, %f19, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 80;  ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f20, %f21, %f22, %f23, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 96;  ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f24, %f25, %f26, %f27, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 112; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f28, %f29, %f30, %f31, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 128; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f32, %f33, %f34, %f35, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 144; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f36, %f37, %f38, %f39, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 160; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f40, %f41, %f42, %f43, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 176; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f44, %f45, %f46, %f47, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 192; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f48, %f49, %f50, %f51, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 208; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f52, %f53, %f54, %f55, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 224; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f56, %f57, %f58, %f59, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 240; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f60, %f61, %f62, %f63, %r32, %r33, %r34, %r35, %r104, %r105)
+
+    // kp=5
+    add.u32 %r91, %r78, 160;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r32, %r33, %r34, %r35}, [%r91];
+    add.u32 %r91, %r120, 20480;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r91];
+    MMA_BF16_M16N8K16(%f0, %f1, %f2, %f3, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 16;  ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f4, %f5, %f6, %f7, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 32;  ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f8, %f9, %f10, %f11, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 48;  ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f12, %f13, %f14, %f15, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 64;  ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f16, %f17, %f18, %f19, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 80;  ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f20, %f21, %f22, %f23, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 96;  ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f24, %f25, %f26, %f27, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 112; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f28, %f29, %f30, %f31, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 128; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f32, %f33, %f34, %f35, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 144; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f36, %f37, %f38, %f39, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 160; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f40, %f41, %f42, %f43, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 176; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f44, %f45, %f46, %f47, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 192; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f48, %f49, %f50, %f51, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 208; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f52, %f53, %f54, %f55, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 224; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f56, %f57, %f58, %f59, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 240; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f60, %f61, %f62, %f63, %r32, %r33, %r34, %r35, %r104, %r105)
+
+    // kp=6
+    add.u32 %r91, %r78, 192;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r32, %r33, %r34, %r35}, [%r91];
+    add.u32 %r91, %r120, 24576;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r91];
+    MMA_BF16_M16N8K16(%f0, %f1, %f2, %f3, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 16;  ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f4, %f5, %f6, %f7, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 32;  ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f8, %f9, %f10, %f11, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 48;  ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f12, %f13, %f14, %f15, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 64;  ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f16, %f17, %f18, %f19, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 80;  ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f20, %f21, %f22, %f23, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 96;  ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f24, %f25, %f26, %f27, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 112; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f28, %f29, %f30, %f31, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 128; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f32, %f33, %f34, %f35, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 144; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f36, %f37, %f38, %f39, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 160; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f40, %f41, %f42, %f43, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 176; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f44, %f45, %f46, %f47, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 192; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f48, %f49, %f50, %f51, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 208; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f52, %f53, %f54, %f55, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 224; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f56, %f57, %f58, %f59, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 240; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f60, %f61, %f62, %f63, %r32, %r33, %r34, %r35, %r104, %r105)
+
+    // kp=7
+    add.u32 %r91, %r78, 224;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r32, %r33, %r34, %r35}, [%r91];
+    add.u32 %r91, %r120, 28672;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r91];
+    MMA_BF16_M16N8K16(%f0, %f1, %f2, %f3, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 16;  ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f4, %f5, %f6, %f7, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 32;  ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f8, %f9, %f10, %f11, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 48;  ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f12, %f13, %f14, %f15, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 64;  ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f16, %f17, %f18, %f19, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 80;  ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f20, %f21, %f22, %f23, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 96;  ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f24, %f25, %f26, %f27, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 112; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f28, %f29, %f30, %f31, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 128; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f32, %f33, %f34, %f35, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 144; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f36, %f37, %f38, %f39, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 160; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f40, %f41, %f42, %f43, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 176; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f44, %f45, %f46, %f47, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 192; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f48, %f49, %f50, %f51, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 208; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f52, %f53, %f54, %f55, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 224; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f56, %f57, %f58, %f59, %r32, %r33, %r34, %r35, %r104, %r105)
+    add.u32 %r90, %r91, 240; ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%r104, %r105}, [%r90]; MMA_BF16_M16N8K16(%f60, %f61, %f62, %f63, %r32, %r33, %r34, %r35, %r104, %r105)

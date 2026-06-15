@@ -1,0 +1,99 @@
+// dequant_nvfp4_bf16.ptx
+//
+// NVFP4 → BF16 dequantization. 16-element blocks with FP8 E4M3 scales.
+//   out[row, block*16 + i] = fp4_to_f32(x[..]) * fp8_to_f32(scales[row, block])
+//
+// Layout:
+//   x: [num_rows, hidden/2] u8 (packed FP4)
+//   scales: [num_rows, hidden/16] u8 (FP8 e4m3)
+//   out: [num_rows, hidden] bf16
+//
+// Grid: (num_rows, num_blocks, 1). Block: (4, 1, 1).
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+.visible .entry dequant_nvfp4_bf16(
+    .param .u64 param_x,
+    .param .u64 param_scales,
+    .param .u64 param_out,
+    .param .u32 param_hidden
+)
+{
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<10>;
+    .reg .b16 %h<16>;
+    .reg .pred %p<2>;
+
+    mov.u32         %r0, BLOCK_ID_X;
+    mov.u32         %r1, BLOCK_ID_Y;
+    mov.u32         %r2, THREAD_ID;
+
+    ld.param.u64    %rd0, [param_x];
+    ld.param.u64    %rd1, [param_scales];
+    ld.param.u64    %rd2, [param_out];
+    ld.param.u32    %r3, [param_hidden];
+
+    mul.lo.u32      %r4, %r0, %r3;
+    shl.b32         %r5, %r1, 4;               // block * 16
+    add.u32         %r4, %r4, %r5;
+
+    shr.u32         %r7, %r4, 1;
+    mul.wide.u32    %rd3, %r7, 1;
+    add.u64         %rd4, %rd0, %rd3;
+
+    mul.wide.u32    %rd5, %r4, 2;
+    add.u64         %rd6, %rd2, %rd5;
+
+    // Decode FP8 scale → FP32
+    shr.u32         %r20, %r3, 4;              // num_blocks
+    mul.lo.u32      %r21, %r0, %r20;
+    add.u32         %r21, %r21, %r1;
+    mul.wide.u32    %rd7, %r21, 1;
+    add.u64         %rd8, %rd1, %rd7;
+    ld.global.u8    %r22, [%rd8];
+    // Pack into low byte of b16 for cvt
+    cvt.u16.u32     %h0, %r22;
+    cvt.rn.f16x2.e4m3x2 %r23, %h0;
+    mov.b32         {%h1, %h2}, %r23;
+    cvt.f32.f16     %f0, %h1;                  // scale in FP32
+
+    shl.b32         %r6, %r2, 1;               // lane * 2 bytes
+    mul.wide.u32    %rd9, %r6, 1;
+    add.u64         %rd10, %rd4, %rd9;
+    ld.global.b16   %h4, [%rd10];
+
+    .reg .b8 _b0, _b1;
+    mov.b16         {_b0, _b1}, %h4;
+    .reg .b32 _p0, _p1;
+    cvt.rn.f16x2.e2m1x2 _p0, _b0;
+    cvt.rn.f16x2.e2m1x2 _p1, _b1;
+    mov.b32         {%h5, %h6}, _p0;
+    mov.b32         {%h7, %h8}, _p1;
+    cvt.f32.f16     %f2, %h5;
+    cvt.f32.f16     %f3, %h6;
+    cvt.f32.f16     %f4, %h7;
+    cvt.f32.f16     %f5, %h8;
+    mul.f32         %f2, %f2, %f0;
+    mul.f32         %f3, %f3, %f0;
+    mul.f32         %f4, %f4, %f0;
+    mul.f32         %f5, %f5, %f0;
+    CVT_F32_BF16(%h9, %f2)
+    CVT_F32_BF16(%h10, %f3)
+    CVT_F32_BF16(%h11, %f4)
+    CVT_F32_BF16(%h12, %f5)
+    mov.b32         %r14, {%h9, %h10};
+    mov.b32         %r15, {%h11, %h12};
+
+    shl.b32         %r23, %r2, 3;              // lane * 8 bytes
+    mul.wide.u32    %rd11, %r23, 1;
+    add.u64         %rd12, %rd6, %rd11;
+    st.global.v2.b32 [%rd12], {%r14, %r15};
+
+    ret;
+}

@@ -1,0 +1,527 @@
+// gemm_bf16_mma_v4.ptx
+//
+// BF16 GEMM v4 — warp-specialized + TMA BF16 GEMM for SM121a.
+//
+// Motivation: v3 hits 27-50 TFLOPS across our
+// transformer-prefill shapes (25-42% of SM121a's ~119 TFLOPS BF16 peak);
+// cuBLAS hits 75-102 TFLOPS on the same shapes (63-86% of peak). v4
+// closes that gap via warp specialization (separate DMA + MMA warps) and
+// TMA (cp.async.bulk.tensor) loads. See docs/gemm_v4_design.md.
+//
+// Design (revised vs initial scaffolding):
+//   9 warps (288 threads) per CTA: 1 producer (DMA) + 8 consumer (MMA).
+//   Consumer warps in 2×4 layout: warp_m ∈ [0,1], warp_n ∈ [0,3].
+//   Each consumer warp handles a 64×32 output sub-tile (4 m-groups ×
+//   4 n-groups, 64 fp32 accumulators per thread). Matches v3's per-warp
+//   shape so the MMA inner loop is essentially v3's, just gated on TMA
+//   loads instead of cp.async.cg.
+//
+// Per-CTA work: 128×128 output tile (ctaid.y × 128, ctaid.x × 128).
+// K loop: 3-stage software pipeline. Producer issues TMA for stage
+// k_iter%3; consumer waits on stage's A/B mbarriers, computes, signals
+// DONE. With 3 stages, producer can be 2 K-iters ahead, so stages
+// N+1 and N+2's TMA both overlap stage N's compute. Needed for shapes
+// with deep K (e.g., MLP down K=12288 → 384 K-iters) where 2-stage
+// starves on producer latency.
+//
+// SMEM (48 KB stages + 72 B mbarriers = 48.07 KB):
+//   Stage 0: A_tile [128×32] BF16 (8 KB) + B_tile [32×128] BF16 (8 KB)
+//   Stage 1: same
+//   Stage 2: same
+//   Per-stage mbarriers: A_mbar (8 B) + B_mbar (8 B) + DONE_mbar (8 B)
+//
+// Constraints: M%128 == 0, N%128 == 0, K%32 == 0.
+//
+// Status: Step 7 — 3-stage pipeline. Stage counter wraps 0→1→2→0 via
+// branchless selp. Per-stage parity_load[3] and parity_done[3] selected
+// via two-step 3-way selp.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+#include "mma.ptxh"
+
+// SMEM layout offsets
+#define A_OFF_STAGE0          0
+#define B_OFF_STAGE0       8192
+#define A_OFF_STAGE1      16384
+#define B_OFF_STAGE1      24576
+#define A_OFF_STAGE2      32768
+#define B_OFF_STAGE2      40960
+#define MBAR_A_STAGE0     49152
+#define MBAR_B_STAGE0     49160
+#define MBAR_DONE_STAGE0  49168
+#define MBAR_A_STAGE1     49176
+#define MBAR_B_STAGE1     49184
+#define MBAR_DONE_STAGE1  49192
+#define MBAR_A_STAGE2     49200
+#define MBAR_B_STAGE2     49208
+#define MBAR_DONE_STAGE2  49216
+#define SMEM_TOTAL_BYTES  49232
+
+.visible .entry gemm_bf16_mma_v4(
+    .param .u64 param_A_tma,       // device pointer to A's CUtensorMap [M, K] bf16
+    .param .u64 param_B_tma,       // device pointer to B's CUtensorMap [K, N] bf16
+    .param .u64 param_C,           // output [M, N] bf16 (no TMA on store)
+    .param .u32 param_M,
+    .param .u32 param_N,
+    .param .u32 param_K
+)
+{
+    .reg .b32  %r<96>;
+    .reg .b64  %rd<16>;
+    .reg .f32  %f<65>;             // 64 accumulators (consumers only)
+    .reg .b16  %h<8>;
+    .reg .pred %p<20>;
+
+    .shared .align 128 .b8 smem[SMEM_TOTAL_BYTES];
+
+    // ============================================================
+    // Thread / warp identification
+    // ============================================================
+    mov.u32         %r0, %tid.x;             // tid [0..287]
+    shr.b32         %r1, %r0, 5;             // warp_id [0..8]
+    and.b32         %r2, %r0, 31;            // lane [0..31]
+
+    // Warp 0..7 = MMA consumers (2×4 layout), warp 8 = TMA producer.
+    setp.eq.u32     %p1, %r1, 8;             // %p1 = is_producer
+    setp.lt.u32     %p2, %r1, 8;             // %p2 = is_consumer
+
+    // Consumer warp layout: warp_m = warp_id / 4, warp_n = warp_id & 3
+    shr.b32         %r3, %r1, 2;             // warp_m [0..1]
+    and.b32         %r4, %r1, 3;             // warp_n [0..3]
+
+    // ============================================================
+    // Load params
+    // ============================================================
+    ld.param.u64    %rd0, [param_A_tma];     // TMA descriptor for A
+    ld.param.u64    %rd1, [param_B_tma];     // TMA descriptor for B
+    ld.param.u64    %rd2, [param_C];         // output base
+    ld.param.u32    %r10, [param_M];
+    ld.param.u32    %r11, [param_N];
+    ld.param.u32    %r12, [param_K];
+
+    // ============================================================
+    // CTA tile offsets
+    // ============================================================
+    mov.u32         %r13, %ctaid.y;          // by → m_block
+    mov.u32         %r14, %ctaid.x;          // bx → n_block
+    shl.b32         %r15, %r13, 7;           // m_off = by * 128
+    shl.b32         %r16, %r14, 7;           // n_off = bx * 128
+
+    // ============================================================
+    // SMEM base + stage-0 mbarrier addresses (stage 1 computed inline
+    // since each stage has its own mbarrier triple).
+    // ============================================================
+    mov.u32         %r17, smem;
+    add.u32         %r18, %r17, MBAR_A_STAGE0;
+    add.u32         %r19, %r17, MBAR_B_STAGE0;
+    add.u32         %r70, %r17, MBAR_DONE_STAGE0;
+    add.u32         %r71, %r17, MBAR_A_STAGE1;
+    add.u32         %r72, %r17, MBAR_B_STAGE1;
+    add.u32         %r73, %r17, MBAR_DONE_STAGE1;
+    add.u32         %r25, %r17, MBAR_A_STAGE2;
+    add.u32         %r26, %r17, MBAR_B_STAGE2;
+    add.u32         %r27, %r17, MBAR_DONE_STAGE2;
+
+    // ============================================================
+    // Mbarrier init (thread 0 only) — all three stages.
+    //   A/B mbars: arrival_count = 1 (TMA itself completes)
+    //   DONE mbar: arrival_count = 256 (8 consumer warps × 32 lanes)
+    // ============================================================
+    setp.eq.u32     %p0, %r0, 0;
+    @%p0 mbarrier.init.shared.b64 [%r18], 1;     // A stage 0
+    @%p0 mbarrier.init.shared.b64 [%r19], 1;     // B stage 0
+    @%p0 mbarrier.init.shared.b64 [%r70], 256;   // DONE stage 0
+    @%p0 mbarrier.init.shared.b64 [%r71], 1;     // A stage 1
+    @%p0 mbarrier.init.shared.b64 [%r72], 1;     // B stage 1
+    @%p0 mbarrier.init.shared.b64 [%r73], 256;   // DONE stage 1
+    @%p0 mbarrier.init.shared.b64 [%r25], 1;     // A stage 2
+    @%p0 mbarrier.init.shared.b64 [%r26], 1;     // B stage 2
+    @%p0 mbarrier.init.shared.b64 [%r27], 256;   // DONE stage 2
+    fence.mbarrier_init.release.cluster;
+    bar.sync 0;
+
+    // K-loop iteration count (n_kblocks = K / 32)
+    shr.b32         %r24, %r12, 5;
+
+    // ============================================================
+    // Warp dispatch
+    // ============================================================
+    @%p1 bra producer_path;
+    @%p2 bra consumer_path;
+    bra done;
+
+// ============================================================================
+// Producer (warp 8)
+// ============================================================================
+producer_path:
+    // Only lane 0 of the producer warp issues TMA ops.
+    setp.eq.u32     %p0, %r2, 0;
+    @!%p0 bra producer_done;
+
+    // K-loop variables
+    mov.u32         %r44, 0;                     // k_iter
+    mov.u32         %r28, 0;                     // stage [0..2] (wrapping counter)
+    // parity_done[stage] init = 1: after stage's first XOR it becomes 0,
+    // which matches DONE phase-0 completion when consumer first arrives.
+    mov.u32         %r45, 1;                     // parity_done[0]
+    mov.u32         %r80, 1;                     // parity_done[1]
+    mov.u32         %r29, 1;                     // parity_done[2]
+
+producer_loop:
+    setp.ge.u32     %p4, %r44, %r24;             // k_iter >= n_kblocks?
+    @%p4 bra producer_done;
+
+    // ----- Stage-driven SMEM/mbar address derivation -----
+    setp.eq.u32     %p9,  %r28, 0;               // stage == 0
+    setp.eq.u32     %p11, %r28, 1;               // stage == 1
+    setp.eq.u32     %p12, %r28, 2;               // stage == 2
+    shl.b32         %r82, %r28, 14;              // buf_off = stage * 16384
+    add.u32         %r40, %r17, %r82;
+    add.u32         %r40, %r40, A_OFF_STAGE0;    // a_smem
+    add.u32         %r42, %r17, %r82;
+    add.u32         %r42, %r42, B_OFF_STAGE0;    // b_smem
+    mul.lo.u32      %r83, %r28, 24;              // mbar_off = stage * 24
+    add.u32         %r86, %r17, %r83;
+    add.u32         %r86, %r86, MBAR_A_STAGE0;   // a_mbar (this stage)
+    add.u32         %r87, %r17, %r83;
+    add.u32         %r87, %r87, MBAR_B_STAGE0;   // b_mbar
+    add.u32         %r88, %r17, %r83;
+    add.u32         %r88, %r88, MBAR_DONE_STAGE0; // done_mbar
+
+    // ----- Wait DONE (skip while k_iter < num_stages = 3) -----
+    setp.lt.u32     %p5, %r44, 3;
+    @%p5 bra producer_skip_done;
+    // 3-way parity_done selection
+    selp.u32        %r89, %r45, %r80, %p9;       // %r89 = (stage==0) ? p[0] : p[1]
+    selp.u32        %r89, %r29, %r89, %p12;      // %r89 = (stage==2) ? p[2] : prev
+wait_done:
+    mbarrier.try_wait.parity.shared.b64 %p6, [%r88], %r89;
+    @!%p6 bra wait_done;
+producer_skip_done:
+
+    // k_off = k_iter * 32
+    shl.b32         %r46, %r44, 5;
+
+    // TMA load A at (k_off, m_off)
+    mbarrier.arrive.expect_tx.shared.b64 _, [%r86], 8192;
+    cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
+        [%r40], [%rd0, {%r46, %r15}], [%r86];
+
+    // TMA load B at (n_off, k_off)
+    mbarrier.arrive.expect_tx.shared.b64 _, [%r87], 8192;
+    cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes
+        [%r42], [%rd1, {%r16, %r46}], [%r87];
+
+    // ----- Flip parity_done[stage] (write to the active slot only) -----
+    selp.u32        %r89, %r45, %r80, %p9;
+    selp.u32        %r89, %r29, %r89, %p12;
+    xor.b32         %r89, %r89, 1;
+    @%p9   mov.u32  %r45, %r89;                  // → parity_done[0]
+    @%p11  mov.u32  %r80, %r89;                  // → parity_done[1]
+    @%p12  mov.u32  %r29, %r89;                  // → parity_done[2]
+
+    // ----- Advance: k_iter++, stage = (stage+1) % 3 -----
+    add.u32         %r44, %r44, 1;
+    add.u32         %r28, %r28, 1;
+    setp.eq.u32     %p13, %r28, 3;
+    @%p13 mov.u32   %r28, 0;
+    bra producer_loop;
+
+producer_done:
+    bra done;
+
+// ============================================================================
+// Consumer (warps 0..7)
+//
+// Per-warp output: 64 rows × 32 cols sub-tile.
+//   warp covers rows [warp_m*64, warp_m*64+64) cols [warp_n*32, warp_n*32+32)
+//   4 m-groups (16 rows each) × 4 n-groups (8 cols each) = 16 (m,n) tiles
+//   Per K-block (K=32): 2 k-substeps (m16n8k16 needs k=16)
+//   Per (m, n) tile across K: accumulators sum over k-substeps
+// ============================================================================
+consumer_path:
+    // Zero accumulators (64 fp32 per thread = 16 (m,n) tiles × 4 outputs)
+    mov.f32 %f0, 0.0;   mov.f32 %f1, 0.0;   mov.f32 %f2, 0.0;   mov.f32 %f3, 0.0;
+    mov.f32 %f4, 0.0;   mov.f32 %f5, 0.0;   mov.f32 %f6, 0.0;   mov.f32 %f7, 0.0;
+    mov.f32 %f8, 0.0;   mov.f32 %f9, 0.0;   mov.f32 %f10, 0.0;  mov.f32 %f11, 0.0;
+    mov.f32 %f12, 0.0;  mov.f32 %f13, 0.0;  mov.f32 %f14, 0.0;  mov.f32 %f15, 0.0;
+    mov.f32 %f16, 0.0;  mov.f32 %f17, 0.0;  mov.f32 %f18, 0.0;  mov.f32 %f19, 0.0;
+    mov.f32 %f20, 0.0;  mov.f32 %f21, 0.0;  mov.f32 %f22, 0.0;  mov.f32 %f23, 0.0;
+    mov.f32 %f24, 0.0;  mov.f32 %f25, 0.0;  mov.f32 %f26, 0.0;  mov.f32 %f27, 0.0;
+    mov.f32 %f28, 0.0;  mov.f32 %f29, 0.0;  mov.f32 %f30, 0.0;  mov.f32 %f31, 0.0;
+    mov.f32 %f32, 0.0;  mov.f32 %f33, 0.0;  mov.f32 %f34, 0.0;  mov.f32 %f35, 0.0;
+    mov.f32 %f36, 0.0;  mov.f32 %f37, 0.0;  mov.f32 %f38, 0.0;  mov.f32 %f39, 0.0;
+    mov.f32 %f40, 0.0;  mov.f32 %f41, 0.0;  mov.f32 %f42, 0.0;  mov.f32 %f43, 0.0;
+    mov.f32 %f44, 0.0;  mov.f32 %f45, 0.0;  mov.f32 %f46, 0.0;  mov.f32 %f47, 0.0;
+    mov.f32 %f48, 0.0;  mov.f32 %f49, 0.0;  mov.f32 %f50, 0.0;  mov.f32 %f51, 0.0;
+    mov.f32 %f52, 0.0;  mov.f32 %f53, 0.0;  mov.f32 %f54, 0.0;  mov.f32 %f55, 0.0;
+    mov.f32 %f56, 0.0;  mov.f32 %f57, 0.0;  mov.f32 %f58, 0.0;  mov.f32 %f59, 0.0;
+    mov.f32 %f60, 0.0;  mov.f32 %f61, 0.0;  mov.f32 %f62, 0.0;  mov.f32 %f63, 0.0;
+
+    // ============================================================
+    // K-loop: for each k_iter, wait A+B mbars (stage-relative), do
+    // ldmatrix + MMAs against this stage's SMEM, arrive DONE on this
+    // stage so the producer can reuse it 2 iters later.
+    // ============================================================
+    mov.u32         %r47, 0;                     // k_iter
+    mov.u32         %r30, 0;                     // stage [0..2] wrapping counter
+    mov.u32         %r48, 0;                     // parity_load[0]
+    mov.u32         %r74, 0;                     // parity_load[1]
+    mov.u32         %r31, 0;                     // parity_load[2]
+
+consumer_loop:
+    setp.ge.u32     %p4, %r47, %r24;             // k_iter >= n_kblocks?
+    @%p4 bra consumer_done;
+
+    // ----- Stage-driven addr derivation -----
+    setp.eq.u32     %p10, %r30, 0;               // stage == 0
+    setp.eq.u32     %p14, %r30, 1;               // stage == 1
+    setp.eq.u32     %p15, %r30, 2;               // stage == 2
+    shl.b32         %r76, %r30, 14;              // buf_off = stage * 16384
+    mul.lo.u32      %r77, %r30, 24;              // mbar_off = stage * 24
+
+    // Stage's A/B/DONE mbar addrs
+    add.u32         %r78, %r17, %r77;
+    add.u32         %r79, %r78, MBAR_A_STAGE0;   // a_mbar (this stage)
+    add.u32         %r84, %r78, MBAR_B_STAGE0;   // b_mbar
+    add.u32         %r85, %r78, MBAR_DONE_STAGE0; // done_mbar
+
+    // 3-way parity_load selection
+    selp.u32        %r57, %r48, %r74, %p10;      // (stage==0) ? p[0] : p[1]
+    selp.u32        %r57, %r31, %r57, %p15;      // (stage==2) ? p[2] : prev
+
+    // Wait A
+wait_A_loop:
+    mbarrier.try_wait.parity.shared.b64 %p3, [%r79], %r57;
+    @!%p3 bra wait_A_loop;
+    // Wait B
+wait_B_loop:
+    mbarrier.try_wait.parity.shared.b64 %p3, [%r84], %r57;
+    @!%p3 bra wait_B_loop;
+
+    // ============================================================
+    // ldmatrix + MMA for current K-block (accumulators carry across iters).
+    //
+    // A_tile layout in SMEM (row-major, stride = 32 cols × 2 = 64 B/row):
+    //   ldm_a_base = stage_off + A_OFF_STAGE0 + (lane%16)*64 + (lane/16)*16 + warp_m*4096
+    and.b32         %r50, %r2, 15;             // lane % 16
+    shl.b32         %r50, %r50, 6;             // (lane%16) * 64
+    shr.b32         %r51, %r2, 4;              // lane / 16
+    shl.b32         %r51, %r51, 4;             // (lane/16) * 16 (= half offset in bytes)
+    add.u32         %r50, %r50, %r51;
+    shl.b32         %r52, %r3, 12;             // warp_m * 4096
+    add.u32         %r50, %r50, %r52;
+    add.u32         %r50, %r50, A_OFF_STAGE0;
+    add.u32         %r50, %r50, %r76;          // + stage buf offset
+    add.u32         %r50, %r17, %r50;          // ldm_a_base for this stage
+
+    // B_tile layout (row-major, stride = 128 cols × 2 = 256 B/row):
+    //   ldm_b_base = stage_off + B_OFF_STAGE0 + (lane%16)*256 + warp_n*64
+    and.b32         %r53, %r2, 15;
+    shl.b32         %r53, %r53, 8;             // (lane%16) * 256
+    shl.b32         %r54, %r4, 6;              // warp_n * 64
+    add.u32         %r53, %r53, %r54;
+    add.u32         %r53, %r53, B_OFF_STAGE0;
+    add.u32         %r53, %r53, %r76;          // + stage buf offset
+    add.u32         %r53, %r17, %r53;          // ldm_b_base for this stage
+
+    // ============================================================
+    // Load 8 B fragments: 4 n-groups × 2 k-substeps
+    // Each ldmatrix.x2.trans loads 16×8 transposed = 2 8x8 tiles.
+    // ============================================================
+    .reg .b32 _b00, _b01, _b02, _b03, _b04, _b05, _b06, _b07;
+    .reg .b32 _b10, _b11, _b12, _b13, _b14, _b15, _b16, _b17;
+
+    // K-substep 0 (cols 0..15 of B_tile)
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {_b00, _b01}, [%r53];
+    add.u32         %r55, %r53, 16;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {_b02, _b03}, [%r55];
+    add.u32         %r55, %r53, 32;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {_b04, _b05}, [%r55];
+    add.u32         %r55, %r53, 48;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {_b06, _b07}, [%r55];
+    // K-substep 1 (cols 16..31 of B_tile = +16 K-rows × 256 B/row = +4096 B)
+    add.u32         %r56, %r53, 4096;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {_b10, _b11}, [%r56];
+    add.u32         %r55, %r56, 16;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {_b12, _b13}, [%r55];
+    add.u32         %r55, %r56, 32;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {_b14, _b15}, [%r55];
+    add.u32         %r55, %r56, 48;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {_b16, _b17}, [%r55];
+
+    // ============================================================
+    // m-group 0 (warp rows 0..15) × 4 n-groups × 2 k-substeps = 8 MMAs
+    // ============================================================
+    .reg .b32 _a0, _a1, _a2, _a3, _a4, _a5, _a6, _a7;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {_a0, _a1, _a2, _a3}, [%r50];
+    add.u32         %r55, %r50, 32;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {_a4, _a5, _a6, _a7}, [%r55];
+    MMA_BF16_M16N8K16(%f0,  %f1,  %f2,  %f3,  _a0, _a1, _a2, _a3, _b00, _b01)
+    MMA_BF16_M16N8K16(%f0,  %f1,  %f2,  %f3,  _a4, _a5, _a6, _a7, _b10, _b11)
+    MMA_BF16_M16N8K16(%f4,  %f5,  %f6,  %f7,  _a0, _a1, _a2, _a3, _b02, _b03)
+    MMA_BF16_M16N8K16(%f4,  %f5,  %f6,  %f7,  _a4, _a5, _a6, _a7, _b12, _b13)
+    MMA_BF16_M16N8K16(%f8,  %f9,  %f10, %f11, _a0, _a1, _a2, _a3, _b04, _b05)
+    MMA_BF16_M16N8K16(%f8,  %f9,  %f10, %f11, _a4, _a5, _a6, _a7, _b14, _b15)
+    MMA_BF16_M16N8K16(%f12, %f13, %f14, %f15, _a0, _a1, _a2, _a3, _b06, _b07)
+    MMA_BF16_M16N8K16(%f12, %f13, %f14, %f15, _a4, _a5, _a6, _a7, _b16, _b17)
+
+    // m-group 1 (warp rows 16..31)
+    add.u32         %r55, %r50, 1024;          // +16 rows × 64 B/row
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {_a0, _a1, _a2, _a3}, [%r55];
+    add.u32         %r55, %r50, 1056;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {_a4, _a5, _a6, _a7}, [%r55];
+    MMA_BF16_M16N8K16(%f16, %f17, %f18, %f19, _a0, _a1, _a2, _a3, _b00, _b01)
+    MMA_BF16_M16N8K16(%f16, %f17, %f18, %f19, _a4, _a5, _a6, _a7, _b10, _b11)
+    MMA_BF16_M16N8K16(%f20, %f21, %f22, %f23, _a0, _a1, _a2, _a3, _b02, _b03)
+    MMA_BF16_M16N8K16(%f20, %f21, %f22, %f23, _a4, _a5, _a6, _a7, _b12, _b13)
+    MMA_BF16_M16N8K16(%f24, %f25, %f26, %f27, _a0, _a1, _a2, _a3, _b04, _b05)
+    MMA_BF16_M16N8K16(%f24, %f25, %f26, %f27, _a4, _a5, _a6, _a7, _b14, _b15)
+    MMA_BF16_M16N8K16(%f28, %f29, %f30, %f31, _a0, _a1, _a2, _a3, _b06, _b07)
+    MMA_BF16_M16N8K16(%f28, %f29, %f30, %f31, _a4, _a5, _a6, _a7, _b16, _b17)
+
+    // m-group 2 (warp rows 32..47)
+    add.u32         %r55, %r50, 2048;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {_a0, _a1, _a2, _a3}, [%r55];
+    add.u32         %r55, %r50, 2080;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {_a4, _a5, _a6, _a7}, [%r55];
+    MMA_BF16_M16N8K16(%f32, %f33, %f34, %f35, _a0, _a1, _a2, _a3, _b00, _b01)
+    MMA_BF16_M16N8K16(%f32, %f33, %f34, %f35, _a4, _a5, _a6, _a7, _b10, _b11)
+    MMA_BF16_M16N8K16(%f36, %f37, %f38, %f39, _a0, _a1, _a2, _a3, _b02, _b03)
+    MMA_BF16_M16N8K16(%f36, %f37, %f38, %f39, _a4, _a5, _a6, _a7, _b12, _b13)
+    MMA_BF16_M16N8K16(%f40, %f41, %f42, %f43, _a0, _a1, _a2, _a3, _b04, _b05)
+    MMA_BF16_M16N8K16(%f40, %f41, %f42, %f43, _a4, _a5, _a6, _a7, _b14, _b15)
+    MMA_BF16_M16N8K16(%f44, %f45, %f46, %f47, _a0, _a1, _a2, _a3, _b06, _b07)
+    MMA_BF16_M16N8K16(%f44, %f45, %f46, %f47, _a4, _a5, _a6, _a7, _b16, _b17)
+
+    // m-group 3 (warp rows 48..63)
+    add.u32         %r55, %r50, 3072;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {_a0, _a1, _a2, _a3}, [%r55];
+    add.u32         %r55, %r50, 3104;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {_a4, _a5, _a6, _a7}, [%r55];
+    MMA_BF16_M16N8K16(%f48, %f49, %f50, %f51, _a0, _a1, _a2, _a3, _b00, _b01)
+    MMA_BF16_M16N8K16(%f48, %f49, %f50, %f51, _a4, _a5, _a6, _a7, _b10, _b11)
+    MMA_BF16_M16N8K16(%f52, %f53, %f54, %f55, _a0, _a1, _a2, _a3, _b02, _b03)
+    MMA_BF16_M16N8K16(%f52, %f53, %f54, %f55, _a4, _a5, _a6, _a7, _b12, _b13)
+    MMA_BF16_M16N8K16(%f56, %f57, %f58, %f59, _a0, _a1, _a2, _a3, _b04, _b05)
+    MMA_BF16_M16N8K16(%f56, %f57, %f58, %f59, _a4, _a5, _a6, _a7, _b14, _b15)
+    MMA_BF16_M16N8K16(%f60, %f61, %f62, %f63, _a0, _a1, _a2, _a3, _b06, _b07)
+    MMA_BF16_M16N8K16(%f60, %f61, %f62, %f63, _a4, _a5, _a6, _a7, _b16, _b17)
+
+    // Signal DONE on this stage's mbar, flip this stage's parity_load,
+    // advance k_iter + stage counter (wrapping mod 3).
+    mbarrier.arrive.shared.b64 _, [%r85];
+    selp.u32        %r57, %r48, %r74, %p10;      // current
+    selp.u32        %r57, %r31, %r57, %p15;
+    xor.b32         %r57, %r57, 1;
+    @%p10  mov.u32  %r48, %r57;                  // → parity_load[0]
+    @%p14  mov.u32  %r74, %r57;                  // → parity_load[1]
+    @%p15  mov.u32  %r31, %r57;                  // → parity_load[2]
+    add.u32         %r47, %r47, 1;
+    add.u32         %r30, %r30, 1;
+    setp.eq.u32     %p16, %r30, 3;
+    @%p16 mov.u32   %r30, 0;
+    bra consumer_loop;
+
+consumer_done:
+    // ============================================================
+    // Step 3: convert fp32 accumulators → bf16, store 64×32 sub-tile to C.
+    //
+    // Per-warp output: rows [m_off + warp_m*64, m_off + warp_m*64 + 64),
+    //                  cols [n_off + warp_n*32, n_off + warp_n*32 + 32)
+    //
+    // m16n8 MMA D fragment layout (per warp, 32 threads):
+    //   group_id = lane / 4       (8 groups, 8 rows per group → row pair)
+    //   tid_in_group = lane % 4   (4 column pairs per group)
+    //   d0 = row(group_id) col(2*tid_in_group)
+    //   d1 = row(group_id) col(2*tid_in_group + 1)
+    //   d2 = row(group_id + 8) col(2*tid_in_group)
+    //   d3 = row(group_id + 8) col(2*tid_in_group + 1)
+    //
+    // For each (m, n) accumulator block: 8 rows pair (group_id, group_id+8)
+    // × 2 col pair (2*tid_in_group, 2*tid_in_group+1) = 4 fp32 → 4 bf16.
+    // ============================================================
+    shr.b32         %r60, %r2, 2;              // groupID = lane / 4
+    and.b32         %r61, %r2, 3;              // tidInGroup = lane % 4
+
+    shl.b32         %r62, %r3, 6;              // warp_m * 64
+    add.u32         %r62, %r15, %r62;          // m_off + warp_m*64
+    add.u32         %r63, %r62, %r60;          // base_row_d0 = m_off + warp_m*64 + groupID
+    add.u32         %r64, %r63, 8;             // base_row_d2 (d2/d3 rows are +8)
+
+    shl.b32         %r65, %r4, 5;              // warp_n * 32
+    add.u32         %r65, %r16, %r65;          // n_off + warp_n*32
+    shl.b32         %r66, %r61, 1;             // tidInGroup * 2
+    add.u32         %r66, %r65, %r66;          // base_col_d0 = n_off + warp_n*32 + tidInGroup*2
+
+    // For each of the 16 (m, n) tiles, store 4 BF16 values (2 from d0/d1
+    // upper row pair, 2 from d2/d3 lower row pair) to global C[M, N].
+    //
+    // tile indices:
+    //   accum_base = (m_group * 4 + n_group) * 4
+    //   m_group ∈ [0,3] → row offset = m_group * 16
+    //   n_group ∈ [0,3] → col offset = n_group * 8
+    //
+    // For each tile we write:
+    //   C[base_row_d0 + m_group*16, base_col_d0 + n_group*8 + 0] = bf16(f[accum_base + 0])
+    //   C[base_row_d0 + m_group*16, base_col_d0 + n_group*8 + 1] = bf16(f[accum_base + 1])
+    //   C[base_row_d2 + m_group*16, base_col_d0 + n_group*8 + 0] = bf16(f[accum_base + 2])
+    //   C[base_row_d2 + m_group*16, base_col_d0 + n_group*8 + 1] = bf16(f[accum_base + 3])
+
+    // Helper macro: store 4 bf16 outputs from 4 f32 accumulators for one
+    // (m, n) tile, at base_row offset = m_group*16, col offset = n_group*8.
+    .reg .b16 _o0, _o1, _o2, _o3;
+    .reg .b32 _row_off, _col_off, _addr_d0, _addr_d2;
+    .reg .b64 _addr64;
+
+#define STORE_TILE(m_grp, n_grp, fa, fb, fc, fd)                                 \
+    /* d0 row = base_row_d0 + m_grp*16,  col = base_col_d0 + n_grp*8 */          \
+    add.u32         _row_off, %r63, (m_grp * 16);                                 \
+    add.u32         _col_off, %r66, (n_grp * 8);                                  \
+    mad.lo.u32      _row_off, _row_off, %r11, _col_off;                           \
+    mul.wide.u32    _addr64, _row_off, 2;                                         \
+    add.u64         _addr64, %rd2, _addr64;                                       \
+    cvt.rn.bf16.f32 _o0, fa;                                                      \
+    cvt.rn.bf16.f32 _o1, fb;                                                      \
+    st.global.b16   [_addr64],     _o0;                                           \
+    st.global.b16   [_addr64 + 2], _o1;                                           \
+    /* d2 row = base_row_d2 + m_grp*16, same col */                              \
+    add.u32         _row_off, %r64, (m_grp * 16);                                 \
+    add.u32         _col_off, %r66, (n_grp * 8);                                  \
+    mad.lo.u32      _row_off, _row_off, %r11, _col_off;                           \
+    mul.wide.u32    _addr64, _row_off, 2;                                         \
+    add.u64         _addr64, %rd2, _addr64;                                       \
+    cvt.rn.bf16.f32 _o2, fc;                                                      \
+    cvt.rn.bf16.f32 _o3, fd;                                                      \
+    st.global.b16   [_addr64],     _o2;                                           \
+    st.global.b16   [_addr64 + 2], _o3;
+
+    // m-group 0
+    STORE_TILE(0, 0, %f0,  %f1,  %f2,  %f3)
+    STORE_TILE(0, 1, %f4,  %f5,  %f6,  %f7)
+    STORE_TILE(0, 2, %f8,  %f9,  %f10, %f11)
+    STORE_TILE(0, 3, %f12, %f13, %f14, %f15)
+    // m-group 1
+    STORE_TILE(1, 0, %f16, %f17, %f18, %f19)
+    STORE_TILE(1, 1, %f20, %f21, %f22, %f23)
+    STORE_TILE(1, 2, %f24, %f25, %f26, %f27)
+    STORE_TILE(1, 3, %f28, %f29, %f30, %f31)
+    // m-group 2
+    STORE_TILE(2, 0, %f32, %f33, %f34, %f35)
+    STORE_TILE(2, 1, %f36, %f37, %f38, %f39)
+    STORE_TILE(2, 2, %f40, %f41, %f42, %f43)
+    STORE_TILE(2, 3, %f44, %f45, %f46, %f47)
+    // m-group 3
+    STORE_TILE(3, 0, %f48, %f49, %f50, %f51)
+    STORE_TILE(3, 1, %f52, %f53, %f54, %f55)
+    STORE_TILE(3, 2, %f56, %f57, %f58, %f59)
+    STORE_TILE(3, 3, %f60, %f61, %f62, %f63)
+
+done:
+    ret;
+}

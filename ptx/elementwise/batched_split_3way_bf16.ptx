@@ -1,0 +1,103 @@
+// batched_split_3way_bf16.ptx
+//
+// Replace 3*M dtod copies per fused-QKV split with
+// ONE kernel launch. Reads per-seq interleaved [M, N1+N2+N3] BF16 source,
+// writes to three contiguous [M, N1], [M, N2], [M, N3] dst buffers.
+//
+// Used by gdn_hybrid_9b vector-2 full-attn forward:
+//   src = bs.fa_qkv_fused_out  [M, q_proj_dim + kv_dim + kv_dim]
+//   dst0 = bs.q_proj_out         [M, q_proj_dim]
+//   dst1 = bs.k_proj_out         [M, kv_dim]
+//   dst2 = bs.v_proj_out         [M, kv_dim]
+//
+// Grid: (ceil(total / 128), M, 1).  Block: (128, 1, 1).
+// Each thread handles one element. Total work = M * total_size elements.
+//
+// For thread (b, m, t) where t = global element idx within seq:
+//   if t < n1:                   dst0[m * n1 + t]              = src[m * total + t]
+//   elif t < n1 + n2:            dst1[m * n2 + (t - n1)]       = src[m * total + t]
+//   else:                        dst2[m * n3 + (t - n1 - n2)]  = src[m * total + t]
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+.visible .entry batched_split_3way_bf16(
+    .param .u64 param_src,        // [M, total] BF16 (total = n1+n2+n3)
+    .param .u64 param_dst0,       // [M, n1] BF16
+    .param .u64 param_dst1,       // [M, n2] BF16
+    .param .u64 param_dst2,       // [M, n3] BF16
+    .param .u32 param_n1,
+    .param .u32 param_n2,
+    .param .u32 param_n3
+)
+{
+    .reg .b32  %r<32>;
+    .reg .b64  %rd<24>;
+    .reg .b16  %h<2>;
+    .reg .pred %p<4>;
+
+    // Element index within seq: t = blockIdx.x * blockDim.x + threadIdx.x
+    mov.u32         %r0, %tid.x;
+    mov.u32         %r1, %ctaid.x;
+    mov.u32         %r2, %ntid.x;
+    mad.lo.u32      %r3, %r1, %r2, %r0;        // t
+
+    ld.param.u32    %r4, [param_n1];
+    ld.param.u32    %r5, [param_n2];
+    ld.param.u32    %r6, [param_n3];
+    add.u32         %r7, %r4, %r5;              // n1 + n2
+    add.u32         %r8, %r7, %r6;              // total = n1 + n2 + n3
+
+    // Bounds check: t >= total → done
+    setp.ge.u32     %p0, %r3, %r8;
+    @%p0 bra        done;
+
+    // Seq index m = blockIdx.y
+    mov.u32         %r9, %ctaid.y;
+
+    ld.param.u64    %rd0, [param_src];
+    ld.param.u64    %rd1, [param_dst0];
+    ld.param.u64    %rd2, [param_dst1];
+    ld.param.u64    %rd3, [param_dst2];
+
+    // src offset = (m * total + t) * 2 bytes
+    mad.lo.u32      %r10, %r9, %r8, %r3;        // m * total + t
+    mul.wide.u32    %rd4, %r10, 2;
+    add.u64         %rd5, %rd0, %rd4;
+    ld.global.b16   %h0, [%rd5];
+
+    // Branch by region
+    setp.lt.u32     %p1, %r3, %r4;              // t < n1?
+    @%p1 bra        write_dst0;
+
+    setp.lt.u32     %p2, %r3, %r7;              // t < n1+n2?
+    @%p2 bra        write_dst1;
+
+    // dst2: offset = (m * n3 + (t - n1 - n2)) * 2
+    sub.u32         %r11, %r3, %r7;             // t - n1 - n2
+    mad.lo.u32      %r12, %r9, %r6, %r11;       // m * n3 + (t - n1 - n2)
+    mul.wide.u32    %rd6, %r12, 2;
+    add.u64         %rd7, %rd3, %rd6;
+    st.global.b16   [%rd7], %h0;
+    bra             done;
+
+write_dst0:
+    // dst0: offset = (m * n1 + t) * 2
+    mad.lo.u32      %r13, %r9, %r4, %r3;        // m * n1 + t
+    mul.wide.u32    %rd8, %r13, 2;
+    add.u64         %rd9, %rd1, %rd8;
+    st.global.b16   [%rd9], %h0;
+    bra             done;
+
+write_dst1:
+    // dst1: offset = (m * n2 + (t - n1)) * 2
+    sub.u32         %r14, %r3, %r4;             // t - n1
+    mad.lo.u32      %r15, %r9, %r5, %r14;       // m * n2 + (t - n1)
+    mul.wide.u32    %rd10, %r15, 2;
+    add.u64         %rd11, %rd2, %rd10;
+    st.global.b16   [%rd11], %h0;
+
+done:
+    ret;
+}

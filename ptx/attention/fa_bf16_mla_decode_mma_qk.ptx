@@ -1,0 +1,606 @@
+// fa_bf16_mla_decode_mma_qk.ptx
+//
+// QK-ONLY VALIDATION KERNEL for the MMA-MLA decode rewrite.
+//
+// Purpose: validate the QK pipeline (16 heads per CTA, SWIZZLE_128B SMEM,
+// ldmatrix + m16n8k16 MMA across D_C=512 + D_R=64) in isolation, before
+// integrating the softmax + PV MMA stages. Writes scaled scores to a global
+// output buffer so a Rust test can compare against a PyTorch (Q @ K^T * scale)
+// reference.
+//
+// This is NOT the shipping MLA decode kernel. It's a test harness for the
+// QK half of the `fa_bf16_mla_decode_mma.ptx` that follows. Once this
+// validates, we bolt on softmax + PV MMA without re-deriving the QK pattern.
+//
+// Layouts:
+//   Q_c      : [B, H, 512] BF16                   (input)
+//   Q_r      : [B, H, 64 ] BF16                   (input)
+//   c_kv     : [B, Skv, 512] BF16                 (input; head-shared in MLA)
+//   k_rope   : [B, Skv, 64 ] BF16                 (input; head-shared)
+//   scores   : [B, H, Skv] FP32                   (output: scale * (Q_c@c_kv^T + Q_r@k_rope^T))
+//
+// Grid: (num_heads / 16, batch). Block: (128,1,1) = 4 warps.
+// SMEM (~38 KB — under 48 KB dynamic default but we set it explicitly):
+//   SMEM_Q_C      0      - 16383   16 rows × 512 BF16, 8 halves × 2 KB, SWIZZLE_128B
+//   SMEM_Q_R      16384  - 18431   16 rows × 64  BF16, 1 half  × 2 KB
+//   SMEM_KV_C     18432  - 26623    8 rows × 512 BF16, 8 halves × 1 KB
+//   SMEM_KV_R     26624  - 27647    8 rows × 64  BF16, 1 half
+//   SMEM_SCORE    27648  - 28159   16 rows × 8 cols FP32 = 512 B
+//
+// Swizzle formulae (ported from V21):
+//   Q_c / Q_r:  row_in_half = (lane < 16) ? lane : lane - 16;
+//               XOR = (row_in_half & 7) << 4.
+//   K operand:  sub_lane = lane & 7; XOR = sub_lane << 4.
+//
+// Warp 0 does QK. Warps 1-3 are idle (added in step-4 kernel when PV lands).
+// For QK-only test we still launch 128 threads for future alignment, but
+// guard the MMA with warp 0.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+#include "mma.ptxh"
+
+#define D_C            512
+#define D_R            64
+#define HEADS_PER_CTA  16
+#define KV_CHUNK       8
+#define NUM_WARPS      4
+#define BLOCK_DIM      128
+
+#define SMEM_Q_C       0
+#define SMEM_Q_R       16384
+#define SMEM_KV_C      18432
+#define SMEM_KV_R      26624
+#define SMEM_SCORE     27648
+#define SMEM_TOTAL     28160
+
+.extern .shared .align 128 .b8 mma_qk_smem[];
+
+.visible .entry fa_bf16_mla_decode_mma_qk(
+    .param .u64 param_Q_c,       // [B, H, 512] BF16
+    .param .u64 param_Q_r,       // [B, H, 64 ] BF16
+    .param .u64 param_c_kv,      // [B, Skv, 512] BF16
+    .param .u64 param_k_rope,    // [B, Skv, 64 ] BF16
+    .param .u64 param_scores,    // [B, H, Skv] FP32
+    .param .u32 param_num_heads,
+    .param .u32 param_seq_kv,
+    .param .f32 param_scale
+)
+{
+    .reg .b32  %r<160>;
+    .reg .b64  %rd<16>;
+    .reg .f32  %f<64>;
+    .reg .b16  %h<16>;
+    .reg .pred %p<32>;
+
+    mov.u32      %r0, %tid.x;
+    shr.b32      %r1, %r0, 5;            // warp_id
+    and.b32      %r2, %r0, 31;           // lane
+    mov.u32      %r3, %ctaid.x;          // head_group (0..H/16)
+    mov.u32      %r4, %ctaid.y;          // batch
+
+    ld.param.u64 %rd0, [param_Q_c];
+    ld.param.u64 %rd1, [param_Q_r];
+    ld.param.u64 %rd2, [param_c_kv];
+    ld.param.u64 %rd3, [param_k_rope];
+    ld.param.u64 %rd4, [param_scores];
+    ld.param.u32 %r5, [param_num_heads];
+    ld.param.u32 %r6, [param_seq_kv];
+    ld.param.f32 %f0, [param_scale];
+
+    mov.u32      %r7, mma_qk_smem;
+
+    // ================================================================
+    // Stage 1: Load Q_c and Q_r into SMEM with SWIZZLE_128B layout.
+    //
+    // SWIZZLE_128B means: for a logical tensor of R rows × 128-B wide rows,
+    // stored at base, logical element (row, byte_in_row) lives at physical
+    // address base + row*128 + (byte_in_row XOR ((row & 7) << 4)).
+    //
+    // Q_c is 16 rows × 1024 B wide (= 512 BF16). We split into 8 halves
+    // of 128 B each. Each half lives at SMEM_Q_C + half*2048 (= half*16 rows*128 B).
+    // For a logical element at (head, col), the half = col / 64,
+    // byte_in_half = (col % 64) * 2, physical in that half = head*128 + swizzle.
+    //
+    // Each CTA owns 16 heads. head_in_cta = head_global - head_group*16.
+    // Global row for Q_c[b, head_global, :] = batch*H + head_global.
+    // ================================================================
+
+    // Q_c base: &Q_c[batch, head_group*16, 0] = batch*H + head_group*16 rows
+    mul.lo.u32   %r10, %r4, %r5;               // batch * H
+    shl.b32      %r11, %r3, 4;                 // head_group * 16
+    add.u32      %r10, %r10, %r11;             // batch*H + head_group*16 = first head row
+    mul.lo.u32   %r12, %r10, D_C;
+    mul.wide.u32 %rd5, %r12, 2;
+    add.u64      %rd6, %rd0, %rd5;             // Q_c pointer
+    mul.lo.u32   %r13, %r10, D_R;
+    mul.wide.u32 %rd5, %r13, 2;
+    add.u64      %rd7, %rd1, %rd5;             // Q_r pointer
+
+    // Cooperative Q_c load: 128 threads × 8 BF16 each = 1024 BF16 per iter,
+    // 16 iters to cover 16384 BF16 (16 rows × 512 cols * 2B = 16 KB).
+    //
+    // Map thread t to (row, col_start) such that consecutive threads' loads
+    // cover the row in contiguous 16-byte chunks (v2.b32 = 8 BF16 = 16 B).
+    //   col_start = (t % 64) * 8 BF16 = (t % 64) * 16 B   // 64 threads cover one row
+    //   row_iter  = t / 64                                 // 0 or 1
+    //   We do 8 row-iter groups (each covering 2 rows); outer loop repeats to 16.
+    //
+    // Simpler: flatten as loop-of-16, with 128 threads each reading one chunk
+    // of 128 B (8 BF16).
+    //   Per iter: row_iter = iter, col_start = t*8 B? No — 128*8 = 1024 B
+    //   but row is 1024 B wide. So each iter covers exactly 1 row, 128 threads.
+    //
+    // YES: 16 iterations, each iter loads 1 row of 1024 B = 512 BF16.
+    //   iter `i`: thread t reads global Q_c[head_group*16 + i, t*8 .. t*8+8).
+    //   Write to SMEM:
+    //     half = col / 64 = t / 8   (t%8 == col%64 since col = t*8, well t*8/64 = t/8)
+    //     Actually col_bf16 = t*4, col_byte = t*8.
+    //     half = col_byte / 128 = t/16.
+    //     byte_in_half = col_byte % 128 = (t%16) * 8.
+    //     half_base = SMEM_Q_C + half*2048
+    //     swizzled = byte_in_half XOR ((i & 7) << 4)
+    //     smem_addr = half_base + i*128 + swizzled
+    //
+    // Note: each thread covers 8 BF16 = 4 b32. 128*4 b32 = 512 b32 = 2 KB
+    // read per iter. 16 iters * 2 KB = 32 KB total. Wait Q_c is 16 KB.
+    // Issue: each thread reads 16 B, 128 threads * 16 B = 2 KB per iter.
+    // Q_c row is 1024 B wide. So 128 threads * 16 B = 2048 B > 1024 B.
+    //
+    // Fix: use only 64 threads per row. 64 threads × 16 B = 1024 B = 1 row.
+    // For 16 rows: threads 0-63 handle row `2i`, threads 64-127 handle row `2i+1`.
+    // Inner loop: 8 iterations (covering 2 rows each).
+    //
+    // Thread decomposition:
+    //   row_half = t / 64      (0 = rows 2i, 1 = rows 2i+1)
+    //   t_in_half = t % 64
+    //   col_bf16_start = t_in_half * 4
+    //   col_byte_start = t_in_half * 8
+    //   half = col_byte_start / 128 = t_in_half / 16
+    //   byte_in_half = col_byte_start % 128 = (t_in_half % 16) * 8
+
+    // Each thread loads 16 B = 8 BF16 per iter via ld.global.v4.b32.
+    // 128 threads × 16 B = 2048 B/iter = 2 rows of 1024 B each.
+    // 8 iters × 2 rows = 16 rows full Q_c coverage.
+    shr.b32      %r20, %r0, 6;            // row_half = t / 64  (0 or 1)
+    and.b32      %r21, %r0, 63;           // t_in_half 0..63
+    shl.b32      %r22, %r21, 4;           // t_in_half * 16 = col_byte
+    shr.b32      %r23, %r22, 7;           // half index = col_byte / 128 (0..7)
+    shl.b32      %r24, %r23, 11;          // half * 2048
+    and.b32      %r26, %r22, 127;         // byte_in_half = col_byte % 128
+
+    // Iterate i = 0..8, loading rows 2i (row_half=0) and 2i+1 (row_half=1)
+    mov.u32      %r30, 0;
+q_load_loop:
+    setp.ge.u32  %p0, %r30, 8;
+    @%p0 bra     q_load_done;
+
+    shl.b32      %r31, %r30, 1;           // 2*i
+    add.u32      %r32, %r31, %r20;        // row_in_tile = 2*i + row_half  (0..15)
+
+    // Global addr: Q_c_ptr + row_in_tile * D_C * 2 + col_byte
+    mul.lo.u32   %r33, %r32, D_C;
+    shl.b32      %r33, %r33, 1;           // * 2 bytes
+    add.u32      %r33, %r33, %r22;        // + col_byte
+    cvt.u64.u32  %rd8, %r33;
+    add.u64      %rd9, %rd6, %rd8;
+    ld.global.v4.b32 {%r40, %r41, %r42, %r43}, [%rd9];     // 16 B = 8 BF16
+
+    // SMEM swizzle: XOR = (row_in_tile & 7) << 4
+    and.b32      %r35, %r32, 7;
+    shl.b32      %r35, %r35, 4;
+    xor.b32      %r36, %r26, %r35;
+    add.u32      %r37, %r7, SMEM_Q_C;
+    add.u32      %r37, %r37, %r24;        // + half*2048
+    shl.b32      %r38, %r32, 7;           // row_in_tile * 128 (within the half)
+    add.u32      %r37, %r37, %r38;
+    add.u32      %r37, %r37, %r36;
+    st.shared.v4.b32 [%r37], {%r40, %r41, %r42, %r43};
+
+    add.u32      %r30, %r30, 1;
+    bra          q_load_loop;
+q_load_done:
+
+    // Q_r load: 16 rows × 64 BF16 = 16 rows × 128 B = 1 half × 2 KB.
+    // 64 threads × 16 B = 1024 B = 8 rows per iter. 2 iters for 16 rows.
+    // row_qr = iter*8 + (t / 8).
+    // t_in_row = t % 8.
+    // col_byte = t_in_row * 16.
+    // Only threads 0..63 participate.
+    // Q_r: 16 rows × 64 BF16 = 16 rows × 128 B = 2048 B.
+    // 128 threads × 16 B = 2048 B — one iter covers all 16 rows.
+    // row = t / 8, col_byte = (t % 8) * 16.
+    shr.b32      %r41, %r0, 3;            // row = t / 8 (0..15)
+    and.b32      %r42, %r0, 7;            // t%8
+    shl.b32      %r43, %r42, 4;           // col_byte = (t%8) * 16
+
+    mul.lo.u32   %r47, %r41, D_R;
+    shl.b32      %r47, %r47, 1;           // bytes
+    add.u32      %r47, %r47, %r43;        // + col_byte
+    cvt.u64.u32  %rd8, %r47;
+    add.u64      %rd9, %rd7, %rd8;
+    ld.global.v4.b32 {%r40, %r50, %r51, %r52}, [%rd9];  // 16 B = 8 BF16
+
+    // Swizzle: single half, addr = SMEM_Q_R + row*128 + (col_byte XOR ((row&7)<<4))
+    and.b32      %r53, %r41, 7;
+    shl.b32      %r53, %r53, 4;
+    xor.b32      %r54, %r43, %r53;
+    add.u32      %r55, %r7, SMEM_Q_R;
+    shl.b32      %r56, %r41, 7;           // row * 128
+    add.u32      %r55, %r55, %r56;
+    add.u32      %r55, %r55, %r54;
+    st.shared.v4.b32 [%r55], {%r40, %r50, %r51, %r52};
+
+    bar.sync 0;
+
+    // ================================================================
+    // Stage 2: Main QK loop over KV chunks. No TMA yet — plain cp.async
+    // or scalar ld.global. For simplicity of the QK test, use scalar
+    // global loads into SMEM with SWIZZLE_128B layout.
+    // ================================================================
+    //
+    // Each chunk covers 8 positions. For each chunk we load c_kv[pos:pos+8, :]
+    // and k_rope[pos:pos+8, :] into SMEM, then warp 0 runs the MMA.
+    //
+    // KV ptrs: c_kv_base = &c_kv[batch, 0, 0], k_rope_base = &k_rope[batch, 0, 0]
+    mul.lo.u32   %r60, %r4, %r6;          // batch * Skv
+    mul.lo.u32   %r61, %r60, D_C;
+    shl.b32      %r61, %r61, 1;
+    cvt.u64.u32  %rd10, %r61;
+    add.u64      %rd11, %rd2, %rd10;      // c_kv + batch * Skv * D_C
+    mul.lo.u32   %r62, %r60, D_R;
+    shl.b32      %r62, %r62, 1;
+    cvt.u64.u32  %rd10, %r62;
+    add.u64      %rd12, %rd3, %rd10;      // k_rope + batch * Skv * D_R
+
+    // Lane precomputes for ldmatrix (Q A-operand, K B-operand)
+    //
+    // Q A-operand lane mapping (m16n8k16):
+    //   row_in_half = (lane < 16) ? lane : lane - 16   (0..15)
+    //   half_pair   = (lane < 16) ? 0 : 16             (byte offset picking 8-col group)
+    setp.lt.u32  %p2, %r2, 16;
+    selp.b32     %r70, %r2, 0, %p2;             // temp for lane<16
+    sub.u32      %r71, %r2, 16;
+    selp.b32     %r70, %r70, %r71, %p2;         // row_in_half
+    selp.b32     %r72, 0, 16, %p2;              // half_pair
+
+    // Q swizzle XOR = (row_in_half & 7) << 4
+    and.b32      %r73, %r70, 7;
+    shl.b32      %r73, %r73, 4;                 // Q swizzle XOR val
+    shl.b32      %r74, %r70, 7;                 // row_in_half * 128 (stride within half)
+
+    // K B-operand lane mapping (m16n8k16 .x2):
+    //   sub_lane = lane & 7     (K row 0..7)
+    //   half_bit = (lane>>3) & 1 → half_pair = half_bit * 16
+    //   swizzle  = sub_lane * 16  (since sub_lane<8, equiv (sub_lane&7)*16)
+    and.b32      %r75, %r2, 7;                  // sub_lane
+    shr.b32      %r76, %r2, 3;
+    and.b32      %r76, %r76, 1;
+    shl.b32      %r77, %r76, 4;                 // K half_pair
+    shl.b32      %r78, %r75, 4;                 // K swizzle XOR (= sub_lane*16)
+    shl.b32      %r79, %r75, 7;                 // sub_lane * 128 (K row stride in half)
+
+    // Warp predicate: only warp 0 does QK
+    setp.eq.u32  %p15, %r1, 0;
+
+    // Outer chunk loop. pos_start = chunk_idx * KV_CHUNK; len = min(KV_CHUNK, Skv - pos_start)
+    mov.u32      %r80, 0;                       // chunk_idx
+chunk_loop:
+    mul.lo.u32   %r81, %r80, KV_CHUNK;
+    setp.ge.u32  %p3, %r81, %r6;
+    @%p3 bra     chunk_loop_done;
+
+    // ------------------------------------------------------------
+    // Load c_kv[pos:pos+len, :] and k_rope[pos:pos+len, :] into SMEM with swizzle.
+    //
+    // c_kv chunk: 8 rows × 1024 B = 8 KB = 8 halves × (8 rows × 128 B = 1 KB).
+    // k_rope chunk: 8 rows × 128 B = 1 KB = 1 half.
+    // ------------------------------------------------------------
+    //
+    // Use ALL 128 threads cooperatively:
+    //   For c_kv (8 KB = 512 b32): 128 threads × 4 b32 each = 512 b32. One pass.
+    //   Thread t: row = t / 16   (rows 0..7 at 16 threads/row)
+    //             col_byte_in_row = (t % 16) * 16  (each thread handles 16 B = 8 BF16)
+    //             half = col_byte_in_row / 128 = (t % 16) / 16 = 0 ... wait
+    //
+    // Wait. 1024 B / 16 B = 64 cells per row. 128 threads / 8 rows = 16 threads/row.
+    // 16 threads × 16 B = 256 B per row. But row is 1024 B. So each thread needs
+    // 64 B = 32 BF16 = 16 b32. That's a lot.
+    //
+    // Better: do multiple iterations. 128 threads × 16 B = 2048 B per iter.
+    // 8 KB c_kv / 2048 B = 4 iterations.
+    //
+    // Thread t: within-iter row = t / 64  (0 or 1), col_byte = (t % 64) * 16.
+    //           iter i picks 2 rows: row = 2i + within_iter_row.
+
+    // c_kv chunk: 8 rows × 1024 B = 8 KB. 128 threads × 16 B = 2048 B/iter.
+    // 4 iters × 2 rows each = 8 rows. row_half = t/64, t_in_half = t%64.
+    shr.b32      %r90, %r0, 6;                  // row_half 0/1
+    and.b32      %r91, %r0, 63;                 // t_in_half 0..63
+    shl.b32      %r92, %r91, 4;                 // col_byte = t_in_half * 16 (0..1008)
+    shr.b32      %r93, %r92, 7;                 // half = col_byte / 128 (0..7)
+    shl.b32      %r94, %r93, 10;                // half * 1024
+    and.b32      %r95, %r92, 127;               // byte_in_half = col_byte % 128
+
+    mov.u32      %r96, 0;
+ckv_load_loop:
+    setp.ge.u32  %p4, %r96, 4;
+    @%p4 bra     ckv_load_done;
+
+    shl.b32      %r97, %r96, 1;                 // 2*i
+    add.u32      %r98, %r97, %r90;              // row_in_chunk = 2i + row_half (0..7)
+
+    // Bounds check: global position = pos_start + row_in_chunk
+    add.u32      %r99, %r81, %r98;
+    setp.ge.u32  %p5, %r99, %r6;
+    @%p5 bra     ckv_row_skip;
+
+    // Global c_kv addr = c_kv_base + global_pos * D_C * 2 + col_byte
+    mul.lo.u32   %r100, %r99, D_C;
+    shl.b32      %r100, %r100, 1;
+    add.u32      %r100, %r100, %r92;            // + col_byte
+    cvt.u64.u32  %rd13, %r100;
+    add.u64      %rd14, %rd11, %rd13;
+    ld.global.v4.b32 {%r40, %r41, %r42, %r43}, [%rd14];  // 16 B = 8 BF16
+
+    // SMEM write: SMEM_KV_C + half*1024 + row_in_chunk*128 + (byte_in_half XOR ((row & 7)<<4))
+    and.b32      %r101, %r98, 7;
+    shl.b32      %r101, %r101, 4;
+    xor.b32      %r102, %r95, %r101;
+    add.u32      %r103, %r7, SMEM_KV_C;
+    add.u32      %r103, %r103, %r94;            // + half*1024
+    shl.b32      %r104, %r98, 7;                // row * 128
+    add.u32      %r103, %r103, %r104;
+    add.u32      %r103, %r103, %r102;
+    st.shared.v4.b32 [%r103], {%r40, %r41, %r42, %r43};
+
+ckv_row_skip:
+    add.u32      %r96, %r96, 1;
+    bra          ckv_load_loop;
+ckv_load_done:
+
+    // k_rope chunk: 8 rows × 128 B = 1 KB. 64 threads × 16 B = 1024 B (single iter).
+    setp.lt.u32  %p6, %r0, 64;
+    @!%p6 bra    krope_skip;
+    shr.b32      %r110, %r0, 3;                 // row 0..7
+    and.b32      %r111, %r0, 7;                 // t%8
+    shl.b32      %r112, %r111, 4;               // col_byte = (t%8)*16 (0..112)
+
+    add.u32      %r113, %r81, %r110;            // global position
+    setp.ge.u32  %p7, %r113, %r6;
+    @%p7 bra     krope_skip_one;
+
+    mul.lo.u32   %r114, %r113, D_R;
+    shl.b32      %r114, %r114, 1;
+    add.u32      %r114, %r114, %r112;
+    cvt.u64.u32  %rd13, %r114;
+    add.u64      %rd14, %rd12, %rd13;
+    ld.global.v4.b32 {%r40, %r41, %r42, %r43}, [%rd14];
+
+    and.b32      %r115, %r110, 7;
+    shl.b32      %r115, %r115, 4;
+    xor.b32      %r116, %r112, %r115;
+    add.u32      %r117, %r7, SMEM_KV_R;
+    shl.b32      %r118, %r110, 7;
+    add.u32      %r117, %r117, %r118;
+    add.u32      %r117, %r117, %r116;
+    st.shared.v4.b32 [%r117], {%r40, %r41, %r42, %r43};
+
+krope_skip_one:
+krope_skip:
+    bar.sync 0;
+
+    // ------------------------------------------------------------
+    // QK MMA (warp 0 only): 32 MMAs for Q_c@c_kv^T + 4 for Q_r@k_rope^T.
+    // Accumulate into D0..D3 (4 FP32 regs per lane). After loop: scale.
+    // ------------------------------------------------------------
+    @!%p15 bra skip_qk_mma;
+
+    // Init D accumulators
+    mov.f32      %f10, 0.0;
+    mov.f32      %f11, 0.0;
+    mov.f32      %f12, 0.0;
+    mov.f32      %f13, 0.0;
+
+    // ---- Q_c @ c_kv^T ----
+    // For each D_C half h = 0..7, for each kc_in_half = 0..3:
+    //   Q base:  SMEM_Q_C + h*2048
+    //   K base:  SMEM_KV_C + h*1024
+    //   Q addr:  Q_base + row_in_half*128 + (half_pair XOR Q_swizzle_XOR)       // kc=0
+    //            then shift by +32 per kc
+    //   K addr:  K_base + sub_lane*128 + (half_pair_K XOR K_swizzle_XOR)
+    //            then shift by +32 per kc
+
+    // Loop body — unrolled at runtime via a counter for brevity.
+    mov.u32      %r120, 0;                      // h = 0..7
+qc_loop:
+    setp.ge.u32  %p8, %r120, 8;
+    @%p8 bra     qc_loop_done;
+
+    shl.b32      %r121, %r120, 11;              // h * 2048 (Q half offset)
+    shl.b32      %r122, %r120, 10;              // h * 1024 (K half offset)
+
+    add.u32      %r123, %r7, SMEM_Q_C;
+    add.u32      %r123, %r123, %r121;
+    add.u32      %r123, %r123, %r74;            // + row_in_half * 128
+
+    add.u32      %r124, %r7, SMEM_KV_C;
+    add.u32      %r124, %r124, %r122;
+    add.u32      %r124, %r124, %r79;            // + sub_lane * 128
+
+    // kc_in_half = 0
+    xor.b32      %r125, %r72, %r73;             // Q: half_pair XOR swizzle
+    add.u32      %r125, %r123, %r125;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r40, %r41, %r42, %r43}, [%r125];
+    xor.b32      %r126, %r77, %r78;             // K: half_pair_K XOR K_swizzle
+    add.u32      %r126, %r124, %r126;
+    ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%r44, %r45}, [%r126];
+    MMA_BF16_M16N8K16(%f10, %f11, %f12, %f13, %r40, %r41, %r42, %r43, %r44, %r45)
+
+    // kc_in_half = 1: byte += 32
+    add.u32      %r127, %r72, 32;
+    xor.b32      %r125, %r127, %r73;
+    add.u32      %r125, %r123, %r125;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r40, %r41, %r42, %r43}, [%r125];
+    add.u32      %r127, %r77, 32;
+    xor.b32      %r126, %r127, %r78;
+    add.u32      %r126, %r124, %r126;
+    ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%r44, %r45}, [%r126];
+    MMA_BF16_M16N8K16(%f10, %f11, %f12, %f13, %r40, %r41, %r42, %r43, %r44, %r45)
+
+    // kc_in_half = 2: byte += 64
+    add.u32      %r127, %r72, 64;
+    xor.b32      %r125, %r127, %r73;
+    add.u32      %r125, %r123, %r125;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r40, %r41, %r42, %r43}, [%r125];
+    add.u32      %r127, %r77, 64;
+    xor.b32      %r126, %r127, %r78;
+    add.u32      %r126, %r124, %r126;
+    ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%r44, %r45}, [%r126];
+    MMA_BF16_M16N8K16(%f10, %f11, %f12, %f13, %r40, %r41, %r42, %r43, %r44, %r45)
+
+    // kc_in_half = 3: byte += 96
+    add.u32      %r127, %r72, 96;
+    xor.b32      %r125, %r127, %r73;
+    add.u32      %r125, %r123, %r125;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r40, %r41, %r42, %r43}, [%r125];
+    add.u32      %r127, %r77, 96;
+    xor.b32      %r126, %r127, %r78;
+    add.u32      %r126, %r124, %r126;
+    ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%r44, %r45}, [%r126];
+    MMA_BF16_M16N8K16(%f10, %f11, %f12, %f13, %r40, %r41, %r42, %r43, %r44, %r45)
+
+    add.u32      %r120, %r120, 1;
+    bra          qc_loop;
+qc_loop_done:
+
+    // ---- Q_r @ k_rope^T ----
+    // D_R=64, one half, 4 kc_in_half iterations.
+    add.u32      %r123, %r7, SMEM_Q_R;
+    add.u32      %r123, %r123, %r74;            // + row_in_half * 128
+    add.u32      %r124, %r7, SMEM_KV_R;
+    add.u32      %r124, %r124, %r79;            // + sub_lane * 128
+
+    xor.b32      %r125, %r72, %r73;
+    add.u32      %r125, %r123, %r125;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r40, %r41, %r42, %r43}, [%r125];
+    xor.b32      %r126, %r77, %r78;
+    add.u32      %r126, %r124, %r126;
+    ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%r44, %r45}, [%r126];
+    MMA_BF16_M16N8K16(%f10, %f11, %f12, %f13, %r40, %r41, %r42, %r43, %r44, %r45)
+
+    add.u32      %r127, %r72, 32;
+    xor.b32      %r125, %r127, %r73;
+    add.u32      %r125, %r123, %r125;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r40, %r41, %r42, %r43}, [%r125];
+    add.u32      %r127, %r77, 32;
+    xor.b32      %r126, %r127, %r78;
+    add.u32      %r126, %r124, %r126;
+    ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%r44, %r45}, [%r126];
+    MMA_BF16_M16N8K16(%f10, %f11, %f12, %f13, %r40, %r41, %r42, %r43, %r44, %r45)
+
+    add.u32      %r127, %r72, 64;
+    xor.b32      %r125, %r127, %r73;
+    add.u32      %r125, %r123, %r125;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r40, %r41, %r42, %r43}, [%r125];
+    add.u32      %r127, %r77, 64;
+    xor.b32      %r126, %r127, %r78;
+    add.u32      %r126, %r124, %r126;
+    ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%r44, %r45}, [%r126];
+    MMA_BF16_M16N8K16(%f10, %f11, %f12, %f13, %r40, %r41, %r42, %r43, %r44, %r45)
+
+    add.u32      %r127, %r72, 96;
+    xor.b32      %r125, %r127, %r73;
+    add.u32      %r125, %r123, %r125;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%r40, %r41, %r42, %r43}, [%r125];
+    add.u32      %r127, %r77, 96;
+    xor.b32      %r126, %r127, %r78;
+    add.u32      %r126, %r124, %r126;
+    ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%r44, %r45}, [%r126];
+    MMA_BF16_M16N8K16(%f10, %f11, %f12, %f13, %r40, %r41, %r42, %r43, %r44, %r45)
+
+    // Scale
+    mul.f32      %f10, %f10, %f0;
+    mul.f32      %f11, %f11, %f0;
+    mul.f32      %f12, %f12, %f0;
+    mul.f32      %f13, %f13, %f0;
+
+    // ---- Write scores to global output ----
+    //
+    // m16n8 per-lane layout:
+    //   g = lane / 4, t = lane % 4
+    //   D0 = score(g,   2t),  D1 = score(g,   2t+1)
+    //   D2 = score(g+8, 2t),  D3 = score(g+8, 2t+1)
+    //
+    // Output layout: scores[B, H, Skv] FP32.
+    // This CTA's head rows: rows head_group*16 .. head_group*16 + 15.
+    // Position cols: chunk*8 .. chunk*8 + 7 (clipped to Skv).
+    //
+    // head_global = head_group*16 + row_in_tile
+    // output address = scores + ((batch * H + head_global) * Skv + position) * 4
+    shr.b32      %r130, %r2, 2;                 // g = lane / 4 (0..7)
+    and.b32      %r131, %r2, 3;                 // t = lane % 4 (0..3)
+    shl.b32      %r132, %r131, 1;               // 2t (col base)
+    add.u32      %r133, %r132, 1;               // 2t+1
+
+    // row_lo = g, row_hi = g+8
+    // head_global_lo = head_group*16 + g
+    // head_global_hi = head_group*16 + g + 8
+    shl.b32      %r134, %r3, 4;                 // head_group * 16
+    add.u32      %r135, %r134, %r130;           // head_lo
+    add.u32      %r136, %r135, 8;               // head_hi
+
+    // position_lo = chunk*8 + 2t, position_hi = chunk*8 + 2t+1
+    add.u32      %r137, %r81, %r132;            // pos_lo = pos_start + 2t
+    add.u32      %r138, %r81, %r133;            // pos_hi = pos_start + 2t+1
+
+    // scores[b, head_lo, pos_lo] = D0
+    mul.lo.u32   %r139, %r4, %r5;               // batch*H
+    add.u32      %r140, %r139, %r135;           // (b*H + head_lo)
+    mul.lo.u32   %r141, %r140, %r6;             // * Skv
+    add.u32      %r141, %r141, %r137;           // + pos_lo
+    mul.wide.u32 %rd15, %r141, 4;
+    add.u64      %rd15, %rd4, %rd15;
+    setp.lt.u32  %p9, %r137, %r6;
+    @%p9 st.global.f32 [%rd15], %f10;
+
+    // scores[b, head_lo, pos_hi] = D1
+    add.u32      %r141, %r139, %r135;
+    mul.lo.u32   %r141, %r141, %r6;
+    add.u32      %r141, %r141, %r138;
+    mul.wide.u32 %rd15, %r141, 4;
+    add.u64      %rd15, %rd4, %rd15;
+    setp.lt.u32  %p9, %r138, %r6;
+    @%p9 st.global.f32 [%rd15], %f11;
+
+    // scores[b, head_hi, pos_lo] = D2
+    add.u32      %r141, %r139, %r136;
+    mul.lo.u32   %r141, %r141, %r6;
+    add.u32      %r141, %r141, %r137;
+    mul.wide.u32 %rd15, %r141, 4;
+    add.u64      %rd15, %rd4, %rd15;
+    setp.lt.u32  %p9, %r137, %r6;
+    @%p9 st.global.f32 [%rd15], %f12;
+
+    // scores[b, head_hi, pos_hi] = D3
+    add.u32      %r141, %r139, %r136;
+    mul.lo.u32   %r141, %r141, %r6;
+    add.u32      %r141, %r141, %r138;
+    mul.wide.u32 %rd15, %r141, 4;
+    add.u64      %rd15, %rd4, %rd15;
+    setp.lt.u32  %p9, %r138, %r6;
+    @%p9 st.global.f32 [%rd15], %f13;
+
+skip_qk_mma:
+    bar.sync 0;
+
+    add.u32      %r80, %r80, 1;
+    bra          chunk_loop;
+chunk_loop_done:
+
+    ret;
+}

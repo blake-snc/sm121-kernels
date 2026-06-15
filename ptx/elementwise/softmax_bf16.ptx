@@ -1,0 +1,329 @@
+// softmax_bf16.ptx
+//
+// Row-wise softmax with temperature for BF16 tensors (typically logits).
+//   out[i] = exp((x[i] - max(x)) / temperature) / sum(exp((x[j] - max(x)) / temperature))
+//
+// Layout: one CTA per row, 256 threads.
+// Two passes over the row:
+//   Pass 1: find max (warp butterfly reduce → cross-warp reduce via shared memory)
+//   Pass 2: compute exp((x[i]-max)/T), accumulate denominator (same reduce pattern)
+//   Pass 3: normalize and write out[i]
+//
+// Vectorized: 4 BF16 per thread per iteration via v2.b32 loads/stores.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "reduction.ptxh"
+#include "convert.ptxh"
+
+// shared: 8 partial slots (32B) + broadcast slot (4B) → pad to 128.
+.shared .align 128 .b8 smem_reduce[128];
+
+.visible .entry softmax_bf16(
+    .param .u64 param_x,        // input: [num_rows, vocab] bf16
+    .param .u64 param_out,      // output: [num_rows, vocab] bf16
+    .param .u32 param_vocab,    // vocab size
+    .param .f32 param_temp      // temperature (multiply factor: inv_temp = 1/T)
+)
+{
+    .reg .b32 %r<36>;
+    .reg .b64 %rd<20>;
+    .reg .f32 %f<24>;
+    .reg .b16 %h<12>;
+    .reg .pred %p<4>;
+
+    mov.u32         %r0, BLOCK_ID_X;
+    mov.u32         %r1, THREAD_ID;
+
+    ld.param.u64    %rd0, [param_x];
+    ld.param.u64    %rd1, [param_out];
+    ld.param.u32    %r2, [param_vocab];
+    ld.param.f32    %f0, [param_temp];      // temperature
+
+    // Row offset in bytes
+    mul.lo.u32      %r3, %r0, %r2;
+    mul.wide.u32    %rd3, %r3, 2;
+    add.u64         %rd4, %rd0, %rd3;        // &x[row, 0]
+    add.u64         %rd5, %rd1, %rd3;        // &out[row, 0]
+
+    // inv_temp = 1 / temperature (clamped to 1.0 if temp <= 0 for safety)
+    mov.f32         %f18, 0f3F800000;        // 1.0
+    setp.gt.f32     %p1, %f0, 0f00000000;
+    @%p1 rcp.approx.f32 %f18, %f0;
+
+    mov.u32         %r4, %ntid.x;
+    shl.b32         %r20, %r4, 2;            // vec_stride
+    sub.u32         %r21, %r20, 1;
+    not.b32         %r21, %r21;
+    and.b32         %r22, %r2, %r21;         // vec_limit
+
+    // ============ Pass 1: find row max ============
+    mov.b32         %f1, 0xff800000;         // running_max = -inf
+    shl.b32         %r5, %r1, 2;             // i = tid * 4
+
+max_vec_loop:
+    setp.ge.u32     %p0, %r5, %r22;
+    @%p0 bra        max_vec_done;
+
+    mul.wide.u32    %rd7, %r5, 2;
+    add.u64         %rd8, %rd4, %rd7;
+    ld.global.v2.b32 {%r10, %r11}, [%rd8];
+    mov.b32         {%h0, %h1}, %r10;
+    mov.b32         {%h2, %h3}, %r11;
+    CVT_BF16_F32(%f2, %h0)
+    CVT_BF16_F32(%f3, %h1)
+    CVT_BF16_F32(%f4, %h2)
+    CVT_BF16_F32(%f5, %h3)
+    max.f32         %f1, %f1, %f2;
+    max.f32         %f1, %f1, %f3;
+    max.f32         %f1, %f1, %f4;
+    max.f32         %f1, %f1, %f5;
+
+    add.u32         %r5, %r5, %r20;
+    bra             max_vec_loop;
+
+max_vec_done:
+    // Scalar tail
+    add.u32         %r5, %r22, %r1;
+
+max_tail:
+    setp.ge.u32     %p0, %r5, %r2;
+    @%p0 bra        max_done;
+    mul.wide.u32    %rd7, %r5, 2;
+    add.u64         %rd8, %rd4, %rd7;
+    ld.global.b16   %h0, [%rd8];
+    CVT_BF16_F32(%f2, %h0)
+    max.f32         %f1, %f1, %f2;
+    add.u32         %r5, %r5, %r4;
+    bra             max_tail;
+
+max_done:
+    WARP_REDUCE_MAX_F32(%f1, %f3)
+
+    WARP_ID(%r6, %r1)
+    LANE_ID(%r7, %r1)
+    setp.eq.u32     %p1, %r7, 0;
+    @%p1 bra        mx_write_smem;
+    bra             mx_skip_write;
+
+mx_write_smem:
+    mul.wide.u32    %rd10, %r6, 4;
+    mov.u64         %rd11, smem_reduce;
+    add.u64         %rd12, %rd11, %rd10;
+    st.shared.f32   [%rd12], %f1;
+
+mx_skip_write:
+    bar.sync        0;
+
+    shr.u32         %r8, %r4, 5;             // num_warps
+    setp.lt.u32     %p2, %r6, 1;
+    @%p2 bra        mx_w0_reduce;
+    bra             mx_after;
+
+mx_w0_reduce:
+    setp.lt.u32     %p3, %r7, %r8;
+    @%p3 bra        mx_load_partial;
+    mov.b32         %f1, 0xff800000;
+    bra             mx_final;
+
+mx_load_partial:
+    mul.wide.u32    %rd10, %r7, 4;
+    mov.u64         %rd11, smem_reduce;
+    add.u64         %rd12, %rd11, %rd10;
+    ld.shared.f32   %f1, [%rd12];
+
+mx_final:
+    WARP_REDUCE_MAX_F32(%f1, %f3)
+
+    setp.eq.u32     %p1, %r7, 0;
+    @%p1 bra        mx_store;
+    bra             mx_after;
+
+mx_store:
+    mov.u64         %rd11, smem_reduce;
+    st.shared.f32   [%rd11], %f1;
+
+mx_after:
+    bar.sync        0;
+
+    // Broadcast row_max
+    mov.u64         %rd11, smem_reduce;
+    ld.shared.f32   %f19, [%rd11];           // row_max
+
+    // ============ Pass 2: compute exp((x-max)*inv_temp), accumulate sum ============
+    mov.f32         %f20, 0f00000000;        // sum accumulator
+    shl.b32         %r5, %r1, 2;             // i = tid * 4
+
+// Fused-exp shorthand: s = exp2((x - row_max) * inv_temp * LOG2E), clamped.
+#define EXP_STABLE(dst, x) \
+    sub.f32 dst, x, %f19; \
+    mul.f32 dst, dst, %f18; \
+    mul.f32 dst, dst, LOG2E; \
+    max.f32 dst, dst, 0fC2FA0000; \
+    ex2.approx.ftz.f32 dst, dst;
+
+sum_vec_loop:
+    setp.ge.u32     %p0, %r5, %r22;
+    @%p0 bra        sum_vec_done;
+
+    mul.wide.u32    %rd7, %r5, 2;
+    add.u64         %rd8, %rd4, %rd7;
+    ld.global.v2.b32 {%r10, %r11}, [%rd8];
+    mov.b32         {%h0, %h1}, %r10;
+    mov.b32         {%h2, %h3}, %r11;
+    CVT_BF16_F32(%f2, %h0)
+    CVT_BF16_F32(%f3, %h1)
+    CVT_BF16_F32(%f4, %h2)
+    CVT_BF16_F32(%f5, %h3)
+    EXP_STABLE(%f6, %f2)
+    EXP_STABLE(%f7, %f3)
+    EXP_STABLE(%f8, %f4)
+    EXP_STABLE(%f9, %f5)
+    add.f32         %f20, %f20, %f6;
+    add.f32         %f20, %f20, %f7;
+    add.f32         %f20, %f20, %f8;
+    add.f32         %f20, %f20, %f9;
+
+    // Store intermediate unnormalized probs back to out as bf16
+    CVT_F32_BF16(%h0, %f6)
+    CVT_F32_BF16(%h1, %f7)
+    CVT_F32_BF16(%h2, %f8)
+    CVT_F32_BF16(%h3, %f9)
+    mov.b32         %r14, {%h0, %h1};
+    mov.b32         %r15, {%h2, %h3};
+    add.u64         %rd13, %rd5, %rd7;
+    st.global.v2.b32 [%rd13], {%r14, %r15};
+
+    add.u32         %r5, %r5, %r20;
+    bra             sum_vec_loop;
+
+sum_vec_done:
+    add.u32         %r5, %r22, %r1;
+
+sum_tail:
+    setp.ge.u32     %p0, %r5, %r2;
+    @%p0 bra        sum_done;
+    mul.wide.u32    %rd7, %r5, 2;
+    add.u64         %rd8, %rd4, %rd7;
+    ld.global.b16   %h0, [%rd8];
+    CVT_BF16_F32(%f2, %h0)
+    EXP_STABLE(%f6, %f2)
+    add.f32         %f20, %f20, %f6;
+    CVT_F32_BF16(%h1, %f6)
+    add.u64         %rd13, %rd5, %rd7;
+    st.global.b16   [%rd13], %h1;
+    add.u32         %r5, %r5, %r4;
+    bra             sum_tail;
+
+sum_done:
+    WARP_REDUCE_SUM_F32(%f20, %f3)
+
+    setp.eq.u32     %p1, %r7, 0;
+    @%p1 bra        sm_write_smem;
+    bra             sm_skip_write;
+
+sm_write_smem:
+    mul.wide.u32    %rd10, %r6, 4;
+    mov.u64         %rd11, smem_reduce;
+    add.u64         %rd12, %rd11, %rd10;
+    st.shared.f32   [%rd12], %f20;
+
+sm_skip_write:
+    bar.sync        0;
+
+    setp.lt.u32     %p2, %r6, 1;
+    @%p2 bra        sm_w0_reduce;
+    bra             sm_after;
+
+sm_w0_reduce:
+    setp.lt.u32     %p3, %r7, %r8;
+    @%p3 bra        sm_load_partial;
+    mov.f32         %f20, 0f00000000;
+    bra             sm_final;
+
+sm_load_partial:
+    mul.wide.u32    %rd10, %r7, 4;
+    mov.u64         %rd11, smem_reduce;
+    add.u64         %rd12, %rd11, %rd10;
+    ld.shared.f32   %f20, [%rd12];
+
+sm_final:
+    WARP_REDUCE_SUM_F32(%f20, %f3)
+
+    setp.eq.u32     %p1, %r7, 0;
+    @%p1 bra        sm_store_inv;
+    bra             sm_after;
+
+sm_store_inv:
+    // Broadcast 1/sum; clamp at 1.0 if sum is 0 (shouldn't happen post-exp_stable)
+    mov.f32         %f21, 0f3F800000;
+    setp.gt.f32     %p1, %f20, 0f00000000;
+    @%p1 rcp.approx.f32 %f21, %f20;
+    mov.u64         %rd11, smem_reduce;
+    st.shared.f32   [%rd11], %f21;
+
+sm_after:
+    bar.sync        0;
+
+    mov.u64         %rd11, smem_reduce;
+    ld.shared.f32   %f21, [%rd11];           // inv_sum
+
+    // ============ Pass 3: multiply by inv_sum and rewrite ============
+    shl.b32         %r5, %r1, 2;
+
+norm_vec_loop:
+    setp.ge.u32     %p0, %r5, %r22;
+    @%p0 bra        norm_vec_done;
+
+    mul.wide.u32    %rd7, %r5, 2;
+    add.u64         %rd13, %rd5, %rd7;
+    ld.global.v2.b32 {%r10, %r11}, [%rd13];
+    mov.b32         {%h0, %h1}, %r10;
+    mov.b32         {%h2, %h3}, %r11;
+
+    CVT_BF16_F32(%f2, %h0)
+    mul.f32         %f2, %f2, %f21;
+    CVT_F32_BF16(%h0, %f2)
+
+    CVT_BF16_F32(%f3, %h1)
+    mul.f32         %f3, %f3, %f21;
+    CVT_F32_BF16(%h1, %f3)
+
+    mov.b32         %r14, {%h0, %h1};
+
+    CVT_BF16_F32(%f4, %h2)
+    mul.f32         %f4, %f4, %f21;
+    CVT_F32_BF16(%h2, %f4)
+
+    CVT_BF16_F32(%f5, %h3)
+    mul.f32         %f5, %f5, %f21;
+    CVT_F32_BF16(%h3, %f5)
+
+    mov.b32         %r15, {%h2, %h3};
+    st.global.v2.b32 [%rd13], {%r14, %r15};
+
+    add.u32         %r5, %r5, %r20;
+    bra             norm_vec_loop;
+
+norm_vec_done:
+    add.u32         %r5, %r22, %r1;
+
+norm_tail:
+    setp.ge.u32     %p0, %r5, %r2;
+    @%p0 bra        norm_done;
+    mul.wide.u32    %rd7, %r5, 2;
+    add.u64         %rd13, %rd5, %rd7;
+    ld.global.b16   %h0, [%rd13];
+    CVT_BF16_F32(%f2, %h0)
+    mul.f32         %f2, %f2, %f21;
+    CVT_F32_BF16(%h1, %f2)
+    st.global.b16   [%rd13], %h1;
+    add.u32         %r5, %r5, %r4;
+    bra             norm_tail;
+
+norm_done:
+    ret;
+}

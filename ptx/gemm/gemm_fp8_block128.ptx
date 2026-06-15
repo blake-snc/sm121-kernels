@@ -1,0 +1,205 @@
+// gemm_fp8_block128.ptx
+//
+// Dense GEMM with DSv3 block-scaled FP8 weights (BF16 activations).
+// Used by DeepSeek V3 / V3.1 / V3.2 dense MLP layers (and the FP8 attention
+// path) where weights are quantized FP8 E4M3 in 1×128 blocks, each block
+// carrying one FP32 scale.
+//
+// Compute:
+//   C[m, n] = Σ_k A[m, k] * B[n, k] * scale[n, k / 128]
+//
+// Input layout:
+//   A:      [M, K]            BF16 row-major
+//   B:      [N, K]             FP8 E4M3 row-major (1 byte per element)
+//   scales: [N, K/128]        FP32 (one scale per 1×128 K-block per output row)
+//   C:      [M, N]            BF16
+//
+// Grid: (ceil(N / BN), ceil(M / BM), 1)
+//   BM = 32, BN = 32. Block: (BN) threads — one per output column.
+//
+// Scalar reference — correct but slow. Sibling of `gemm_fp8_block128_grouped`
+// from `ptx/gemm/`. An MMA-optimized variant is tracked as follow-up.
+//
+// K must be divisible by 128 (the block size).
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+#define BM 32
+#define BN 32
+#define BLOCK_K 128
+
+.visible .entry gemm_fp8_block128(
+    .param .u64 param_A,
+    .param .u64 param_B,
+    .param .u64 param_scales,
+    .param .u64 param_C,
+    .param .u32 param_M,
+    .param .u32 param_N,
+    .param .u32 param_K
+)
+{
+    .reg .b32 %r<32>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<40>;
+    .reg .b16 %h<2>;
+    .reg .pred %p<4>;
+
+    mov.u32         %r1, %ctaid.y;             // m_tile
+    mov.u32         %r2, %ctaid.x;             // n_tile
+    mov.u32         %r3, %tid.x;               // lane [0..31]
+
+    ld.param.u64    %rd0, [param_A];
+    ld.param.u64    %rd1, [param_B];
+    ld.param.u64    %rd2, [param_scales];
+    ld.param.u64    %rd3, [param_C];
+    ld.param.u32    %r0, [param_M];
+    ld.param.u32    %r4, [param_N];
+    ld.param.u32    %r5, [param_K];
+
+    // m-tile range: m_tile*BM .. min(M, (m_tile+1)*BM)
+    shl.b32         %r9, %r1, 5;               // m_tile*BM
+    setp.ge.u32     %p0, %r9, %r0;             // out-of-range m_tile
+    @%p0 bra        done;
+
+    // This thread's n index
+    shl.b32         %r10, %r2, 5;
+    add.u32         %r10, %r10, %r3;
+    setp.ge.u32     %p1, %r10, %r4;
+    @%p1 bra        done;
+
+    // B base for n: &B[n*K]  (FP8, 1B/elem)
+    mul.lo.u32      %r12, %r10, %r5;
+    cvt.u64.u32     %rd7, %r12;
+    add.u64         %rd8, %rd1, %rd7;
+
+    // Scales base for n: &scales[n*(K/128)] * 4B
+    div.u32         %r14, %r5, BLOCK_K;        // num_k_blocks
+    mul.lo.u32      %r17, %r10, %r14;
+    mul.wide.u32    %rd7, %r17, 4;
+    add.u64         %rd9, %rd2, %rd7;          // &scales[n, 0]
+
+    // Accumulators for BM rows (32 FP32)
+    mov.f32 %f0, 0.0;   mov.f32 %f1, 0.0;   mov.f32 %f2, 0.0;   mov.f32 %f3, 0.0;
+    mov.f32 %f4, 0.0;   mov.f32 %f5, 0.0;   mov.f32 %f6, 0.0;   mov.f32 %f7, 0.0;
+    mov.f32 %f8, 0.0;   mov.f32 %f9, 0.0;   mov.f32 %f10, 0.0;  mov.f32 %f11, 0.0;
+    mov.f32 %f12, 0.0;  mov.f32 %f13, 0.0;  mov.f32 %f14, 0.0;  mov.f32 %f15, 0.0;
+    mov.f32 %f16, 0.0;  mov.f32 %f17, 0.0;  mov.f32 %f18, 0.0;  mov.f32 %f19, 0.0;
+    mov.f32 %f20, 0.0;  mov.f32 %f21, 0.0;  mov.f32 %f22, 0.0;  mov.f32 %f23, 0.0;
+    mov.f32 %f24, 0.0;  mov.f32 %f25, 0.0;  mov.f32 %f26, 0.0;  mov.f32 %f27, 0.0;
+    mov.f32 %f28, 0.0;  mov.f32 %f29, 0.0;  mov.f32 %f30, 0.0;  mov.f32 %f31, 0.0;
+
+    // first_row = m_tile*BM
+    mov.u32         %r18, %r9;
+    mul.lo.u32      %r19, %r18, %r5;
+    mul.wide.u32    %rd7, %r19, 2;
+    add.u64         %rd10, %rd0, %rd7;          // &A[first_row, 0] (BF16)
+
+    // Effective row count = min(BM, M - first_row)
+    sub.u32         %r20, %r0, %r18;
+    min.u32         %r20, %r20, 32;
+
+    // Iterate K-blocks; for each block, load one scale, accumulate 128 K dims
+    mov.u32         %r21, 0;                    // k_block
+k_block_loop:
+    setp.ge.u32     %p2, %r21, %r14;
+    @%p2 bra        k_block_done;
+
+    // Load scale for this (n, k_block)
+    mul.wide.u32    %rd7, %r21, 4;
+    .reg .b64 _sc_ptr;
+    add.u64         _sc_ptr, %rd9, %rd7;
+    .reg .f32 _scale;
+    ld.global.f32   _scale, [_sc_ptr];
+
+    // Iterate 128 K-dims within this block
+    mov.u32         %r22, 0;
+k_inner_loop:
+    setp.ge.u32     %p3, %r22, BLOCK_K;
+    @%p3 bra        k_inner_done;
+
+    // Global k = k_block * 128 + inner
+    shl.b32         %r23, %r21, 7;              // k_block * 128
+    add.u32         %r23, %r23, %r22;           // k
+
+    // Load B[n, k] FP8 (1 byte) and dequant
+    cvt.u64.u32     %rd11, %r23;
+    .reg .b64 _b_ptr;
+    add.u64         _b_ptr, %rd8, %rd11;
+    .reg .u32 _b8_u;
+    ld.global.u8    _b8_u, [_b_ptr];
+    .reg .b16 _fp8_pair;
+    .reg .b32 _f16_pair;
+    .reg .b16 _hlo, _hhi;
+    cvt.u16.u32     _fp8_pair, _b8_u;
+    cvt.rn.f16x2.e4m3x2 _f16_pair, _fp8_pair;
+    mov.b32         {_hlo, _hhi}, _f16_pair;
+    .reg .f32 _b_val;
+    cvt.f32.f16     _b_val, _hlo;
+    mul.f32         _b_val, _b_val, _scale;
+
+    // For each of BM rows: A[first_row + r, k] × b_val
+#define ACCUM_FP8_DENSE(idx, acc) \
+    { .reg .pred _in; \
+      .reg .b16 _a; \
+      .reg .f32 _af; \
+      .reg .b64 _p; \
+      .reg .b32 _rowoff; \
+      setp.lt.u32 _in, idx, %r20; \
+      mul.lo.u32 _rowoff, idx, %r5; \
+      add.u32 _rowoff, _rowoff, %r23; \
+      mul.wide.u32 _p, _rowoff, 2; \
+      add.u64 _p, %rd10, _p; \
+      mov.b16 _a, 0; \
+      @_in ld.global.b16 _a, [_p]; \
+      CVT_BF16_F32(_af, _a) \
+      @_in fma.rn.f32 acc, _af, _b_val, acc; \
+    }
+    ACCUM_FP8_DENSE(0,  %f0)   ACCUM_FP8_DENSE(1,  %f1)   ACCUM_FP8_DENSE(2,  %f2)   ACCUM_FP8_DENSE(3,  %f3)
+    ACCUM_FP8_DENSE(4,  %f4)   ACCUM_FP8_DENSE(5,  %f5)   ACCUM_FP8_DENSE(6,  %f6)   ACCUM_FP8_DENSE(7,  %f7)
+    ACCUM_FP8_DENSE(8,  %f8)   ACCUM_FP8_DENSE(9,  %f9)   ACCUM_FP8_DENSE(10, %f10)  ACCUM_FP8_DENSE(11, %f11)
+    ACCUM_FP8_DENSE(12, %f12)  ACCUM_FP8_DENSE(13, %f13)  ACCUM_FP8_DENSE(14, %f14)  ACCUM_FP8_DENSE(15, %f15)
+    ACCUM_FP8_DENSE(16, %f16)  ACCUM_FP8_DENSE(17, %f17)  ACCUM_FP8_DENSE(18, %f18)  ACCUM_FP8_DENSE(19, %f19)
+    ACCUM_FP8_DENSE(20, %f20)  ACCUM_FP8_DENSE(21, %f21)  ACCUM_FP8_DENSE(22, %f22)  ACCUM_FP8_DENSE(23, %f23)
+    ACCUM_FP8_DENSE(24, %f24)  ACCUM_FP8_DENSE(25, %f25)  ACCUM_FP8_DENSE(26, %f26)  ACCUM_FP8_DENSE(27, %f27)
+    ACCUM_FP8_DENSE(28, %f28)  ACCUM_FP8_DENSE(29, %f29)  ACCUM_FP8_DENSE(30, %f30)  ACCUM_FP8_DENSE(31, %f31)
+
+    add.u32         %r22, %r22, 1;
+    bra             k_inner_loop;
+k_inner_done:
+
+    add.u32         %r21, %r21, 1;
+    bra             k_block_loop;
+k_block_done:
+
+    // Store
+#define STORE_ROW_DENSE(idx, acc) \
+    { .reg .pred _in; \
+      .reg .b16 _bv; \
+      .reg .b64 _p; \
+      .reg .b32 _rowoff; \
+      setp.lt.u32 _in, idx, %r20; \
+      @_in cvt.rn.bf16.f32 _bv, acc; \
+      add.u32 _rowoff, %r18, idx; \
+      mul.lo.u32 _rowoff, _rowoff, %r4; \
+      add.u32 _rowoff, _rowoff, %r10; \
+      mul.wide.u32 _p, _rowoff, 2; \
+      add.u64 _p, %rd3, _p; \
+      @_in st.global.b16 [_p], _bv; \
+    }
+    STORE_ROW_DENSE(0,  %f0)   STORE_ROW_DENSE(1,  %f1)   STORE_ROW_DENSE(2,  %f2)   STORE_ROW_DENSE(3,  %f3)
+    STORE_ROW_DENSE(4,  %f4)   STORE_ROW_DENSE(5,  %f5)   STORE_ROW_DENSE(6,  %f6)   STORE_ROW_DENSE(7,  %f7)
+    STORE_ROW_DENSE(8,  %f8)   STORE_ROW_DENSE(9,  %f9)   STORE_ROW_DENSE(10, %f10)  STORE_ROW_DENSE(11, %f11)
+    STORE_ROW_DENSE(12, %f12)  STORE_ROW_DENSE(13, %f13)  STORE_ROW_DENSE(14, %f14)  STORE_ROW_DENSE(15, %f15)
+    STORE_ROW_DENSE(16, %f16)  STORE_ROW_DENSE(17, %f17)  STORE_ROW_DENSE(18, %f18)  STORE_ROW_DENSE(19, %f19)
+    STORE_ROW_DENSE(20, %f20)  STORE_ROW_DENSE(21, %f21)  STORE_ROW_DENSE(22, %f22)  STORE_ROW_DENSE(23, %f23)
+    STORE_ROW_DENSE(24, %f24)  STORE_ROW_DENSE(25, %f25)  STORE_ROW_DENSE(26, %f26)  STORE_ROW_DENSE(27, %f27)
+    STORE_ROW_DENSE(28, %f28)  STORE_ROW_DENSE(29, %f29)  STORE_ROW_DENSE(30, %f30)  STORE_ROW_DENSE(31, %f31)
+
+done:
+    ret;
+}

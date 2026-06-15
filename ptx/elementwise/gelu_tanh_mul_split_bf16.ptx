@@ -1,0 +1,92 @@
+// gelu_tanh_mul_split_bf16.ptx
+//
+// GeLU-tanh activation with multiply, taking SEPARATE gate and up tensors.
+//   out[i] = gelu_tanh(gate[i]) * up[i]
+// where gelu_tanh(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+//
+// Layout:
+//   gate: [n] bf16
+//   up:   [n] bf16
+//   out:  [n] bf16
+//
+// Drop-in counterpart to silu_mul_split_bf16, but for Gemma-style MLPs and
+// per-layer-input gates that use gelu_pytorch_tanh. Avoids the dtod-copy
+// "fuse gate||up into [N, 2D]" step that gelu_tanh_mul_bf16 requires.
+//
+// Vectorized: each thread iteration processes 2 consecutive elements via
+// packed b32 loads/stores. n must be even.
+//
+// Uses the numerically-stable GELU_TANH_F32 macro from convert.ptxh
+// (sigmoid form gelu(x) = x / (1 + exp(-2 * arg)); no NaN at large |x|).
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+.visible .entry gelu_tanh_mul_split_bf16(
+    .param .u64 param_gate,     // [n] bf16
+    .param .u64 param_up,       // [n] bf16
+    .param .u64 param_out,      // [n] bf16
+    .param .u32 param_n         // total elements (must be even)
+)
+{
+    .reg .b32 %r<16>;
+    .reg .b64 %rd<12>;
+    .reg .f32 %f<24>;
+    .reg .b16 %h<8>;
+    .reg .pred %p<4>;
+
+    mov.u32         %r0, BLOCK_ID_X;
+    mov.u32         %r1, %ntid.x;
+    mov.u32         %r2, THREAD_ID;
+    mad.lo.u32      %r3, %r0, %r1, %r2;
+    mov.u32         %r4, %nctaid.x;
+    mul.lo.u32      %r5, %r4, %r1;
+
+    shl.b32         %r8, %r3, 1;            // i = 2 * tid
+    shl.b32         %r5, %r5, 1;            // stride *= 2
+
+    ld.param.u64    %rd0, [param_gate];
+    ld.param.u64    %rd1, [param_up];
+    ld.param.u64    %rd2, [param_out];
+    ld.param.u32    %r6, [param_n];
+
+loop:
+    setp.ge.u32     %p0, %r8, %r6;
+    @%p0 bra        done;
+
+    mul.wide.u32    %rd3, %r8, 2;
+    add.u64         %rd4, %rd0, %rd3;
+    add.u64         %rd5, %rd1, %rd3;
+    add.u64         %rd6, %rd2, %rd3;
+
+    ld.global.b32   %r10, [%rd4];           // gate[i..i+1]
+    mov.b32         {%h0, %h1}, %r10;
+    CVT_BF16_F32(%f0, %h0)
+    CVT_BF16_F32(%f1, %h1)
+
+    ld.global.b32   %r11, [%rd5];           // up[i..i+1]
+    mov.b32         {%h2, %h3}, %r11;
+    CVT_BF16_F32(%f2, %h2)
+    CVT_BF16_F32(%f3, %h3)
+
+    GELU_TANH_F32(%f4, %f0, %f12, %f13, %f14)
+    GELU_TANH_F32(%f5, %f1, %f15, %f16, %f17)
+
+    mul.f32         %f6, %f4, %f2;
+    mul.f32         %f7, %f5, %f3;
+
+    CVT_F32_BF16(%h4, %f6)
+    CVT_F32_BF16(%h5, %f7)
+    mov.b32         %r12, {%h4, %h5};
+    st.global.b32   [%rd6], %r12;
+
+    add.u32         %r8, %r8, %r5;
+    bra             loop;
+
+done:
+    ret;
+}

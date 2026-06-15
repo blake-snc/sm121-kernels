@@ -1,0 +1,108 @@
+// rope_bf16.ptx
+//
+// Rotary Position Embedding (RoPE) for BF16 tensors.
+// x_rot[2i]   = x[2i] * cos[pos, i] - x[2i+1] * sin[pos, i]
+// x_rot[2i+1] = x[2i] * sin[pos, i] + x[2i+1] * cos[pos, i]
+//
+// Layout: x is [batch, seq, heads, dim], cos/sin cache is [seq, dim/2]
+// One thread per dimension pair. Grid: (seq * heads * batch, 1, 1)
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+.visible .entry rope_bf16(
+    .param .u64 param_x,        // input/output: [B * S * H * D] bf16 (in-place)
+    .param .u64 param_cos,      // cos cache: [S * D/2] f32
+    .param .u64 param_sin,      // sin cache: [S * D/2] f32
+    .param .u32 param_seq,      // S
+    .param .u32 param_heads,    // H
+    .param .u32 param_dim,      // D (head dim, must be even)
+    .param .u32 param_half_dim  // D / 2
+)
+{
+    .reg .b32 %r<22>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<12>;
+    .reg .b16 %h<4>;
+    .reg .pred %p<2>;
+
+    // Each thread handles one dimension pair for one (batch, seq, head) position.
+    // block_idx = batch * seq * heads + seq_head_idx
+    // thread_idx = pair_idx within the head dimension
+
+    mov.u32         %r0, BLOCK_ID_X;       // position in (B*S*H) grid
+    mov.u32         %r1, THREAD_ID;         // pair index within head dim
+
+    ld.param.u32    %r2, [param_seq];       // S
+    ld.param.u32    %r3, [param_heads];     // H
+    ld.param.u32    %r4, [param_dim];       // D
+    ld.param.u32    %r5, [param_half_dim];  // D/2
+
+    // Bounds check: thread must be < D/2
+    setp.ge.u32     %p0, %r1, %r5;
+    @%p0 bra        done;
+
+    // Decompose block_idx into (batch, seq, head)
+    // total_per_batch = S * H
+    mul.lo.u32      %r6, %r2, %r3;         // S * H
+    div.u32         %r7, %r0, %r6;         // batch
+    rem.u32         %r8, %r0, %r6;         // seq * H remainder
+    div.u32         %r9, %r8, %r3;         // seq_pos
+    rem.u32         %r10, %r8, %r3;        // head
+
+    // Load params
+    ld.param.u64    %rd0, [param_x];
+    ld.param.u64    %rd1, [param_cos];
+    ld.param.u64    %rd2, [param_sin];
+
+    // x offset: (batch * S * H * D + seq * H * D + head * D + 2 * pair) * 2 bytes
+    mul.lo.u32      %r11, %r7, %r6;        // batch * S * H
+    add.u32         %r11, %r11, %r8;       // + seq * H + head
+    mul.lo.u32      %r11, %r11, %r4;       // * D
+    shl.b32         %r12, %r1, 1;          // 2 * pair_idx
+    add.u32         %r11, %r11, %r12;      // + 2 * pair
+
+    mul.wide.u32    %rd3, %r11, 2;         // byte offset
+    add.u64         %rd4, %rd0, %rd3;      // &x[..., 2*pair]
+
+    // cos/sin offset: seq_pos * (D/2) + pair_idx
+    mul.lo.u32      %r13, %r9, %r5;        // seq_pos * D/2
+    add.u32         %r13, %r13, %r1;       // + pair_idx
+
+    mul.wide.u32    %rd5, %r13, 4;         // byte offset (f32 = 4 bytes)
+    add.u64         %rd6, %rd1, %rd5;      // &cos[seq, pair]
+    add.u64         %rd7, %rd2, %rd5;      // &sin[seq, pair]
+
+    // Load x[2i] and x[2i+1] together as a single packed b32 (two BF16 halves).
+    // This halves the number of global loads and improves coalescing.
+    ld.global.b32   %r14, [%rd4];
+    mov.b32         {%h0, %h1}, %r14;
+    CVT_BF16_F32(%f0, %h0)                 // x_even
+    CVT_BF16_F32(%f1, %h1)                 // x_odd
+
+    // Load cos and sin
+    ld.global.f32   %f2, [%rd6];           // cos_val
+    ld.global.f32   %f3, [%rd7];           // sin_val
+
+    // x_rot[2i]   = x_even * cos - x_odd * sin  (fma: x_even*cos - x_odd*sin)
+    mul.f32         %f5, %f1, %f3;
+    neg.f32         %f5, %f5;
+    fma.rn.f32      %f6, %f0, %f2, %f5;
+
+    // x_rot[2i+1] = x_even * sin + x_odd * cos  (fma: x_odd*cos + x_even*sin)
+    mul.f32         %f8, %f1, %f2;
+    fma.rn.f32      %f9, %f0, %f3, %f8;
+
+    // Store both as a single packed b32
+    CVT_F32_BF16(%h2, %f6)
+    CVT_F32_BF16(%h3, %f9)
+    mov.b32         %r15, {%h2, %h3};
+    st.global.b32   [%rd4], %r15;
+
+done:
+    ret;
+}

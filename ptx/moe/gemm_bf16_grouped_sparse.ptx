@@ -1,0 +1,240 @@
+// gemm_bf16_grouped_sparse.ptx
+//
+// Sparse variant of gemm_bf16_grouped: same compute, but expert_id is
+// indirected through `active_experts[ctaid.z]`. Grid z-dim is num_active
+// (count of non-empty experts), not num_experts.
+//
+// Input layout:
+//   A: [total_tokens, K] row-major BF16 (tokens pre-permuted by expert)
+//   B: [num_experts, K, N] row-major BF16 (one weight matrix per expert)
+//   C: [total_tokens, N] row-major BF16 (output, pre-permuted by expert)
+//   expert_offsets: [num_experts+1] u32
+//
+// Grid: (ceil(N / BN), ceil(max_M_per_expert / BM), num_experts)
+//   BM = 32 (rows per CTA), BN = 32 (cols per CTA)
+// Block: (BN, 1, 1) = 32 threads — one per output column.
+// Each thread computes BM output values (one per row) for its (expert, m_tile, n_tile).
+//
+// This is a straightforward scalar accumulation in FP32: correct but slow.
+// Use for validation; a pipelined MMA version can replace it later.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+#define BM 32
+#define BN 32
+
+.visible .entry gemm_bf16_grouped_sparse(
+    .param .u64 param_A,
+    .param .u64 param_B,
+    .param .u64 param_C,
+    .param .u64 param_expert_offsets,
+    .param .u64 param_active_experts,
+    .param .u32 param_N,
+    .param .u32 param_K
+)
+{
+    .reg .b32 %r<32>;
+    .reg .b64 %rd<18>;
+    .reg .f32 %f<40>;
+    .reg .b16 %h<2>;
+    .reg .pred %p<4>;
+
+    mov.u32         %r1, %ctaid.y;             // m_tile
+    mov.u32         %r2, %ctaid.x;             // n_tile
+    mov.u32         %r3, %tid.x;               // lane [0..31]
+
+    // Indirect: real_expert_id = active_experts[ctaid.z]
+    mov.u32         %r0, %ctaid.z;             // active_idx
+    ld.param.u64    %rd16, [param_active_experts];
+    mul.wide.u32    %rd17, %r0, 4;
+    add.u64         %rd17, %rd16, %rd17;
+    ld.global.u32   %r0, [%rd17];              // expert_id (real)
+
+    ld.param.u64    %rd0, [param_A];
+    ld.param.u64    %rd1, [param_B];
+    ld.param.u64    %rd2, [param_C];
+    ld.param.u64    %rd3, [param_expert_offsets];
+    ld.param.u32    %r4, [param_N];
+    ld.param.u32    %r5, [param_K];
+
+    // Load this expert's token range
+    mul.wide.u32    %rd4, %r0, 4;
+    add.u64         %rd5, %rd3, %rd4;
+    ld.global.u32   %r6, [%rd5];               // start_row
+    ld.global.u32   %r7, [%rd5 + 4];           // end_row
+    sub.u32         %r8, %r7, %r6;             // expert_tokens
+
+    // This CTA's M-tile range: rows [m_tile*BM, m_tile*BM + BM) within this expert
+    shl.b32         %r9, %r1, 5;               // m_tile * 32
+    // Early exit if entire tile is past expert
+    setp.ge.u32     %p0, %r9, %r8;
+    @%p0 bra        done;
+
+    // This thread's column: n_tile * BN + lane
+    shl.b32         %r10, %r2, 5;              // n_tile * 32
+    add.u32         %r10, %r10, %r3;           // + lane = n index within row
+    setp.ge.u32     %p1, %r10, %r4;
+    @%p1 bra        done;
+
+    // B base for this expert + this column: &B[expert*K*N + 0*N + n]
+    mul.lo.u32      %r11, %r5, %r4;            // K * N
+    mul.lo.u32      %r12, %r0, %r11;           // expert * K * N
+    add.u32         %r12, %r12, %r10;          // + n
+    mul.wide.u32    %rd6, %r12, 2;
+    add.u64         %rd7, %rd1, %rd6;          // &B[expert, 0, n]
+
+    // For each of BM rows in this tile, compute A[row, :] · B[:, n] in FP32.
+    // Unroll: hold 32 accumulators in %f0..%f31 for 32 rows.
+    mov.f32 %f0, 0.0;   mov.f32 %f1, 0.0;   mov.f32 %f2, 0.0;   mov.f32 %f3, 0.0;
+    mov.f32 %f4, 0.0;   mov.f32 %f5, 0.0;   mov.f32 %f6, 0.0;   mov.f32 %f7, 0.0;
+    mov.f32 %f8, 0.0;   mov.f32 %f9, 0.0;   mov.f32 %f10, 0.0;  mov.f32 %f11, 0.0;
+    mov.f32 %f12, 0.0;  mov.f32 %f13, 0.0;  mov.f32 %f14, 0.0;  mov.f32 %f15, 0.0;
+    mov.f32 %f16, 0.0;  mov.f32 %f17, 0.0;  mov.f32 %f18, 0.0;  mov.f32 %f19, 0.0;
+    mov.f32 %f20, 0.0;  mov.f32 %f21, 0.0;  mov.f32 %f22, 0.0;  mov.f32 %f23, 0.0;
+    mov.f32 %f24, 0.0;  mov.f32 %f25, 0.0;  mov.f32 %f26, 0.0;  mov.f32 %f27, 0.0;
+    mov.f32 %f28, 0.0;  mov.f32 %f29, 0.0;  mov.f32 %f30, 0.0;  mov.f32 %f31, 0.0;
+
+    // Global row start for this tile's first row in A (and C): start_row + m_tile*BM
+    add.u32         %r13, %r6, %r9;            // first_row_global
+
+    // A base for first_row: &A[first_row * K]
+    mul.lo.u32      %r14, %r13, %r5;
+    mul.wide.u32    %rd8, %r14, 2;
+    add.u64         %rd9, %rd0, %rd8;          // &A[first_row, 0]
+
+    // Loop over K: for each k, load A values for all 32 rows (if in range),
+    //              load B[k, n], FMA into accumulators.
+    mov.u32         %r15, 0;                   // k
+
+// Compute actual number of valid rows in this tile
+    sub.u32         %r16, %r8, %r9;            // expert_tokens - m_tile*BM
+    min.u32         %r16, %r16, 32;            // clamp to BM=32
+
+k_loop:
+    setp.ge.u32     %p2, %r15, %r5;
+    @%p2 bra        k_done;
+
+    // Load B[k, n] (one bf16 value)
+    mul.lo.u32      %r17, %r15, %r4;           // k * N
+    mul.wide.u32    %rd10, %r17, 2;
+    add.u64         %rd11, %rd7, %rd10;
+    ld.global.b16   %h0, [%rd11];
+    CVT_BF16_F32(%f32, %h0)                    // b_val
+
+    // For each of up to BM rows, load A[first_row+r, k] and FMA
+    // We unroll by manual loop (r = 0..31)
+    // Each A load: addr = &A[first_row,0] + r*K*2 + k*2
+    mul.wide.u32    %rd12, %r15, 2;            // k * 2 (byte offset)
+
+#define ACCUM_ROW(idx, acc) \
+    { .reg .pred _in; \
+      .reg .b16 _a; \
+      .reg .f32 _af; \
+      .reg .b64 _p; \
+      .reg .b32 _rowoff; \
+      setp.lt.u32 _in, idx, %r16; \
+      mul.lo.u32 _rowoff, idx, %r5; \
+      add.u32 _rowoff, _rowoff, %r15; \
+      mul.wide.u32 _p, _rowoff, 2; \
+      add.u64 _p, %rd9, _p; \
+      mov.b16 _a, 0; \
+      @_in ld.global.b16 _a, [_p]; \
+      CVT_BF16_F32(_af, _a) \
+      @_in fma.rn.f32 acc, _af, %f32, acc; \
+    }
+
+    ACCUM_ROW(0,  %f0)
+    ACCUM_ROW(1,  %f1)
+    ACCUM_ROW(2,  %f2)
+    ACCUM_ROW(3,  %f3)
+    ACCUM_ROW(4,  %f4)
+    ACCUM_ROW(5,  %f5)
+    ACCUM_ROW(6,  %f6)
+    ACCUM_ROW(7,  %f7)
+    ACCUM_ROW(8,  %f8)
+    ACCUM_ROW(9,  %f9)
+    ACCUM_ROW(10, %f10)
+    ACCUM_ROW(11, %f11)
+    ACCUM_ROW(12, %f12)
+    ACCUM_ROW(13, %f13)
+    ACCUM_ROW(14, %f14)
+    ACCUM_ROW(15, %f15)
+    ACCUM_ROW(16, %f16)
+    ACCUM_ROW(17, %f17)
+    ACCUM_ROW(18, %f18)
+    ACCUM_ROW(19, %f19)
+    ACCUM_ROW(20, %f20)
+    ACCUM_ROW(21, %f21)
+    ACCUM_ROW(22, %f22)
+    ACCUM_ROW(23, %f23)
+    ACCUM_ROW(24, %f24)
+    ACCUM_ROW(25, %f25)
+    ACCUM_ROW(26, %f26)
+    ACCUM_ROW(27, %f27)
+    ACCUM_ROW(28, %f28)
+    ACCUM_ROW(29, %f29)
+    ACCUM_ROW(30, %f30)
+    ACCUM_ROW(31, %f31)
+
+    add.u32         %r15, %r15, 1;
+    bra             k_loop;
+
+k_done:
+    // Store C[first_row+r, n] = accumulator[r] for each in-range row
+    // C row offset: (first_row + r) * N + n
+#define STORE_ROW(idx, acc) \
+    { .reg .pred _in; \
+      .reg .b16 _bv; \
+      .reg .b64 _p; \
+      .reg .b32 _rowoff; \
+      setp.lt.u32 _in, idx, %r16; \
+      @_in cvt.rn.bf16.f32 _bv, acc; \
+      add.u32 _rowoff, %r13, idx; \
+      mul.lo.u32 _rowoff, _rowoff, %r4; \
+      add.u32 _rowoff, _rowoff, %r10; \
+      mul.wide.u32 _p, _rowoff, 2; \
+      add.u64 _p, %rd2, _p; \
+      @_in st.global.b16 [_p], _bv; \
+    }
+
+    STORE_ROW(0,  %f0)
+    STORE_ROW(1,  %f1)
+    STORE_ROW(2,  %f2)
+    STORE_ROW(3,  %f3)
+    STORE_ROW(4,  %f4)
+    STORE_ROW(5,  %f5)
+    STORE_ROW(6,  %f6)
+    STORE_ROW(7,  %f7)
+    STORE_ROW(8,  %f8)
+    STORE_ROW(9,  %f9)
+    STORE_ROW(10, %f10)
+    STORE_ROW(11, %f11)
+    STORE_ROW(12, %f12)
+    STORE_ROW(13, %f13)
+    STORE_ROW(14, %f14)
+    STORE_ROW(15, %f15)
+    STORE_ROW(16, %f16)
+    STORE_ROW(17, %f17)
+    STORE_ROW(18, %f18)
+    STORE_ROW(19, %f19)
+    STORE_ROW(20, %f20)
+    STORE_ROW(21, %f21)
+    STORE_ROW(22, %f22)
+    STORE_ROW(23, %f23)
+    STORE_ROW(24, %f24)
+    STORE_ROW(25, %f25)
+    STORE_ROW(26, %f26)
+    STORE_ROW(27, %f27)
+    STORE_ROW(28, %f28)
+    STORE_ROW(29, %f29)
+    STORE_ROW(30, %f30)
+    STORE_ROW(31, %f31)
+
+done:
+    ret;
+}

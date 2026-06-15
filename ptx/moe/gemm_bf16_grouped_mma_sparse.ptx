@@ -1,0 +1,310 @@
+// gemm_bf16_grouped_mma_sparse.ptx
+//
+// Sparse variant of gemm_bf16_grouped_mma. Compute body identical, but the
+// per-CTA expert_id is indirected through an `active_experts` table:
+//   real_expert_id = active_experts[ctaid.z]
+// Grid z-dim is `num_active` (count of experts with tokens this batch), not
+// `num_experts`. Lets MoE at batch=1 / top_k<<num_experts skip the hundreds
+// of empty-expert CTAs that would otherwise launch + early-bail.
+//
+// Layout (unchanged from dense variant):
+//   A: [total_tokens, K] BF16 row-major, tokens pre-permuted by expert
+//   B: [num_experts, K, N] BF16 row-major
+//   C: [total_tokens, N] BF16 row-major
+//   expert_offsets: [num_experts+1] u32 (full table; looked up by real_expert_id)
+//   active_experts: [num_active] u32 (compact list of non-empty expert ids)
+//
+// Grid: (ceil(N / 32), ceil(max_tokens_per_expert / 32), num_active)
+// Block: (32, 1, 1) — 1 warp.
+//
+// Tile: 32x32. K-block: 16 (BF16 m16n8k16). 8 MMAs per K-iter
+//   (2 m-groups x 4 n-groups), 32 FP32 accumulators per thread.
+//
+// Requires N divisible by 32 and K divisible by 16. M (per-expert token count)
+// can be arbitrary — out-of-bounds rows are masked by a per-tile bound check.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+#include "mma.ptxh"
+
+.visible .entry gemm_bf16_grouped_mma_sparse(
+    .param .u64 param_A,
+    .param .u64 param_B,
+    .param .u64 param_C,
+    .param .u64 param_expert_offsets,
+    .param .u64 param_active_experts,
+    .param .u32 param_N,
+    .param .u32 param_K
+)
+{
+    .reg .b32  %r<90>;
+    .reg .b64  %rd<14>;
+    .reg .f32  %f<33>;
+    .reg .b16  %h<3>;
+    .reg .pred %p<8>;
+
+    // SMEM: A tile 32x16 = 1024 B, B tile 16x32 = 1024 B → 2048 B total.
+    .shared .align 128 .b8 smem[2048];
+
+    mov.u32         %r40, %tid.x;                // lane [0..31]
+    mov.u32         %r41, %ctaid.x;              // n_tile
+    mov.u32         %r42, %ctaid.y;              // m_tile
+
+    // Indirect: real_expert_id = active_experts[ctaid.z]
+    mov.u32         %r43, %ctaid.z;              // active_idx
+    ld.param.u64    %rd11, [param_active_experts];
+    mul.wide.u32    %rd12, %r43, 4;
+    add.u64         %rd13, %rd11, %rd12;
+    ld.global.u32   %r43, [%rd13];               // expert_id (real)
+
+    ld.param.u64    %rd0, [param_A];
+    ld.param.u64    %rd1, [param_B];
+    ld.param.u64    %rd2, [param_C];
+    ld.param.u64    %rd3, [param_expert_offsets];
+    ld.param.u32    %r44, [param_N];
+    ld.param.u32    %r45, [param_K];
+
+    // Expert token range.
+    mul.wide.u32    %rd4, %r43, 4;
+    add.u64         %rd5, %rd3, %rd4;
+    ld.global.u32   %r46, [%rd5];                // start_row
+    ld.global.u32   %r47, [%rd5 + 4];            // end_row
+    sub.u32         %r48, %r47, %r46;            // expert_tokens
+
+    shl.b32         %r49, %r42, 5;               // m_tile * 32
+    setp.ge.u32     %p0, %r49, %r48;
+    @%p0 ret;
+
+    shl.b32         %r50, %r41, 5;               // n_tile * 32 = n_off
+    setp.ge.u32     %p1, %r50, %r44;
+    @%p1 ret;
+
+    // Row range in global A for this tile.
+    add.u32         %r51, %r46, %r49;            // first_row = start_row + m_tile*32
+    // Rows actually valid in this tile: min(32, expert_tokens - m_tile*32)
+    sub.u32         %r52, %r48, %r49;            // expert_tokens - m_tile*32
+    min.u32         %r52, %r52, 32;              // row_count (1..32)
+
+    // === A global base for this tile ===
+    // &A[first_row, 0]
+    mul.lo.u32      %r53, %r51, %r45;
+    mul.wide.u32    %rd6, %r53, 2;
+    add.u64         %rd6, %rd0, %rd6;            // &A[first_row, 0]
+
+    // === B global base for (expert, 0, n_off) ===
+    // B layout: [num_experts, K, N] row-major.
+    // &B[expert, 0, n_off] = B + (expert*K + 0)*N + n_off
+    mul.lo.u32      %r54, %r44, %r45;            // N*K
+    mul.lo.u32      %r55, %r43, %r54;            // expert*K*N
+    add.u32         %r55, %r55, %r50;            // + n_off
+    mul.wide.u32    %rd7, %r55, 2;
+    add.u64         %rd7, %rd1, %rd7;            // &B[expert, 0, n_off]
+
+    // Initialize 32 FP32 accumulators.
+    mov.f32 %f0, 0.0;  mov.f32 %f1, 0.0;  mov.f32 %f2, 0.0;  mov.f32 %f3, 0.0;
+    mov.f32 %f4, 0.0;  mov.f32 %f5, 0.0;  mov.f32 %f6, 0.0;  mov.f32 %f7, 0.0;
+    mov.f32 %f8, 0.0;  mov.f32 %f9, 0.0;  mov.f32 %f10, 0.0; mov.f32 %f11, 0.0;
+    mov.f32 %f12, 0.0; mov.f32 %f13, 0.0; mov.f32 %f14, 0.0; mov.f32 %f15, 0.0;
+    mov.f32 %f16, 0.0; mov.f32 %f17, 0.0; mov.f32 %f18, 0.0; mov.f32 %f19, 0.0;
+    mov.f32 %f20, 0.0; mov.f32 %f21, 0.0; mov.f32 %f22, 0.0; mov.f32 %f23, 0.0;
+    mov.f32 %f24, 0.0; mov.f32 %f25, 0.0; mov.f32 %f26, 0.0; mov.f32 %f27, 0.0;
+    mov.f32 %f28, 0.0; mov.f32 %f29, 0.0; mov.f32 %f30, 0.0; mov.f32 %f31, 0.0;
+
+    // === Precompute SMEM addresses for ldmatrix ===
+    mov.u32         %r57, smem;                  // smem_A base
+    add.u32         %r58, %r57, 1024;            // smem_B base
+
+    // A ldmatrix: 32 rows × 16 cols × 2B → row stride 32 bytes.
+    // ldmatrix.x4: lane < 16 → row lane, col 0..7 (16 B/row offset 0);
+    //              lane >=16 → row lane-16, col 8..15 (offset 16).
+    setp.lt.u32     %p2, %r40, 16;
+    @%p2 mul.lo.u32 %r59, %r40, 32;
+    @!%p2 sub.u32   %r59, %r40, 16;
+    @!%p2 mad.lo.u32 %r59, %r59, 32, 16;
+    add.u32         %r60, %r57, %r59;            // ldm_a_mg0
+    add.u32         %r61, %r60, 512;             // ldm_a_mg1 (+ 16*32)
+
+    // B ldmatrix.x2.trans: 16 rows × 32 cols × 2B → row stride 64 bytes.
+    // For n-group ng (0..3, 8 cols each):
+    //   ldm_b_addr = smem_B + (lane%16)*64 + ng*16
+    and.b32         %r62, %r40, 15;              // lane % 16
+    shl.b32         %r62, %r62, 6;               // *64
+    add.u32         %r63, %r58, %r62;            // ldm_b_base (ng=0)
+
+    // Store addresses — MMA m16n8k16 output layout:
+    //   groupID = lane / 4 (0..7), tidInGroup = lane % 4 (0..3)
+    //   d0 @ (row = mg*16 + groupID,      col = ng*8 + tidInGroup*2)
+    //   d1 @ (row = mg*16 + groupID,      col = ng*8 + tidInGroup*2 + 1)
+    //   d2 @ (row = mg*16 + groupID + 8,  col = ng*8 + tidInGroup*2)
+    //   d3 @ (row = mg*16 + groupID + 8,  col = ng*8 + tidInGroup*2 + 1)
+    shr.b32         %r64, %r40, 2;               // groupID
+    and.b32         %r65, %r40, 3;               // tidInGroup
+    shl.b32         %r66, %r65, 1;               // tidInGroup*2
+
+    // ==================== K LOOP ====================
+    mov.u32         %r70, 0;                     // k
+k_loop:
+    setp.ge.u32     %p3, %r70, %r45;
+    @%p3 bra        k_done;
+
+    // === Load A tile: 32 rows × 16 cols ===
+    // Each of 32 threads loads one row. Row = lane. Bytes per row = 32.
+    // Load 2 b16x8 chunks per thread: actually 32 bytes fits in one v4.b32.
+    //   A[first_row + lane, k..k+15]
+    add.u32         %r71, %r51, %r40;            // row_global = first_row + lane
+    setp.lt.u32     %p4, %r71, %r47;             // within expert end_row?
+    // Use row_count clamp (already set)
+    setp.lt.u32     %p4, %r40, %r52;             // lane < row_count
+
+    mul.lo.u32      %r72, %r71, %r45;            // row_global * K
+    add.u32         %r72, %r72, %r70;            // + k
+    mul.wide.u32    %rd8, %r72, 2;
+    add.u64         %rd8, %rd0, %rd8;            // &A[row_global, k]
+
+    mul.lo.u32      %r73, %r40, 32;
+    add.u32         %r73, %r57, %r73;            // smem_A + lane*32
+
+    // Load 32 bytes (16 bf16): 2 × v4.b32.
+    .reg .b32 _a0a, _a1a, _a2a, _a3a, _a0b, _a1b, _a2b, _a3b;
+    @%p4 ld.global.v4.b32 {_a0a, _a1a, _a2a, _a3a}, [%rd8];
+    @%p4 ld.global.v4.b32 {_a0b, _a1b, _a2b, _a3b}, [%rd8 + 16];
+    @!%p4 mov.b32   _a0a, 0;
+    @!%p4 mov.b32   _a1a, 0;
+    @!%p4 mov.b32   _a2a, 0;
+    @!%p4 mov.b32   _a3a, 0;
+    @!%p4 mov.b32   _a0b, 0;
+    @!%p4 mov.b32   _a1b, 0;
+    @!%p4 mov.b32   _a2b, 0;
+    @!%p4 mov.b32   _a3b, 0;
+    st.shared.v4.b32 [%r73],      {_a0a, _a1a, _a2a, _a3a};
+    st.shared.v4.b32 [%r73 + 16], {_a0b, _a1b, _a2b, _a3b};
+
+    // === Load B tile: 16 K-rows × 32 N-cols ===
+    // B layout [num_experts, K, N] — per K row, 32 N-cols are contiguous.
+    // Thread assignment: 32 threads × 32 B (16 bf16) = 1024 B.
+    //   Two threads per K-row: k_row = lane / 2, n_chunk = lane % 2.
+    //   Each loads 16 BF16 (32 B) starting at (k_row, n_chunk*16).
+    shr.b32         %r74, %r40, 1;               // k_row_in_tile = lane / 2
+    and.b32         %r75, %r40, 1;               // n_chunk (0 or 1)
+    shl.b32         %r76, %r75, 5;               // n_chunk * 32 (bytes)
+
+    // Global source: &B[expert, k + k_row, n_off + n_chunk*16]
+    // = %rd7 + (k + k_row)*N*2 + n_chunk*32
+    add.u32         %r77, %r70, %r74;            // k + k_row
+    mul.lo.u32      %r78, %r77, %r44;            // * N
+    mul.wide.u32    %rd9, %r78, 2;               // * 2 bytes
+    add.u64         %rd9, %rd7, %rd9;
+    cvt.u64.u32     %rd10, %r76;
+    add.u64         %rd9, %rd9, %rd10;           // + n_chunk offset
+
+    // Bound: is this row's slice within N? n_off + n_chunk*16 + 16 ≤ N?
+    // Conservative: check n_off + n_chunk*16 < N.
+    add.u32         %r84, %r50, %r76;            // Note: %r76 is bytes — convert to elems
+    shr.b32         %r84, %r76, 1;               // n_chunk*16 (elems)
+    add.u32         %r84, %r50, %r84;            // n_off + n_chunk*16
+    setp.lt.u32     %p5, %r84, %r44;
+
+    // SMEM dst: smem_B + k_row*64 + n_chunk*32
+    shl.b32         %r85, %r74, 6;               // k_row*64
+    add.u32         %r85, %r85, %r76;            // + n_chunk*32
+    add.u32         %r85, %r58, %r85;
+
+    // 32-byte load: 2 × v4.b32 = 16 bf16 per thread.
+    .reg .b32 _b0a, _b1a, _b2a, _b3a, _b0b, _b1b, _b2b, _b3b;
+    @%p5 ld.global.v4.b32 {_b0a, _b1a, _b2a, _b3a}, [%rd9];
+    @%p5 ld.global.v4.b32 {_b0b, _b1b, _b2b, _b3b}, [%rd9 + 16];
+    @!%p5 mov.b32   _b0a, 0;
+    @!%p5 mov.b32   _b1a, 0;
+    @!%p5 mov.b32   _b2a, 0;
+    @!%p5 mov.b32   _b3a, 0;
+    @!%p5 mov.b32   _b0b, 0;
+    @!%p5 mov.b32   _b1b, 0;
+    @!%p5 mov.b32   _b2b, 0;
+    @!%p5 mov.b32   _b3b, 0;
+    st.shared.v4.b32 [%r85],      {_b0a, _b1a, _b2a, _b3a};
+    st.shared.v4.b32 [%r85 + 16], {_b0b, _b1b, _b2b, _b3b};
+
+    bar.sync        0;
+
+    // === A ldmatrix: 2 m-groups ===
+    .reg .b32 %rA0, %rA1, %rA2, %rA3, %rA4, %rA5, %rA6, %rA7;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%rA0, %rA1, %rA2, %rA3}, [%r60];
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%rA4, %rA5, %rA6, %rA7}, [%r61];
+
+    // === For each n-group, load B fragment and do 2 MMAs ===
+    .reg .b32 %rB0, %rB1;
+    // ng=0
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%rB0, %rB1}, [%r63];
+    MMA_BF16_M16N8K16(%f0,  %f1,  %f2,  %f3,  %rA0, %rA1, %rA2, %rA3, %rB0, %rB1)
+    MMA_BF16_M16N8K16(%f16, %f17, %f18, %f19, %rA4, %rA5, %rA6, %rA7, %rB0, %rB1)
+    // ng=1
+    add.u32         %r88, %r63, 16;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%rB0, %rB1}, [%r88];
+    MMA_BF16_M16N8K16(%f4,  %f5,  %f6,  %f7,  %rA0, %rA1, %rA2, %rA3, %rB0, %rB1)
+    MMA_BF16_M16N8K16(%f20, %f21, %f22, %f23, %rA4, %rA5, %rA6, %rA7, %rB0, %rB1)
+    // ng=2
+    add.u32         %r88, %r63, 32;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%rB0, %rB1}, [%r88];
+    MMA_BF16_M16N8K16(%f8,  %f9,  %f10, %f11, %rA0, %rA1, %rA2, %rA3, %rB0, %rB1)
+    MMA_BF16_M16N8K16(%f24, %f25, %f26, %f27, %rA4, %rA5, %rA6, %rA7, %rB0, %rB1)
+    // ng=3
+    add.u32         %r88, %r63, 48;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%rB0, %rB1}, [%r88];
+    MMA_BF16_M16N8K16(%f12, %f13, %f14, %f15, %rA0, %rA1, %rA2, %rA3, %rB0, %rB1)
+    MMA_BF16_M16N8K16(%f28, %f29, %f30, %f31, %rA4, %rA5, %rA6, %rA7, %rB0, %rB1)
+
+    bar.sync        0;
+    add.u32         %r70, %r70, 16;
+    bra             k_loop;
+
+k_done:
+    // === Store 32×32 tile back to C[start_row + m_tile*32, n_off] ===
+    // Per-thread outputs: 4 FP32 per (mg, ng). We emit 8 (mg,ng) tiles.
+#define STORE_TILE(mg, ng, d0, d1, d2, d3) \
+    { .reg .b32 _row, _col, _off; \
+      .reg .b64 _p; \
+      .reg .b16 _b0, _b1; \
+      .reg .b32 _pk; \
+      .reg .pred _rin; \
+      add.u32 _row, %r51, 0; \
+      add.u32 _row, _row, mg*16; \
+      add.u32 _row, _row, %r64;       /* + groupID */ \
+      add.u32 _col, %r50, ng*8; \
+      add.u32 _col, _col, %r66;       /* + tidInGroup*2 */ \
+      /* guard row < end_row */ \
+      setp.lt.u32 _rin, _row, %r47; \
+      mul.lo.u32 _off, _row, %r44; \
+      add.u32 _off, _off, _col; \
+      mul.wide.u32 _p, _off, 2; \
+      add.u64 _p, %rd2, _p; \
+      CVT_F32_BF16(_b0, d0) \
+      CVT_F32_BF16(_b1, d1) \
+      mov.b32 _pk, {_b0, _b1}; \
+      @_rin st.global.b32 [_p], _pk; \
+      /* d2/d3 at row+8 */ \
+      add.u32 _row, _row, 8; \
+      setp.lt.u32 _rin, _row, %r47; \
+      mul.lo.u32 _off, _row, %r44; \
+      add.u32 _off, _off, _col; \
+      mul.wide.u32 _p, _off, 2; \
+      add.u64 _p, %rd2, _p; \
+      CVT_F32_BF16(_b0, d2) \
+      CVT_F32_BF16(_b1, d3) \
+      mov.b32 _pk, {_b0, _b1}; \
+      @_rin st.global.b32 [_p], _pk; \
+    }
+    STORE_TILE(0, 0, %f0,  %f1,  %f2,  %f3)
+    STORE_TILE(0, 1, %f4,  %f5,  %f6,  %f7)
+    STORE_TILE(0, 2, %f8,  %f9,  %f10, %f11)
+    STORE_TILE(0, 3, %f12, %f13, %f14, %f15)
+    STORE_TILE(1, 0, %f16, %f17, %f18, %f19)
+    STORE_TILE(1, 1, %f20, %f21, %f22, %f23)
+    STORE_TILE(1, 2, %f24, %f25, %f26, %f27)
+    STORE_TILE(1, 3, %f28, %f29, %f30, %f31)
+
+    ret;
+}

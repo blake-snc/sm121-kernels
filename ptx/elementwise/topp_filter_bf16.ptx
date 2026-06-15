@@ -1,0 +1,337 @@
+// topp_filter_bf16.ptx
+//
+// Top-p (nucleus) filtering for sampling distributions.
+//   Given probabilities p[0..vocab), keep the smallest set of indices with
+//   cumulative probability >= p_thresh, zero out the rest, renormalize.
+//
+// Algorithm (threshold binary search, no sorting):
+//   1. log2-scale the probability range and iterate. At each step, a trial
+//      threshold tau defines the kept set {i : probs[i] >= tau}. Reduce
+//      over the CTA to get (count, sum_kept).
+//   2. Adjust tau: increase if sum_kept > p_thresh (too lenient), decrease
+//      otherwise. Stop when the smallest kept value gives sum_kept just
+//      above p_thresh, or after a fixed number of iterations (20 is enough
+//      for single-precision convergence).
+//   3. Final pass: out[i] = probs[i] / sum_kept if probs[i] >= tau else 0.
+//
+// Grid: (num_rows, 1, 1), one CTA per row.
+// Block: (256, 1, 1). Vectorized v2.b32 I/O.
+//
+// Input probs must already be a valid probability distribution (sum = 1).
+// If sum_kept is near zero (degenerate input), the kernel falls back to
+// identity output (i.e., keeps all probs).
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "reduction.ptxh"
+#include "convert.ptxh"
+
+// Layout (256 threads → 8 warps):
+//   [0..32)  : 8 f32 partial-sum slots for cross-warp reduction
+//   [32..36) : broadcast tau
+//   [36..40) : broadcast sum_kept
+// Pad to 128 bytes.
+.shared .align 128 .b8 smem_reduce[128];
+
+.visible .entry topp_filter_bf16(
+    .param .u64 param_probs,    // input: [num_rows, vocab] bf16 probabilities
+    .param .u64 param_out,      // output: [num_rows, vocab] bf16 filtered probs
+    .param .u32 param_vocab,
+    .param .f32 param_p_thresh  // top-p threshold in [0, 1]
+)
+{
+    .reg .b32 %r<36>;
+    .reg .b64 %rd<20>;
+    .reg .f32 %f<24>;
+    .reg .b16 %h<8>;
+    .reg .pred %p<8>;
+
+    mov.u32         %r0, BLOCK_ID_X;
+    mov.u32         %r1, THREAD_ID;
+
+    ld.param.u64    %rd0, [param_probs];
+    ld.param.u64    %rd1, [param_out];
+    ld.param.u32    %r2, [param_vocab];
+    ld.param.f32    %f0, [param_p_thresh];
+
+    mul.lo.u32      %r3, %r0, %r2;
+    mul.wide.u32    %rd3, %r3, 2;
+    add.u64         %rd4, %rd0, %rd3;        // &probs[row, 0]
+    add.u64         %rd5, %rd1, %rd3;        // &out[row, 0]
+
+    mov.u32         %r4, %ntid.x;
+    shl.b32         %r20, %r4, 2;
+    sub.u32         %r21, %r20, 1;
+    not.b32         %r21, %r21;
+    and.b32         %r22, %r2, %r21;
+
+    WARP_ID(%r6, %r1)
+    LANE_ID(%r7, %r1)
+    shr.u32         %r8, %r4, 5;             // num_warps
+
+    // ============ Binary-search loop for threshold tau ============
+    // Initial bounds: tau_lo = 0, tau_hi = 1 (covers full prob range).
+    // Invariant: there exists tau* ∈ [tau_lo, tau_hi] such that
+    //   sum(probs >= tau*) ≈ p_thresh
+    mov.f32         %f1, 0f00000000;         // tau_lo
+    mov.f32         %f2, 0f3F800000;         // tau_hi = 1.0
+
+    // Broadcast init once (lane 0 / warp 0 writes initial values)
+    // Shared slot offsets: partials [0..32), tau at [32..36), sum at [36..40).
+    mov.u32         %r30, 32;                // offset = 32
+    mov.u32         %r31, 36;                // offset = 36
+
+    // 20 iterations of bisection → ~6 decimal digits of precision.
+    mov.u32         %r32, 0;                 // iter
+
+bs_loop:
+    setp.ge.u32     %p0, %r32, 20;
+    @%p0 bra        bs_done;
+
+    // tau = (tau_lo + tau_hi) / 2
+    add.f32         %f3, %f1, %f2;
+    mul.f32         %f3, %f3, 0f3F000000;    // * 0.5
+
+    // Each thread sums probs[i] where probs[i] >= tau
+    mov.f32         %f4, 0.0;                // local sum
+    shl.b32         %r5, %r1, 2;
+
+bs_vec:
+    setp.ge.u32     %p1, %r5, %r22;
+    @%p1 bra        bs_vec_done;
+    mul.wide.u32    %rd6, %r5, 2;
+    add.u64         %rd7, %rd4, %rd6;
+    ld.global.v2.b32 {%r10, %r11}, [%rd7];
+    mov.b32         {%h0, %h1}, %r10;
+    mov.b32         {%h2, %h3}, %r11;
+    CVT_BF16_F32(%f5, %h0)
+    CVT_BF16_F32(%f6, %h1)
+    CVT_BF16_F32(%f7, %h2)
+    CVT_BF16_F32(%f8, %h3)
+    setp.ge.f32     %p2, %f5, %f3; @%p2 add.f32 %f4, %f4, %f5;
+    setp.ge.f32     %p2, %f6, %f3; @%p2 add.f32 %f4, %f4, %f6;
+    setp.ge.f32     %p2, %f7, %f3; @%p2 add.f32 %f4, %f4, %f7;
+    setp.ge.f32     %p2, %f8, %f3; @%p2 add.f32 %f4, %f4, %f8;
+    add.u32         %r5, %r5, %r20;
+    bra             bs_vec;
+
+bs_vec_done:
+    // Scalar tail
+    add.u32         %r5, %r22, %r1;
+bs_tail:
+    setp.ge.u32     %p1, %r5, %r2;
+    @%p1 bra        bs_reduce;
+    mul.wide.u32    %rd6, %r5, 2;
+    add.u64         %rd7, %rd4, %rd6;
+    ld.global.b16   %h0, [%rd7];
+    CVT_BF16_F32(%f5, %h0)
+    setp.ge.f32     %p2, %f5, %f3; @%p2 add.f32 %f4, %f4, %f5;
+    add.u32         %r5, %r5, %r4;
+    bra             bs_tail;
+
+bs_reduce:
+    WARP_REDUCE_SUM_F32(%f4, %f9)
+    setp.eq.u32     %p3, %r7, 0;
+    @%p3 bra        bs_ws;
+    bra             bs_skip;
+bs_ws:
+    mul.wide.u32    %rd10, %r6, 4;
+    mov.u64         %rd11, smem_reduce;
+    add.u64         %rd12, %rd11, %rd10;
+    st.shared.f32   [%rd12], %f4;
+bs_skip:
+    bar.sync        0;
+
+    // Warp 0 reduces cross-warp partials
+    setp.lt.u32     %p4, %r6, 1;
+    @%p4 bra        bs_w0;
+    bra             bs_bcast_read;
+
+bs_w0:
+    setp.lt.u32     %p5, %r7, %r8;
+    @%p5 bra        bs_load;
+    mov.f32         %f4, 0.0;
+    bra             bs_final;
+bs_load:
+    mul.wide.u32    %rd10, %r7, 4;
+    mov.u64         %rd11, smem_reduce;
+    add.u64         %rd12, %rd11, %rd10;
+    ld.shared.f32   %f4, [%rd12];
+bs_final:
+    WARP_REDUCE_SUM_F32(%f4, %f9)
+    setp.eq.u32     %p3, %r7, 0;
+    @%p3 bra        bs_commit;
+    bra             bs_bcast_read;
+bs_commit:
+    // Lane 0 / warp 0: adjust tau_lo / tau_hi based on sum_kept vs p_thresh,
+    // store tau and sum for broadcast.
+    mov.u64         %rd11, smem_reduce;
+    add.u64         %rd13, %rd11, 32;
+    st.shared.f32   [%rd13], %f3;            // tau (current trial)
+    add.u64         %rd13, %rd11, 36;
+    st.shared.f32   [%rd13], %f4;            // sum_kept
+
+bs_bcast_read:
+    bar.sync        0;
+    // All threads read sum_kept to decide the next interval
+    mov.u64         %rd11, smem_reduce;
+    add.u64         %rd13, %rd11, 36;
+    ld.shared.f32   %f10, [%rd13];           // sum_kept broadcast
+
+    // If sum_kept < p_thresh → tau too high → move tau_hi down
+    // Else → sum_kept >= p_thresh → tau low enough → record (use as lo) and raise lo
+    setp.lt.f32     %p6, %f10, %f0;
+    @%p6 mov.f32    %f2, %f3;                // tau_hi = tau
+    @!%p6 mov.f32   %f1, %f3;                // tau_lo = tau
+
+    add.u32         %r32, %r32, 1;
+    bra             bs_loop;
+
+bs_done:
+    // Final threshold: use tau_lo (largest tau with sum >= p_thresh).
+    mov.f32         %f11, %f1;
+
+    // Recompute sum_kept at final threshold (for renormalization).
+    mov.f32         %f4, 0.0;
+    shl.b32         %r5, %r1, 2;
+
+fs_vec:
+    setp.ge.u32     %p1, %r5, %r22;
+    @%p1 bra        fs_vec_done;
+    mul.wide.u32    %rd6, %r5, 2;
+    add.u64         %rd7, %rd4, %rd6;
+    ld.global.v2.b32 {%r10, %r11}, [%rd7];
+    mov.b32         {%h0, %h1}, %r10;
+    mov.b32         {%h2, %h3}, %r11;
+    CVT_BF16_F32(%f5, %h0)
+    CVT_BF16_F32(%f6, %h1)
+    CVT_BF16_F32(%f7, %h2)
+    CVT_BF16_F32(%f8, %h3)
+    setp.ge.f32     %p2, %f5, %f11; @%p2 add.f32 %f4, %f4, %f5;
+    setp.ge.f32     %p2, %f6, %f11; @%p2 add.f32 %f4, %f4, %f6;
+    setp.ge.f32     %p2, %f7, %f11; @%p2 add.f32 %f4, %f4, %f7;
+    setp.ge.f32     %p2, %f8, %f11; @%p2 add.f32 %f4, %f4, %f8;
+    add.u32         %r5, %r5, %r20;
+    bra             fs_vec;
+
+fs_vec_done:
+    add.u32         %r5, %r22, %r1;
+fs_tail:
+    setp.ge.u32     %p1, %r5, %r2;
+    @%p1 bra        fs_red;
+    mul.wide.u32    %rd6, %r5, 2;
+    add.u64         %rd7, %rd4, %rd6;
+    ld.global.b16   %h0, [%rd7];
+    CVT_BF16_F32(%f5, %h0)
+    setp.ge.f32     %p2, %f5, %f11; @%p2 add.f32 %f4, %f4, %f5;
+    add.u32         %r5, %r5, %r4;
+    bra             fs_tail;
+
+fs_red:
+    WARP_REDUCE_SUM_F32(%f4, %f9)
+    setp.eq.u32     %p3, %r7, 0;
+    @%p3 bra        fs_ws;
+    bra             fs_skip;
+fs_ws:
+    mul.wide.u32    %rd10, %r6, 4;
+    mov.u64         %rd11, smem_reduce;
+    add.u64         %rd12, %rd11, %rd10;
+    st.shared.f32   [%rd12], %f4;
+fs_skip:
+    bar.sync        0;
+
+    setp.lt.u32     %p4, %r6, 1;
+    @%p4 bra        fs_w0;
+    bra             fs_bcast;
+fs_w0:
+    setp.lt.u32     %p5, %r7, %r8;
+    @%p5 bra        fs_l;
+    mov.f32         %f4, 0.0;
+    bra             fs_final;
+fs_l:
+    mul.wide.u32    %rd10, %r7, 4;
+    mov.u64         %rd11, smem_reduce;
+    add.u64         %rd12, %rd11, %rd10;
+    ld.shared.f32   %f4, [%rd12];
+fs_final:
+    WARP_REDUCE_SUM_F32(%f4, %f9)
+    setp.eq.u32     %p3, %r7, 0;
+    @%p3 bra        fs_commit;
+    bra             fs_bcast;
+fs_commit:
+    // Broadcast inv_sum (fall back to 1.0 if sum is vanishingly small).
+    mov.f32         %f12, 0f3F800000;        // 1.0
+    setp.gt.f32     %p6, %f4, 0f3727C5AC;    // > 1e-5
+    @%p6 rcp.approx.f32 %f12, %f4;
+    mov.u64         %rd11, smem_reduce;
+    add.u64         %rd13, %rd11, 36;
+    st.shared.f32   [%rd13], %f12;
+
+fs_bcast:
+    bar.sync        0;
+    mov.u64         %rd11, smem_reduce;
+    add.u64         %rd13, %rd11, 36;
+    ld.shared.f32   %f12, [%rd13];           // inv_sum_kept
+
+    // ============ Final pass: write filtered+renormalized probs ============
+    shl.b32         %r5, %r1, 2;
+
+w_vec:
+    setp.ge.u32     %p1, %r5, %r22;
+    @%p1 bra        w_done;
+    mul.wide.u32    %rd6, %r5, 2;
+    add.u64         %rd7, %rd4, %rd6;
+    add.u64         %rd14, %rd5, %rd6;
+    ld.global.v2.b32 {%r10, %r11}, [%rd7];
+    mov.b32         {%h0, %h1}, %r10;
+    mov.b32         {%h2, %h3}, %r11;
+    CVT_BF16_F32(%f5, %h0)
+    CVT_BF16_F32(%f6, %h1)
+    CVT_BF16_F32(%f7, %h2)
+    CVT_BF16_F32(%f8, %h3)
+    setp.ge.f32     %p2, %f5, %f11;
+    @%p2 mul.f32    %f5, %f5, %f12;
+    @!%p2 mov.f32   %f5, 0f00000000;
+    setp.ge.f32     %p2, %f6, %f11;
+    @%p2 mul.f32    %f6, %f6, %f12;
+    @!%p2 mov.f32   %f6, 0f00000000;
+    setp.ge.f32     %p2, %f7, %f11;
+    @%p2 mul.f32    %f7, %f7, %f12;
+    @!%p2 mov.f32   %f7, 0f00000000;
+    setp.ge.f32     %p2, %f8, %f11;
+    @%p2 mul.f32    %f8, %f8, %f12;
+    @!%p2 mov.f32   %f8, 0f00000000;
+    CVT_F32_BF16(%h0, %f5)
+    CVT_F32_BF16(%h1, %f6)
+    CVT_F32_BF16(%h2, %f7)
+    CVT_F32_BF16(%h3, %f8)
+    mov.b32         %r14, {%h0, %h1};
+    mov.b32         %r15, {%h2, %h3};
+    st.global.v2.b32 [%rd14], {%r14, %r15};
+    add.u32         %r5, %r5, %r20;
+    bra             w_vec;
+
+w_done:
+    add.u32         %r5, %r22, %r1;
+w_tail:
+    setp.ge.u32     %p1, %r5, %r2;
+    @%p1 bra        end;
+    mul.wide.u32    %rd6, %r5, 2;
+    add.u64         %rd7, %rd4, %rd6;
+    add.u64         %rd14, %rd5, %rd6;
+    ld.global.b16   %h0, [%rd7];
+    CVT_BF16_F32(%f5, %h0)
+    setp.ge.f32     %p2, %f5, %f11;
+    @%p2 mul.f32    %f5, %f5, %f12;
+    @!%p2 mov.f32   %f5, 0f00000000;
+    CVT_F32_BF16(%h0, %f5)
+    st.global.b16   [%rd14], %h0;
+    add.u32         %r5, %r5, %r4;
+    bra             w_tail;
+
+end:
+    ret;
+}

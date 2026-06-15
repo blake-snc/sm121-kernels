@@ -1,0 +1,163 @@
+// gemv_bf16_v2.ptx
+//
+// BF16 matrix-vector v2: out[N] = x[K] @ B[K, N].
+// Each thread holds 8 output-column accumulators in registers and does 8
+// independent FMAs per K iteration (vs v1's 1-FMA chain). This raises ILP
+// from 1 to 8 and beats the v1 GEMV (which lost to scalar gemm at M=1
+// because of accumulator dependency stalls — see memory: gemv_naive_lesson).
+//
+// Block: 128 threads (4 warps), 8 cols per thread → 1024 cols per block.
+// Grid: ceil(N / 1024) blocks.
+// Constraint: N must be divisible by 8 (for packed b32 stores).
+// SMEM: K * 2 bytes for the X tile (loaded cooperatively once per block).
+//
+// B access pattern: per K iter, all threads in a warp read B[k, ..] for
+// 32 contiguous 8-col groups = 256 cols × 2 bytes = 512 bytes per warp,
+// fully coalesced.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+.extern .shared .align 16 .b8 smem_x_v2[];
+
+.visible .entry gemv_bf16_v2(
+    .param .u64 param_x,        // [K] bf16
+    .param .u64 param_b,        // [K, N] bf16  (row-major)
+    .param .u64 param_out,      // [N] bf16
+    .param .u32 param_n,
+    .param .u32 param_k
+)
+{
+    .reg .b32 %r<32>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<24>;
+    .reg .b16 %h<16>;
+    .reg .pred %p<4>;
+
+    mov.u32         %r0, %ctaid.x;             // block idx
+    mov.u32         %r1, %tid.x;               // tid in [0..127]
+    mov.u32         %r2, %ntid.x;              // 128
+
+    // col_start = block_idx * 1024 + tid * 8
+    shl.b32         %r3, %r0, 10;              // block * 1024
+    shl.b32         %r4, %r1, 3;               // tid * 8
+    add.u32         %r5, %r3, %r4;             // col_start
+
+    ld.param.u64    %rd0, [param_x];
+    ld.param.u64    %rd1, [param_b];
+    ld.param.u64    %rd2, [param_out];
+    ld.param.u32    %r6, [param_n];
+    ld.param.u32    %r7, [param_k];
+
+    // ----- Cooperatively load X[0..K] into smem -----
+    mov.u32         %r8, smem_x_v2;
+    mov.u32         %r9, %r1;                  // i = tid
+load_loop:
+    setp.ge.u32     %p0, %r9, %r7;
+    @%p0 bra        load_done;
+    mul.wide.u32    %rd3, %r9, 2;
+    add.u64         %rd4, %rd0, %rd3;
+    ld.global.b16   %h0, [%rd4];
+    shl.b32         %r10, %r9, 1;
+    add.u32         %r11, %r8, %r10;
+    st.shared.b16   [%r11], %h0;
+    add.u32         %r9, %r9, %r2;
+    bra             load_loop;
+load_done:
+    bar.sync        0;
+
+    // ----- Bounds: skip whole thread if its 8-col group is beyond N -----
+    setp.ge.u32     %p1, %r5, %r6;
+    @%p1 bra        ret;
+
+    // ----- 8 column accumulators -----
+    mov.f32         %f0, 0.0;
+    mov.f32         %f1, 0.0;
+    mov.f32         %f2, 0.0;
+    mov.f32         %f3, 0.0;
+    mov.f32         %f4, 0.0;
+    mov.f32         %f5, 0.0;
+    mov.f32         %f6, 0.0;
+    mov.f32         %f7, 0.0;
+
+    // ----- K reduction -----
+    mov.u32         %r12, 0;                   // k = 0
+k_loop:
+    setp.ge.u32     %p2, %r12, %r7;
+    @%p2 bra        k_done;
+
+    // X[k] from smem → f32
+    shl.b32         %r13, %r12, 1;
+    add.u32         %r14, %r8, %r13;
+    ld.shared.b16   %h0, [%r14];
+    CVT_BF16_F32(%f8, %h0)
+
+    // B[k, col_start..col_start+8] = 4 packed b32 loads (8 BF16)
+    // addr = b_ptr + (k * N + col_start) * 2
+    mul.lo.u32      %r15, %r12, %r6;
+    add.u32         %r15, %r15, %r5;
+    mul.wide.u32    %rd5, %r15, 2;
+    add.u64         %rd6, %rd1, %rd5;
+
+    ld.global.b32   %r16, [%rd6 + 0];
+    ld.global.b32   %r17, [%rd6 + 4];
+    ld.global.b32   %r18, [%rd6 + 8];
+    ld.global.b32   %r19, [%rd6 + 12];
+
+    mov.b32         {%h0, %h1}, %r16;
+    mov.b32         {%h2, %h3}, %r17;
+    mov.b32         {%h4, %h5}, %r18;
+    mov.b32         {%h6, %h7}, %r19;
+
+    CVT_BF16_F32(%f9,  %h0)
+    CVT_BF16_F32(%f10, %h1)
+    CVT_BF16_F32(%f11, %h2)
+    CVT_BF16_F32(%f12, %h3)
+    CVT_BF16_F32(%f13, %h4)
+    CVT_BF16_F32(%f14, %h5)
+    CVT_BF16_F32(%f15, %h6)
+    CVT_BF16_F32(%f16, %h7)
+
+    // 8 independent FMAs (no inter-FMA dependency → 8-way ILP)
+    fma.rn.f32      %f0, %f8, %f9,  %f0;
+    fma.rn.f32      %f1, %f8, %f10, %f1;
+    fma.rn.f32      %f2, %f8, %f11, %f2;
+    fma.rn.f32      %f3, %f8, %f12, %f3;
+    fma.rn.f32      %f4, %f8, %f13, %f4;
+    fma.rn.f32      %f5, %f8, %f14, %f5;
+    fma.rn.f32      %f6, %f8, %f15, %f6;
+    fma.rn.f32      %f7, %f8, %f16, %f7;
+
+    add.u32         %r12, %r12, 1;
+    bra             k_loop;
+
+k_done:
+    // ----- Store 8 outputs as 4 packed b32 stores -----
+    mul.wide.u32    %rd7, %r5, 2;
+    add.u64         %rd8, %rd2, %rd7;
+
+    CVT_F32_BF16(%h0, %f0)
+    CVT_F32_BF16(%h1, %f1)
+    CVT_F32_BF16(%h2, %f2)
+    CVT_F32_BF16(%h3, %f3)
+    CVT_F32_BF16(%h4, %f4)
+    CVT_F32_BF16(%h5, %f5)
+    CVT_F32_BF16(%h6, %f6)
+    CVT_F32_BF16(%h7, %f7)
+
+    mov.b32         %r20, {%h0, %h1};
+    st.global.b32   [%rd8 + 0],  %r20;
+    mov.b32         %r21, {%h2, %h3};
+    st.global.b32   [%rd8 + 4],  %r21;
+    mov.b32         %r22, {%h4, %h5};
+    st.global.b32   [%rd8 + 8],  %r22;
+    mov.b32         %r23, {%h6, %h7};
+    st.global.b32   [%rd8 + 12], %r23;
+
+ret:
+    ret;
+}

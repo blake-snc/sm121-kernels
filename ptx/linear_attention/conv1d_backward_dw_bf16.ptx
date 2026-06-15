@@ -1,0 +1,106 @@
+// conv1d_backward_dw_bf16.ptx
+//
+// Backward (dW) for depthwise causal conv1d with kernel_size=4.
+//
+// Forward:  y[t, c] = sum_{j=0..K-1} W[c, j] * x[t - (K-1-j), c]
+//
+// Backward (this kernel):
+//   dW[c, j] = sum_{t = K-1-j .. T-1} dy[t, c] * x[t - (K-1-j), c]
+//
+// (The lower bound on t is the smallest t for which x[t - (K-1-j)] is in-range,
+//  i.e., t - (K-1-j) >= 0.)
+//
+// Layouts:
+//   dy: [T, C] BF16
+//   x:  [T, C] BF16 — original conv input (must be cached during forward)
+//   dW: [C, K] BF16 — output; computed in FP32 internally, narrowed to BF16
+//
+// Grid:  (ceil(C * K / 128), 1, 1)
+// Block: (128, 1, 1) — each thread computes ONE dW[c, j] entry.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "convert.ptxh"
+
+#define K 4
+
+.visible .entry conv1d_backward_dw_bf16(
+    .param .u64 param_dy,
+    .param .u64 param_x,
+    .param .u64 param_dw,
+    .param .u32 param_T,
+    .param .u32 param_C
+)
+{
+    .reg .b32  %r<24>;
+    .reg .b64  %rd<16>;
+    .reg .f32  %f<16>;
+    .reg .b16  %h<8>;
+    .reg .pred %p<4>;
+
+    // Global thread idx = blockIdx.x * 128 + threadIdx.x
+    mov.u32     %r0, %ctaid.x;
+    mov.u32     %r1, %tid.x;
+    shl.b32     %r2, %r0, 7;             // ctaid.x * 128
+    add.u32     %r3, %r2, %r1;           // flat idx
+
+    ld.param.u32 %r4, [param_T];         // T
+    ld.param.u32 %r5, [param_C];         // C
+
+    // Total entries = C * K. Guard.
+    mul.lo.u32   %r6, %r5, K;            // C * K
+    setp.ge.u32  %p0, %r3, %r6;
+    @%p0 bra     done;
+
+    // Decode (c, j) from flat idx
+    div.u32     %r7, %r3, K;             // c
+    rem.u32     %r8, %r3, K;             // j
+
+    ld.param.u64 %rd0, [param_dy];
+    ld.param.u64 %rd1, [param_x];
+    ld.param.u64 %rd2, [param_dw];
+
+    // dW[c, j] = sum_{t = K-1-j .. T-1} dy[t, c] * x[t - (K-1-j), c]
+    sub.u32     %r9, K, 1;               // K - 1
+    sub.u32     %r9, %r9, %r8;           // K-1 - j (= t_min)
+    mov.f32     %f0, 0.0;
+
+    mov.u32     %r10, %r9;               // t = t_min
+loop_t:
+    setp.ge.u32 %p1, %r10, %r4;
+    @%p1 bra    loop_done;
+
+    // dy[t, c]
+    mul.lo.u32  %r11, %r10, %r5;         // t * C
+    add.u32     %r11, %r11, %r7;         // + c
+    mul.wide.u32 %rd3, %r11, 2;
+    add.u64     %rd4, %rd0, %rd3;
+    ld.global.b16 %h0, [%rd4];
+    cvt.f32.bf16 %f1, %h0;
+
+    // x[t - (K-1-j), c] = x[t - t_min, c]   (note: offset = t - t_min = t - (K-1-j))
+    sub.u32     %r12, %r10, %r9;         // t_offset
+    mul.lo.u32  %r12, %r12, %r5;         // * C
+    add.u32     %r12, %r12, %r7;         // + c
+    mul.wide.u32 %rd5, %r12, 2;
+    add.u64     %rd6, %rd1, %rd5;
+    ld.global.b16 %h1, [%rd6];
+    cvt.f32.bf16 %f2, %h1;
+
+    fma.rn.f32  %f0, %f1, %f2, %f0;
+
+    add.u32     %r10, %r10, 1;
+    bra         loop_t;
+loop_done:
+
+    // Write dW[c, j] = dW + c*K + j (flat idx)
+    mul.wide.u32 %rd7, %r3, 2;
+    add.u64     %rd8, %rd2, %rd7;
+    cvt.rn.bf16.f32 %h2, %f0;
+    st.global.b16 [%rd8], %h2;
+
+done:
+    ret;
+}

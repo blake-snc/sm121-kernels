@@ -1,0 +1,225 @@
+// quant_bf16_to_fp8_pertoken.ptx
+//
+// Per-token dynamic FP8 E4M3 quantization for BF16 activations.
+//
+// Operation (per row):
+//   abs_max = max(|x[i]|) for i in row
+//   scale   = abs_max / FP8_E4M3_MAX                  (rounded up to avoid overflow)
+//   out[i]  = round_to_e4m3(x[i] / scale)              (saturating)
+//   scales[row] = scale                                (FP32 written separately)
+//
+// Downstream FP8 GEMM/attention dequantizes with: y[i] = out[i] * scales[row].
+// This is the vLLM-style dynamic per-token quantization pattern.
+//
+// Layout:
+//   x: [num_rows, hidden_dim] bf16
+//   out: [num_rows, hidden_dim] fp8_e4m3 (u8)
+//   scales: [num_rows] f32
+//
+// Grid: (num_rows, 1, 1), one CTA per row. Block: (256, 1, 1).
+// Vectorized v2.b32 I/O on input/output.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "reduction.ptxh"
+#include "convert.ptxh"
+
+#define FP8_E4M3_MAX 448.0
+#define FP8_E4M3_MAX_INV 0f3B124925   // 1/448
+
+.shared .align 128 .b8 smem_reduce[128];
+
+.visible .entry quant_bf16_to_fp8_pertoken(
+    .param .u64 param_x,         // [num_rows, hidden] bf16
+    .param .u64 param_out,       // [num_rows, hidden] fp8_e4m3 (u8)
+    .param .u64 param_scales,    // [num_rows] f32 (per-row output scale)
+    .param .u32 param_hidden
+)
+{
+    .reg .b32 %r<32>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<16>;
+    .reg .b16 %h<8>;
+    .reg .pred %p<4>;
+
+    mov.u32         %r0, BLOCK_ID_X;
+    mov.u32         %r1, THREAD_ID;
+
+    ld.param.u64    %rd0, [param_x];
+    ld.param.u64    %rd1, [param_out];
+    ld.param.u64    %rd2, [param_scales];
+    ld.param.u32    %r2, [param_hidden];
+
+    mul.lo.u32      %r3, %r0, %r2;
+    mul.wide.u32    %rd3, %r3, 2;
+    add.u64         %rd4, %rd0, %rd3;        // &x[row, 0]
+    mul.wide.u32    %rd5, %r3, 1;
+    add.u64         %rd6, %rd1, %rd5;        // &out[row, 0]
+
+    mov.u32         %r4, %ntid.x;
+    shl.b32         %r20, %r4, 2;
+    sub.u32         %r21, %r20, 1;
+    not.b32         %r21, %r21;
+    and.b32         %r22, %r2, %r21;
+
+    // ============ Pass 1: find abs_max over row ============
+    mov.f32         %f1, 0.0;
+    shl.b32         %r5, %r1, 2;
+
+am_vec:
+    setp.ge.u32     %p0, %r5, %r22;
+    @%p0 bra        am_done;
+    mul.wide.u32    %rd7, %r5, 2;
+    add.u64         %rd8, %rd4, %rd7;
+    ld.global.v2.b32 {%r10, %r11}, [%rd8];
+    mov.b32         {%h0, %h1}, %r10;
+    mov.b32         {%h2, %h3}, %r11;
+    CVT_BF16_F32(%f2, %h0)
+    CVT_BF16_F32(%f3, %h1)
+    CVT_BF16_F32(%f4, %h2)
+    CVT_BF16_F32(%f5, %h3)
+    abs.f32         %f2, %f2;
+    abs.f32         %f3, %f3;
+    abs.f32         %f4, %f4;
+    abs.f32         %f5, %f5;
+    max.f32         %f1, %f1, %f2;
+    max.f32         %f1, %f1, %f3;
+    max.f32         %f1, %f1, %f4;
+    max.f32         %f1, %f1, %f5;
+    add.u32         %r5, %r5, %r20;
+    bra             am_vec;
+
+am_done:
+    add.u32         %r5, %r22, %r1;
+
+am_tail:
+    setp.ge.u32     %p0, %r5, %r2;
+    @%p0 bra        am_red;
+    mul.wide.u32    %rd7, %r5, 2;
+    add.u64         %rd8, %rd4, %rd7;
+    ld.global.b16   %h0, [%rd8];
+    CVT_BF16_F32(%f2, %h0)
+    abs.f32         %f2, %f2;
+    max.f32         %f1, %f1, %f2;
+    add.u32         %r5, %r5, %r4;
+    bra             am_tail;
+
+am_red:
+    WARP_REDUCE_MAX_F32(%f1, %f3)
+    WARP_ID(%r6, %r1)
+    LANE_ID(%r7, %r1)
+    setp.eq.u32     %p1, %r7, 0;
+    @%p1 bra        am_ws;
+    bra             am_skip;
+am_ws:
+    mul.wide.u32    %rd10, %r6, 4;
+    mov.u64         %rd11, smem_reduce;
+    add.u64         %rd12, %rd11, %rd10;
+    st.shared.f32   [%rd12], %f1;
+am_skip:
+    bar.sync        0;
+
+    shr.u32         %r8, %r4, 5;
+    setp.lt.u32     %p2, %r6, 1;
+    @%p2 bra        am_w0;
+    bra             am_after;
+am_w0:
+    setp.lt.u32     %p3, %r7, %r8;
+    @%p3 bra        am_load;
+    mov.f32         %f1, 0.0;
+    bra             am_final;
+am_load:
+    mul.wide.u32    %rd10, %r7, 4;
+    mov.u64         %rd11, smem_reduce;
+    add.u64         %rd12, %rd11, %rd10;
+    ld.shared.f32   %f1, [%rd12];
+am_final:
+    WARP_REDUCE_MAX_F32(%f1, %f3)
+    setp.eq.u32     %p1, %r7, 0;
+    @%p1 bra        am_store;
+    bra             am_after;
+am_store:
+    // scale = max(abs_max / 448, tiny_eps) — avoid div-by-zero.
+    mul.f32         %f6, %f1, FP8_E4M3_MAX_INV;
+    max.f32         %f6, %f6, 0f3727C5AC;    // > 1e-5
+    // inv_scale for downstream multiply
+    rcp.approx.f32  %f7, %f6;
+    mov.u64         %rd11, smem_reduce;
+    add.u64         %rd13, %rd11, 64;
+    st.shared.f32   [%rd13], %f7;            // broadcast inv_scale
+    // Store scale to global
+    mul.wide.u32    %rd14, %r0, 4;
+    add.u64         %rd15, %rd2, %rd14;
+    st.global.f32   [%rd15], %f6;
+
+am_after:
+    bar.sync        0;
+    mov.u64         %rd11, smem_reduce;
+    add.u64         %rd13, %rd11, 64;
+    ld.shared.f32   %f7, [%rd13];            // inv_scale
+
+    // ============ Pass 2: quantize x * inv_scale → FP8 ============
+    shl.b32         %r5, %r1, 2;
+
+q_vec:
+    setp.ge.u32     %p0, %r5, %r22;
+    @%p0 bra        q_done;
+    mul.wide.u32    %rd7, %r5, 2;
+    add.u64         %rd8, %rd4, %rd7;
+    ld.global.v2.b32 {%r10, %r11}, [%rd8];
+    mov.b32         {%h0, %h1}, %r10;
+    mov.b32         {%h2, %h3}, %r11;
+    CVT_BF16_F32(%f2, %h0)
+    CVT_BF16_F32(%f3, %h1)
+    CVT_BF16_F32(%f4, %h2)
+    CVT_BF16_F32(%f5, %h3)
+    mul.f32         %f2, %f2, %f7;
+    mul.f32         %f3, %f3, %f7;
+    mul.f32         %f4, %f4, %f7;
+    mul.f32         %f5, %f5, %f7;
+
+    .reg .b16 _b0, _b1;
+    CVT_F32X2_E4M3X2(_b0, %f3, %f2)           // bytes [0,1] = [f2, f3]
+    CVT_F32X2_E4M3X2(_b1, %f5, %f4)           // bytes [2,3] = [f4, f5]
+    mov.b32         %r14, {_b0, _b1};
+    mul.wide.u32    %rd9, %r5, 1;
+    add.u64         %rd12, %rd6, %rd9;
+    st.global.b32   [%rd12], %r14;
+
+    add.u32         %r5, %r5, %r20;
+    bra             q_vec;
+
+q_done:
+    add.u32         %r5, %r22, %r1;
+
+q_tail:
+    setp.ge.u32     %p0, %r5, %r2;
+    @%p0 bra        end;
+    // Pair tail elements via single b16 stores; hidden must be even for FP8 pack.
+    mul.wide.u32    %rd7, %r5, 2;
+    add.u64         %rd8, %rd4, %rd7;
+    ld.global.b16   %h0, [%rd8];
+    add.u32         %r24, %r5, 1;
+    setp.lt.u32     %p1, %r24, %r2;
+    @!%p1 bra       end;
+    add.u64         %rd8, %rd8, 2;
+    ld.global.b16   %h1, [%rd8];
+    CVT_BF16_F32(%f2, %h0)
+    CVT_BF16_F32(%f3, %h1)
+    mul.f32         %f2, %f2, %f7;
+    mul.f32         %f3, %f3, %f7;
+    .reg .b16 _t0;
+    CVT_F32X2_E4M3X2(_t0, %f3, %f2)
+    mul.wide.u32    %rd9, %r5, 1;
+    add.u64         %rd12, %rd6, %rd9;
+    st.global.b16   [%rd12], _t0;
+    add.u32         %r5, %r5, 2;
+    add.u32         %r5, %r5, %r4;
+    bra             q_tail;
+
+end:
+    ret;
+}

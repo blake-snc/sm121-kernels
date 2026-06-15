@@ -1,0 +1,179 @@
+// gemv_w8a16_split_k.ptx
+//
+// W8A16 GEMV with split-K:
+//   out_f32[N] += (x[k_start:k_end] @ dequant(B[k_start:k_end, N]))
+// where B is FP8 e4m3 stored row-major and `dequant(b) = scale * f32(b)`
+// with one shared per-tensor scale (passed as f32 param).
+//
+// Designed as a drop-in lower-bandwidth alternative to gemv_bf16_split_k for
+// large weight matrices (e.g. GDN in_proj_fused, MoE down_stack). Halves the
+// weight reads from HBM (2 bytes/elem → 1 byte/elem) while keeping BF16
+// activations and BF16 output cast (caller does cast separately).
+//
+// Block: 128 threads, 8 cols/thread → 1024 cols per block.
+// Grid: (ceil(N / 1024), num_k_shards, 1)
+// SMEM: k_shard * 2 bytes for the X-shard tile.
+// Constraints: N must be a multiple of 8.
+// Caller MUST zero `out_f32[N]` before launch.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+.extern .shared .align 16 .b8 smem_xsh_w8a16[];
+
+.visible .entry gemv_w8a16_split_k(
+    .param .u64 param_x,         // [K] bf16
+    .param .u64 param_b,         // [K, N] fp8 e4m3
+    .param .u64 param_out_f32,   // [N] f32 (caller-zeroed accumulator)
+    .param .f32 param_scale,     // per-tensor dequant scale
+    .param .u32 param_n,
+    .param .u32 param_k,
+    .param .u32 param_k_shard
+)
+{
+    .reg .b32 %r<32>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<32>;
+    .reg .b16 %h<16>;
+    .reg .pred %p<8>;
+
+    mov.u32         %r0, %ctaid.x;
+    mov.u32         %r1, %ctaid.y;
+    mov.u32         %r2, %tid.x;
+    mov.u32         %r3, %ntid.x;
+
+    // col_start = col_block * 1024 + tid * 8
+    shl.b32         %r4, %r0, 10;
+    shl.b32         %r5, %r2, 3;
+    add.u32         %r6, %r4, %r5;
+
+    ld.param.u64    %rd0, [param_x];
+    ld.param.u64    %rd1, [param_b];
+    ld.param.u64    %rd2, [param_out_f32];
+    ld.param.f32    %f30, [param_scale];
+    ld.param.u32    %r7, [param_n];
+    ld.param.u32    %r8, [param_k];
+    ld.param.u32    %r9, [param_k_shard];
+
+    // K range: [k_start, min(k_start + k_shard, K))
+    mul.lo.u32      %r10, %r1, %r9;
+    add.u32         %r11, %r10, %r9;
+    min.u32         %r11, %r11, %r8;
+    sub.u32         %r13, %r11, %r10;
+
+    // ----- Load X[k_start..k_end] into SMEM -----
+    mov.u32         %r12, smem_xsh_w8a16;
+    mov.u32         %r14, %r2;
+load_x:
+    setp.ge.u32     %p0, %r14, %r13;
+    @%p0 bra        load_done;
+    add.u32         %r15, %r14, %r10;
+    mul.wide.u32    %rd3, %r15, 2;
+    add.u64         %rd4, %rd0, %rd3;
+    ld.global.b16   %h0, [%rd4];
+    shl.b32         %r16, %r14, 1;
+    add.u32         %r17, %r12, %r16;
+    st.shared.b16   [%r17], %h0;
+    add.u32         %r14, %r14, %r3;
+    bra             load_x;
+load_done:
+    bar.sync        0;
+
+    // Bounds: skip whole thread if its 8-col group beyond N
+    setp.ge.u32     %p1, %r6, %r7;
+    @%p1 bra        ret;
+
+    // 8 accumulators
+    mov.f32         %f0, 0.0;
+    mov.f32         %f1, 0.0;
+    mov.f32         %f2, 0.0;
+    mov.f32         %f3, 0.0;
+    mov.f32         %f4, 0.0;
+    mov.f32         %f5, 0.0;
+    mov.f32         %f6, 0.0;
+    mov.f32         %f7, 0.0;
+
+    // K-shard loop
+    mov.u32         %r18, 0;
+k_loop:
+    setp.ge.u32     %p2, %r18, %r13;
+    @%p2 bra        k_done;
+
+    // X[k_in_shard] from smem, * scale (fold scale into x to save 8 muls per K)
+    shl.b32         %r19, %r18, 1;
+    add.u32         %r20, %r12, %r19;
+    ld.shared.b16   %h0, [%r20];
+    CVT_BF16_F32(%f8, %h0)
+    mul.f32         %f8, %f8, %f30;             // x_scaled = x * w_scale
+
+    // B[k_global, col_start..col_start+8] = 8 FP8 = 8 bytes = v2.b32
+    add.u32         %r21, %r18, %r10;
+    mul.lo.u32      %r22, %r21, %r7;
+    add.u32         %r22, %r22, %r6;
+    cvt.u64.u32     %rd5, %r22;                  // byte offset = elem offset (1 B/FP8)
+    add.u64         %rd6, %rd1, %rd5;
+
+    ld.global.v2.b32 {%r23, %r24}, [%rd6];
+
+    // %r23 = 4 FP8 values (cols 0..3); %r24 = 4 FP8 (cols 4..7)
+    // Each b32 = 4 e4m3 = 2 e4m3x2 pairs
+    mov.b32         {%h0, %h1}, %r23;            // h0 = pair (col0, col1) ; h1 = pair (col2, col3)
+    mov.b32         {%h2, %h3}, %r24;            // h2 = pair (col4, col5) ; h3 = pair (col6, col7)
+
+    // Convert each e4m3x2 pair → f16x2
+    cvt.rn.f16x2.e4m3x2 %r25, %h0;
+    cvt.rn.f16x2.e4m3x2 %r26, %h1;
+    cvt.rn.f16x2.e4m3x2 %r27, %h2;
+    cvt.rn.f16x2.e4m3x2 %r28, %h3;
+
+    // Extract individual f16s
+    mov.b32         {%h4, %h5}, %r25;            // f16 col0, col1
+    mov.b32         {%h6, %h7}, %r26;            // f16 col2, col3
+    mov.b32         {%h8, %h9}, %r27;            // f16 col4, col5
+    mov.b32         {%h10, %h11}, %r28;          // f16 col6, col7
+
+    // f16 → f32
+    cvt.f32.f16     %f9,  %h4;
+    cvt.f32.f16     %f10, %h5;
+    cvt.f32.f16     %f11, %h6;
+    cvt.f32.f16     %f12, %h7;
+    cvt.f32.f16     %f13, %h8;
+    cvt.f32.f16     %f14, %h9;
+    cvt.f32.f16     %f15, %h10;
+    cvt.f32.f16     %f16, %h11;
+
+    // 8-way ILP FMAs (acc += x_scaled * w_dq)
+    fma.rn.f32      %f0, %f8, %f9,  %f0;
+    fma.rn.f32      %f1, %f8, %f10, %f1;
+    fma.rn.f32      %f2, %f8, %f11, %f2;
+    fma.rn.f32      %f3, %f8, %f12, %f3;
+    fma.rn.f32      %f4, %f8, %f13, %f4;
+    fma.rn.f32      %f5, %f8, %f14, %f5;
+    fma.rn.f32      %f6, %f8, %f15, %f6;
+    fma.rn.f32      %f7, %f8, %f16, %f7;
+
+    add.u32         %r18, %r18, 1;
+    bra             k_loop;
+
+k_done:
+    // Atomically accumulate into out_f32
+    mul.wide.u32    %rd7, %r6, 4;
+    add.u64         %rd8, %rd2, %rd7;
+
+    .reg .f32 %old;
+    atom.global.add.f32 %old, [%rd8 + 0],  %f0;
+    atom.global.add.f32 %old, [%rd8 + 4],  %f1;
+    atom.global.add.f32 %old, [%rd8 + 8],  %f2;
+    atom.global.add.f32 %old, [%rd8 + 12], %f3;
+    atom.global.add.f32 %old, [%rd8 + 16], %f4;
+    atom.global.add.f32 %old, [%rd8 + 20], %f5;
+    atom.global.add.f32 %old, [%rd8 + 24], %f6;
+    atom.global.add.f32 %old, [%rd8 + 28], %f7;
+
+ret:
+    ret;
+}

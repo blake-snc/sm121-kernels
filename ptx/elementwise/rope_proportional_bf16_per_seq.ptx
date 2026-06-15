@@ -1,0 +1,111 @@
+// rope_proportional_bf16_per_seq.ptx
+//
+// Per-sequence variant of `rope_proportional_bf16_pos_dev` (Gemma-4
+// full-attention layers). Reads a different position per sequence
+// (pos_per_seq[seq_idx]) instead of broadcasting one position across all
+// heads — enables heterogeneous-position decoding (continuous batching).
+//
+// Same math as the single-pos variant: only the first `rope_angles` pair
+// indices receive a nonzero rotation; the rest pass through (identity).
+// Pair convention is `(i, i + head_dim/2)`.
+//
+// Layout:
+//   buf:         [M, heads_per_seq, head_dim] BF16 (in-place)
+//   pos_per_seq: [M] u32 device — per-sequence current decode position
+//   theta:       f32 scalar (1000000.0 for Gemma-4 full attention)
+//   head_dim:    u32
+//   rope_angles: u32
+//   heads_per_seq: u32 (caller's n_q or n_kv)
+//
+// Grid:  (M * heads_per_seq, 1, 1)
+// Block: (head_dim / 2, 1, 1)
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+.visible .entry rope_proportional_bf16_per_seq(
+    .param .u64 param_buf,
+    .param .u64 param_pos_per_seq,
+    .param .f32 param_theta,
+    .param .u32 param_head_dim,
+    .param .u32 param_rope_angles,
+    .param .u32 param_heads_per_seq
+)
+{
+    .reg .b32  %r<20>;
+    .reg .b64  %rd<8>;
+    .reg .f32  %f<16>;
+    .reg .b16  %h<4>;
+    .reg .pred %p<4>;
+
+    mov.u32         %r0, %tid.x;            // i (pair index)
+    mov.u32         %r1, %ctaid.x;          // global head index
+    ld.param.u32    %r2, [param_head_dim];
+    ld.param.u32    %r3, [param_rope_angles];
+    ld.param.u32    %r10, [param_heads_per_seq];
+
+    shr.u32         %r4, %r2, 1;            // half = head_dim / 2
+    setp.ge.u32     %p0, %r0, %r4;
+    @%p0 bra        done;
+
+    ld.param.u64    %rd0, [param_buf];
+    ld.param.u64    %rd1, [param_pos_per_seq];
+    ld.param.f32    %f0, [param_theta];
+
+    // Per-seq position lookup: seq_idx = h_global / heads_per_seq.
+    div.u32         %r11, %r1, %r10;
+    mul.wide.u32    %rd6, %r11, 4;
+    add.u64         %rd7, %rd1, %rd6;
+    ld.global.u32   %r5, [%rd7];
+    cvt.rn.f32.u32  %f1, %r5;
+
+    // For i >= rope_angles: identity. Otherwise compute angle.
+    setp.ge.u32     %p1, %r0, %r3;
+    mov.f32         %f9, 0f3F800000;        // c = 1
+    mov.f32         %f10, 0f00000000;       // s = 0
+    @%p1 bra        load_xy;
+
+    lg2.approx.f32  %f2, %f0;
+    cvt.rn.f32.u32  %f3, %r0;
+    mul.f32         %f4, %f3, %f2;
+    cvt.rn.f32.u32  %f5, %r2;
+    div.approx.f32  %f6, %f4, %f5;
+    add.f32         %f6, %f6, %f6;
+    neg.f32         %f6, %f6;
+    ex2.approx.f32  %f7, %f6;
+    mul.f32         %f8, %f1, %f7;
+
+    cos.approx.ftz.f32  %f9, %f8;
+    sin.approx.ftz.f32  %f10, %f8;
+
+load_xy:
+    mul.lo.u32      %r6, %r1, %r2;
+    add.u32         %r7, %r6, %r0;
+    add.u32         %r8, %r7, %r4;
+
+    mul.wide.u32    %rd2, %r7, 2;
+    add.u64         %rd3, %rd0, %rd2;
+    mul.wide.u32    %rd4, %r8, 2;
+    add.u64         %rd5, %rd0, %rd4;
+
+    ld.global.b16   %h0, [%rd3];
+    cvt.f32.bf16    %f11, %h0;
+    ld.global.b16   %h1, [%rd5];
+    cvt.f32.bf16    %f12, %h1;
+
+    neg.f32         %f15, %f10;
+    mul.f32         %f13, %f11, %f9;
+    fma.rn.f32      %f13, %f12, %f15, %f13;
+
+    mul.f32         %f14, %f11, %f10;
+    fma.rn.f32      %f14, %f12, %f9, %f14;
+
+    cvt.rn.bf16.f32 %h2, %f13;
+    st.global.b16   [%rd3], %h2;
+    cvt.rn.bf16.f32 %h3, %f14;
+    st.global.b16   [%rd5], %h3;
+
+done:
+    ret;
+}

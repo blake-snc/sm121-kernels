@@ -1,0 +1,68 @@
+// f32_renormalize_topk.ptx
+//
+// Single-block in-place renormalization:
+//   for i in 0..n: w[i] /= sum(w)
+//
+// For MoE with `norm_topk_prob=True` (Qwen3 family). Replaces a dtoh + host
+// renorm + htod sequence per MoE layer with a single launch.
+//
+// Single block, single thread (n is tiny — top_k ≤ 16). The serial cost is
+// negligible compared to the launch.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+.visible .entry f32_renormalize_topk(
+    .param .u64 param_w,            // [n] f32 in/out
+    .param .u32 param_n
+)
+{
+    .reg .b32  %r<8>;
+    .reg .b64  %rd<8>;
+    .reg .f32  %f<8>;
+    .reg .pred %p<4>;
+
+    mov.u32         %r0, %tid.x;
+    setp.ne.u32     %p0, %r0, 0;
+    @%p0 bra        done;
+
+    ld.param.u64    %rd0, [param_w];
+    ld.param.u32    %r1, [param_n];
+
+    // Sum
+    mov.f32         %f0, 0.0;
+    mov.u32         %r2, 0;
+sum_loop:
+    setp.ge.u32     %p1, %r2, %r1;
+    @%p1 bra        sum_done;
+    mul.wide.u32    %rd1, %r2, 4;
+    add.u64         %rd2, %rd0, %rd1;
+    ld.global.f32   %f1, [%rd2];
+    add.f32         %f0, %f0, %f1;
+    add.u32         %r2, %r2, 1;
+    bra             sum_loop;
+sum_done:
+
+    // Guard against divide-by-zero
+    setp.lt.f32     %p2, %f0, 0f322BCC77;     // < 1e-8
+    @%p2 bra        done;
+
+    rcp.approx.f32  %f2, %f0;
+
+    // Divide each w[i] *= 1/sum
+    mov.u32         %r2, 0;
+div_loop:
+    setp.ge.u32     %p1, %r2, %r1;
+    @%p1 bra        done;
+    mul.wide.u32    %rd1, %r2, 4;
+    add.u64         %rd2, %rd0, %rd1;
+    ld.global.f32   %f3, [%rd2];
+    mul.f32         %f3, %f3, %f2;
+    st.global.f32   [%rd2], %f3;
+    add.u32         %r2, %r2, 1;
+    bra             div_loop;
+
+done:
+    ret;
+}

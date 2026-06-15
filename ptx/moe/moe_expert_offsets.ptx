@@ -1,0 +1,65 @@
+// moe_expert_offsets.ptx
+//
+// Compute inclusive-exclusive expert_offsets from histogram:
+//   expert_offsets[0] = 0
+//   expert_offsets[e+1] = expert_offsets[e] + histogram[e]
+//
+// Output is [num_experts + 1] entries where the last equals total count.
+//
+// For small num_experts (typical: up to 256), we run a single CTA with
+// serial prefix sum in thread 0. A parallel scan is unnecessary because
+// num_experts is tiny compared to kernel launch overhead.
+//
+// Grid: (1, 1, 1). Block: (32, 1, 1).
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+
+.visible .entry moe_expert_offsets(
+    .param .u64 param_histogram,     // [num_experts] u32
+    .param .u64 param_offsets,       // [num_experts+1] u32 (output)
+    .param .u32 param_num_experts
+)
+{
+    .reg .b32 %r<12>;
+    .reg .b64 %rd<8>;
+    .reg .pred %p<2>;
+
+    mov.u32         %r0, THREAD_ID;
+    setp.ne.u32     %p0, %r0, 0;
+    @%p0 bra        done;
+
+    ld.param.u64    %rd0, [param_histogram];
+    ld.param.u64    %rd1, [param_offsets];
+    ld.param.u32    %r1, [param_num_experts];
+
+    // offsets[0] = 0
+    st.global.u32   [%rd1], 0;
+
+    mov.u32         %r2, 0;                    // i = 0
+    mov.u32         %r3, 0;                    // sum = 0
+
+loop:
+    setp.ge.u32     %p1, %r2, %r1;
+    @%p1 bra        done;
+
+    mul.wide.u32    %rd2, %r2, 4;
+    add.u64         %rd3, %rd0, %rd2;
+    ld.global.u32   %r4, [%rd3];
+    add.u32         %r3, %r3, %r4;
+
+    // Write offsets[i+1] = sum
+    add.u32         %r5, %r2, 1;
+    mul.wide.u32    %rd4, %r5, 4;
+    add.u64         %rd5, %rd1, %rd4;
+    st.global.u32   [%rd5], %r3;
+
+    mov.u32         %r2, %r5;
+    bra             loop;
+
+done:
+    ret;
+}

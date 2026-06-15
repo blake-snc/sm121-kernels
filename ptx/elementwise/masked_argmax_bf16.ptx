@@ -1,0 +1,175 @@
+// masked_argmax_bf16.ptx
+//
+// Constrained-decode argmax: argmax over BF16 logits, restricted to a
+// caller-supplied allowed-token bitmask. Tokens whose mask bit is 0 are
+// treated as -inf and skipped.
+//
+// Input:
+//   logits [B, V] BF16
+//   mask   [B, ceil(V/8)] u8 — bit i of byte (j/8) is 1 iff token j is allowed
+//   token  [B] u32 — output: argmax token id per batch row
+//   vocab  u32
+//
+// Grid: (batch, 1, 1). Block: (128, 1, 1).
+// Each thread strides over V with stride BLOCK_DIM=128, computes its
+// local max+idx over allowed tokens, then a standard warp-butterfly +
+// SMEM final reduction yields the per-batch argmax.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+
+#define BLOCK_DIM 128
+#define NUM_WARPS 4
+
+.shared .align 4 .b8 smem_warp_max[16];   // 4 warps × 4 bytes FP32
+.shared .align 4 .b8 smem_warp_idx[16];   // 4 warps × 4 bytes u32
+
+.visible .entry masked_argmax_bf16(
+    .param .u64 param_logits,
+    .param .u64 param_mask,
+    .param .u64 param_token,
+    .param .u32 param_vocab
+)
+{
+    .reg .b32 %r<40>;
+    .reg .b64 %rd<10>;
+    .reg .f32 %f<8>;
+    .reg .pred %p<8>;
+
+    mov.u32     %r0, %tid.x;
+    mov.u32     %r1, %ctaid.x;          // batch index
+
+    ld.param.u64 %rd0, [param_logits];
+    ld.param.u64 %rd1, [param_mask];
+    ld.param.u64 %rd2, [param_token];
+    ld.param.u32 %r2, [param_vocab];
+
+    // Per-batch base addresses.
+    // logits base: &logits[b*V * 2 bytes]
+    mul.lo.u32  %r3, %r1, %r2;
+    mul.wide.u32 %rd3, %r3, 2;
+    add.u64     %rd4, %rd0, %rd3;        // %rd4 = logits + b*V*2
+
+    // mask base: &mask[b * ceil(V/8)]. Round up: (V + 7) >> 3.
+    add.u32     %r4, %r2, 7;
+    shr.b32     %r4, %r4, 3;            // mask_bytes_per_row
+    mul.lo.u32  %r5, %r1, %r4;
+    cvt.u64.u32 %rd5, %r5;
+    add.u64     %rd6, %rd1, %rd5;        // %rd6 = mask + b*mask_bytes
+
+    shr.b32     %r6, %r0, 5;            // warp_id
+    and.b32     %r7, %r0, 31;           // lane
+
+    // Per-thread scan: stride BLOCK_DIM over vocab.
+    mov.b32     %f0, 0xff800000;        // best_val = -inf
+    mov.u32     %r8, 0xFFFFFFFF;        // best_idx = sentinel
+    mov.u32     %r9, %r0;               // tok_id = tid
+
+scan_loop:
+    setp.ge.u32 %p1, %r9, %r2;
+    @%p1 bra    scan_done;
+
+    // mask bit test: byte_idx = tok_id >> 3, bit_idx = tok_id & 7
+    shr.b32     %r10, %r9, 3;
+    cvt.u64.u32 %rd7, %r10;
+    add.u64     %rd8, %rd6, %rd7;
+    ld.global.u8 %r11, [%rd8];
+    and.b32     %r12, %r9, 7;
+    shr.b32     %r11, %r11, %r12;
+    and.b32     %r11, %r11, 1;
+    setp.eq.u32 %p2, %r11, 0;
+    @%p2 bra    advance;                // mask bit 0 → skip token
+
+    // Load BF16 logit (16 bits), reinterpret as F32 by shifting into upper half
+    mul.wide.u32 %rd7, %r9, 2;
+    add.u64     %rd8, %rd4, %rd7;
+    ld.global.u16 %r13, [%rd8];
+    shl.b32     %r14, %r13, 16;
+    mov.b32     %f1, %r14;
+
+    setp.gt.f32 %p3, %f1, %f0;
+    @%p3 mov.f32 %f0, %f1;
+    @%p3 mov.u32 %r8, %r9;
+
+advance:
+    add.u32     %r9, %r9, BLOCK_DIM;
+    bra         scan_loop;
+scan_done:
+
+    // Warp-wide butterfly reduction (5 stages for 32 lanes), tracking idx
+    shfl.sync.bfly.b32 %f1|%p5, %f0, 0x10, 0x1f, 0xffffffff;
+    shfl.sync.bfly.b32 %r15|%p5, %r8, 0x10, 0x1f, 0xffffffff;
+    setp.gt.f32 %p3, %f1, %f0;
+    @%p3 mov.f32 %f0, %f1;
+    @%p3 mov.u32 %r8, %r15;
+
+    shfl.sync.bfly.b32 %f1|%p5, %f0, 0x08, 0x1f, 0xffffffff;
+    shfl.sync.bfly.b32 %r15|%p5, %r8, 0x08, 0x1f, 0xffffffff;
+    setp.gt.f32 %p3, %f1, %f0;
+    @%p3 mov.f32 %f0, %f1;
+    @%p3 mov.u32 %r8, %r15;
+
+    shfl.sync.bfly.b32 %f1|%p5, %f0, 0x04, 0x1f, 0xffffffff;
+    shfl.sync.bfly.b32 %r15|%p5, %r8, 0x04, 0x1f, 0xffffffff;
+    setp.gt.f32 %p3, %f1, %f0;
+    @%p3 mov.f32 %f0, %f1;
+    @%p3 mov.u32 %r8, %r15;
+
+    shfl.sync.bfly.b32 %f1|%p5, %f0, 0x02, 0x1f, 0xffffffff;
+    shfl.sync.bfly.b32 %r15|%p5, %r8, 0x02, 0x1f, 0xffffffff;
+    setp.gt.f32 %p3, %f1, %f0;
+    @%p3 mov.f32 %f0, %f1;
+    @%p3 mov.u32 %r8, %r15;
+
+    shfl.sync.bfly.b32 %f1|%p5, %f0, 0x01, 0x1f, 0xffffffff;
+    shfl.sync.bfly.b32 %r15|%p5, %r8, 0x01, 0x1f, 0xffffffff;
+    setp.gt.f32 %p3, %f1, %f0;
+    @%p3 mov.f32 %f0, %f1;
+    @%p3 mov.u32 %r8, %r15;
+
+    // Lane 0 of each warp writes to SMEM
+    setp.eq.u32 %p4, %r7, 0;
+    shl.b32     %r16, %r6, 2;
+    mov.u32     %r17, smem_warp_max;
+    add.u32     %r17, %r17, %r16;
+    mov.u32     %r18, smem_warp_idx;
+    add.u32     %r18, %r18, %r16;
+    @%p4 st.shared.f32 [%r17], %f0;
+    @%p4 st.shared.u32 [%r18], %r8;
+    bar.sync 0;
+
+    // Warp 0 reads 4 warp results and reduces
+    setp.lt.u32 %p6, %r0, NUM_WARPS;
+    mov.b32     %f0, 0xff800000;
+    mov.u32     %r8, 0xFFFFFFFF;
+    @%p6 shl.b32 %r16, %r0, 2;
+    @%p6 mov.u32 %r17, smem_warp_max;
+    @%p6 add.u32 %r17, %r17, %r16;
+    @%p6 mov.u32 %r18, smem_warp_idx;
+    @%p6 add.u32 %r18, %r18, %r16;
+    @%p6 ld.shared.f32 %f0, [%r17];
+    @%p6 ld.shared.u32 %r8, [%r18];
+
+    shfl.sync.bfly.b32 %f1|%p5, %f0, 0x02, 0x1f, 0xffffffff;
+    shfl.sync.bfly.b32 %r15|%p5, %r8, 0x02, 0x1f, 0xffffffff;
+    setp.gt.f32 %p3, %f1, %f0;
+    @%p3 mov.f32 %f0, %f1;
+    @%p3 mov.u32 %r8, %r15;
+
+    shfl.sync.bfly.b32 %f1|%p5, %f0, 0x01, 0x1f, 0xffffffff;
+    shfl.sync.bfly.b32 %r15|%p5, %r8, 0x01, 0x1f, 0xffffffff;
+    setp.gt.f32 %p3, %f1, %f0;
+    @%p3 mov.f32 %f0, %f1;
+    @%p3 mov.u32 %r8, %r15;
+
+    // Thread 0 writes final token id
+    setp.eq.u32 %p4, %r0, 0;
+    mul.wide.u32 %rd7, %r1, 4;
+    add.u64     %rd8, %rd2, %rd7;
+    @%p4 st.global.u32 [%rd8], %r8;
+
+    ret;
+}

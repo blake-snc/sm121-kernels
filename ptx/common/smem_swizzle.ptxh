@@ -1,0 +1,20 @@
+// smem_swizzle.ptxh
+// XOR-based shared memory swizzling for bank-conflict-free ldmatrix access.
+//
+// For a row-major matrix in shared memory with 256-byte row stride (128 bf16),
+// the swizzled byte offset is:
+//   swizzled_addr = base_addr ^ ((row & 7) << 4)
+//
+// This targets bits [6:4] of the byte address (bank group selection).
+
+#ifndef SPARK_SMEM_SWIZZLE_PTXH
+#define SPARK_SMEM_SWIZZLE_PTXH
+
+// SWIZZLE_ADDR(dst_reg, base_reg, row_reg)
+// All .b32 registers.
+#define SWIZZLE_ADDR(dst, base, row) \
+    and.b32 dst, row, 7; \
+    shl.b32 dst, dst, 4; \
+    xor.b32 dst, base, dst;
+
+#endif

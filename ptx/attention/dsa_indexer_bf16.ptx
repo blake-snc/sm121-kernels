@@ -1,0 +1,265 @@
+// dsa_indexer_bf16.ptx
+//
+// DeepSeek Sparse Attention (DSA) indexer — score computation, BF16 path.
+//
+// Reference: transformers/models/glm_moe_dsa/modeling_glm_moe_dsa.py
+//            class GlmMoeDsaIndexer.forward (line 145-228)
+//
+// Computes per-(b, s, t) raw index scores. Top-k selection is done by the
+// caller (host-side top-k for the MVP; a fused GPU top-k
+// is a follow-on perf item).
+//
+// Math (matches the HF "bf16 mode" path that skips FP8 Hadamard scoring):
+//   score[b,s,t] = sum_h( weights[b,s,h] * ReLU(softmax_scale * dot(q[b,s,h,:], k[b,t,:])) )
+//
+//   Note: softmax_scale is already baked into `weights` upstream — the HF
+//   reference computes `weights = weights_proj(x) * n_heads^(-0.5)` then
+//   multiplies by softmax_scale during the fp8_index call. We follow that
+//   convention: the caller passes weights with softmax_scale already absorbed.
+//
+// Shapes (compiled-in defaults match GLM-MoE-DSA config):
+//   q:       [B, S, H_idx, D_idx] BF16
+//   k:       [B, T,        D_idx] BF16  (note: NO head dim — one k vector per t)
+//   weights: [B, S, H_idx]        FP32  (already includes softmax_scale * n_heads^-0.5)
+//   out:     [B, S, T]            FP32  (index_scores)
+//
+// Defaults: H_IDX=32, D_IDX=128, TILE_T=128. The MVP fixes these
+// at compile time; a generic dimension dispatch can ship later.
+//
+// Grid:  (B*S, ceil(T / TILE_T), 1)
+// Block: (TILE_T, 1, 1) = 128 threads
+//
+// Per-thread: one t position. SMEM holds Q + weights for this (b, s).
+//   Q                : 32 * 128 BF16 = 8192 B
+//   weights          : 32 FP32      =  128 B
+//   Total SMEM       : 8320 B per CTA  (well under 99 KB SM121a limit)
+//
+// Per-thread registers: ~150 (K in registers, 128 FP32 + indexing + accumulators).
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "convert.ptxh"
+#include "macros.ptxh"
+
+#define H_IDX 32
+#define D_IDX 128
+#define TILE_T 128
+#define SMEM_Q_BYTES (H_IDX * D_IDX * 2)   // 8192
+#define SMEM_W_OFF SMEM_Q_BYTES            // weights start after Q
+#define SMEM_TOTAL (SMEM_Q_BYTES + H_IDX * 4)
+
+.extern .shared .align 16 .b8 dsa_smem[];
+
+.visible .entry dsa_indexer_score_bf16(
+    .param .u64 param_q,         // [B, S, H_idx, D_idx] BF16
+    .param .u64 param_k,         // [B, T, D_idx]        BF16
+    .param .u64 param_weights,   // [B, S, H_idx]        FP32
+    .param .u64 param_out,       // [B, S, T]            FP32
+    .param .u32 param_seq_q,     // S
+    .param .u32 param_seq_kv     // T
+)
+{
+    .reg .b32  %r<32>;
+    .reg .b64  %rd<32>;
+    .reg .b16  %h<8>;
+    .reg .f32  %f<160>;
+    .reg .pred %p<8>;
+
+    // Indexing
+    mov.u32     %r0, %ctaid.x;             // bs = b * S + s
+    mov.u32     %r1, %ctaid.y;             // t_tile
+    mov.u32     %r2, %tid.x;               // t_local in [0, TILE_T)
+    ld.param.u32 %r3, [param_seq_q];       // S
+    ld.param.u32 %r4, [param_seq_kv];      // T
+
+    // b = bs / S, s = bs % S
+    div.u32     %r5, %r0, %r3;             // b
+    rem.u32     %r6, %r0, %r3;             // s
+
+    // t_global = t_tile * TILE_T + t_local
+    shl.b32     %r7, %r1, 7;               // t_tile * 128
+    add.u32     %r7, %r7, %r2;             // t_global
+
+    // ========================================================================
+    // Stage 1: cooperatively load Q[b, s, :, :] and weights[b, s, :] into SMEM
+    // ========================================================================
+    //   Q  : H_IDX * D_IDX = 4096 BF16 values
+    //   W  : H_IDX = 32 FP32 values
+    //   128 threads -> each loads 32 BF16 of Q. First 32 threads load 1 FP32 of W.
+    // ========================================================================
+
+    ld.param.u64 %rd0, [param_q];          // Q base
+    // Q offset for this (b, s): (b * S + s) * H_IDX * D_IDX BF16 elems
+    //   = bs * H_IDX * D_IDX * 2 bytes
+    mul.lo.u32   %r8, %r0, H_IDX * D_IDX;  // bs * 4096 elems
+    mul.wide.u32 %rd1, %r8, 2;             // bytes
+    add.u64      %rd2, %rd0, %rd1;         // &Q[b, s, 0, 0]
+
+    mov.u32     %r9, dsa_smem;             // smem base
+    // Each thread loads 32 BF16 (one per stride of 128).
+    // t_local owns indices: t_local, t_local + 128, ..., t_local + 31*128.
+    mov.u32     %r10, 0;
+load_q_loop:
+    setp.ge.u32 %p0, %r10, 32;
+    @%p0 bra    load_q_done;
+    shl.b32     %r11, %r10, 7;             // i * 128
+    add.u32     %r12, %r11, %r2;           // i*128 + t_local  (elem idx)
+    shl.b32     %r13, %r12, 1;             // bytes
+    // Load BF16 from gmem
+    cvt.u64.u32 %rd3, %r13;
+    add.u64     %rd4, %rd2, %rd3;
+    ld.global.b16 %h0, [%rd4];
+    // Store BF16 to smem at same offset
+    add.u32     %r14, %r9, %r13;
+    st.shared.b16 [%r14], %h0;
+    add.u32     %r10, %r10, 1;
+    bra         load_q_loop;
+load_q_done:
+
+    // Load weights[b, s, :] — first 32 threads each load 1 FP32
+    setp.ge.u32 %p1, %r2, H_IDX;
+    @%p1 bra    load_w_done;
+    ld.param.u64 %rd5, [param_weights];
+    // offset: bs * H_IDX * 4 bytes + t_local * 4
+    mul.lo.u32  %r15, %r0, H_IDX;          // bs * 32
+    add.u32     %r15, %r15, %r2;           // + t_local
+    shl.b32     %r16, %r15, 2;             // *4 bytes
+    cvt.u64.u32 %rd6, %r16;
+    add.u64     %rd7, %rd5, %rd6;
+    ld.global.f32 %f0, [%rd7];
+    // Store at smem[SMEM_W_OFF + t_local*4]
+    shl.b32     %r17, %r2, 2;
+    add.u32     %r18, %r9, SMEM_W_OFF;
+    add.u32     %r18, %r18, %r17;
+    st.shared.f32 [%r18], %f0;
+load_w_done:
+
+    bar.sync 0;
+
+    // ========================================================================
+    // Stage 2: out-of-bounds t threads exit (after participating in bar.sync)
+    // ========================================================================
+    setp.ge.u32 %p2, %r7, %r4;
+    @%p2 bra    kernel_exit;
+
+    // ========================================================================
+    // Stage 3: load k[b, t, :] (128 BF16 → 128 FP32 registers %f1..%f128)
+    // ========================================================================
+    ld.param.u64 %rd8, [param_k];
+    // K offset: b * T * D_IDX * 2 + t * D_IDX * 2 bytes
+    mul.lo.u32  %r19, %r5, %r4;            // b * T
+    add.u32     %r19, %r19, %r7;           // b*T + t
+    mul.lo.u32  %r19, %r19, D_IDX;         // *D_IDX
+    mul.wide.u32 %rd9, %r19, 2;            // *2 bytes
+    add.u64     %rd10, %rd8, %rd9;         // &k[b, t, 0]
+
+    // Unroll into 128 FP32 regs via 64 .b32 loads of 2-packed BF16
+    // For simplicity, load 1 BF16 at a time (PTX cvt is fine; ptxas can optimize)
+    .reg .f32 k_<128>;
+    mov.u32 %r20, 0;
+load_k_loop:
+    setp.ge.u32 %p3, %r20, D_IDX;
+    @%p3 bra    load_k_done;
+    shl.b32     %r21, %r20, 1;             // i*2 bytes
+    cvt.u64.u32 %rd11, %r21;
+    add.u64     %rd12, %rd10, %rd11;
+    ld.global.b16 %h1, [%rd12];
+    cvt.f32.bf16 %f129, %h1;
+    // Store to a per-iteration FP32 register slot — but PTX needs static
+    // register references. We instead use SMEM as scratch for the unrolled
+    // load: write k_f32 to dsa_smem + (SMEM_W_OFF + 32*4) + t_local*512 + i*4.
+    // ... cleaner: store K in shared memory too, padded to avoid bank conflicts.
+    add.u32     %r20, %r20, 1;
+    bra         load_k_loop;
+load_k_done:
+
+    // ========================================================================
+    // NOTE: the elaborate "K in 128 FP32 registers" plan above is awkward
+    // in pure PTX because we'd need %f1..%f128 statically named. For the MVP
+    // MVP, we store K in a per-thread SMEM slot too. Padding by +1 column
+    // prevents 32-way bank conflicts on broadcast reads.
+    //
+    // SMEM layout (revised):
+    //   [0 .. 8191]                  Q [32, 128] BF16    = 8192 B
+    //   [8192 .. 8319]               weights [32] FP32   =  128 B
+    //   [8320 .. 8320 + per-thread K [TILE_T, D_IDX+1] BF16, padded]
+    //     = 128 * 129 * 2 = 33024 B
+    //   total = 41344 B  (well under 99 KB)
+    //
+    // We ship a SIMPLER version here: compute the dot product by
+    // re-loading k from global memory inside the head loop. That's 32 * 128
+    // BF16 loads per thread = 32x redundant traffic on K, but it sidesteps
+    // the static-register-count problem and is correct. Perf optimization
+    // (K to SMEM with padding) is a future optimization.
+    // ========================================================================
+
+    // Reset accumulator
+    mov.f32 %f1, 0.0;                      // score (accumulator across heads)
+
+    // Loop over H_IDX heads
+    mov.u32 %r22, 0;                       // h
+head_loop:
+    setp.ge.u32 %p4, %r22, H_IDX;
+    @%p4 bra    head_done;
+
+    // dot[h] = sum_{i=0..D_IDX} q_smem[h, i] * k[b, t, i]
+    mov.f32 %f2, 0.0;                      // dot accumulator
+
+    // smem_q base for head h: dsa_smem + h * D_IDX * 2
+    mul.lo.u32  %r23, %r22, D_IDX * 2;
+    add.u32     %r23, %r9, %r23;           // smem_q[h, 0]
+
+    mov.u32 %r24, 0;                       // i
+dot_loop:
+    setp.ge.u32 %p5, %r24, D_IDX;
+    @%p5 bra    dot_done;
+    // Load q[h, i] from SMEM
+    shl.b32     %r25, %r24, 1;
+    add.u32     %r26, %r23, %r25;
+    ld.shared.b16 %h2, [%r26];
+    cvt.f32.bf16 %f3, %h2;
+    // Load k[b, t, i] from global
+    cvt.u64.u32 %rd13, %r25;
+    add.u64     %rd14, %rd10, %rd13;
+    ld.global.b16 %h3, [%rd14];
+    cvt.f32.bf16 %f4, %h3;
+    // dot += q * k
+    fma.rn.f32  %f2, %f3, %f4, %f2;
+    add.u32     %r24, %r24, 1;
+    bra         dot_loop;
+dot_done:
+
+    // ReLU
+    max.f32     %f2, %f2, 0f00000000;      // max(dot, 0.0)
+
+    // Multiply by weights[h]
+    shl.b32     %r27, %r22, 2;
+    add.u32     %r28, %r9, SMEM_W_OFF;
+    add.u32     %r28, %r28, %r27;
+    ld.shared.f32 %f5, [%r28];
+    mul.f32     %f2, %f2, %f5;
+
+    // Accumulate into score
+    add.f32     %f1, %f1, %f2;
+
+    add.u32     %r22, %r22, 1;
+    bra         head_loop;
+head_done:
+
+    // ========================================================================
+    // Stage 4: write index_score[b, s, t] = score
+    // ========================================================================
+    ld.param.u64 %rd15, [param_out];
+    // offset: (bs * T + t) * 4 bytes
+    mul.lo.u32  %r29, %r0, %r4;            // bs * T
+    add.u32     %r29, %r29, %r7;           // bs*T + t
+    shl.b32     %r30, %r29, 2;             // *4
+    cvt.u64.u32 %rd16, %r30;
+    add.u64     %rd17, %rd15, %rd16;
+    st.global.f32 [%rd17], %f1;
+
+kernel_exit:
+    ret;
+}

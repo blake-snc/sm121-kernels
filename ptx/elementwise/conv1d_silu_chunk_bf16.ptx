@@ -1,0 +1,140 @@
+// conv1d_silu_chunk_bf16.ptx
+//
+// Chunked depthwise causal conv1d (kernel=4) + SiLU over M consecutive tokens
+// of ONE sequence. Byte-identical to running conv1d_silu_bf16 M times while
+// threading the 3-tap state across tokens: same f32 fma order, same ex2/rcp
+// SiLU, same bf16 round points. One thread per channel; the 3-tap sliding
+// window is kept in registers (as the original bf16 values) and only the FINAL
+// state is written back.
+//
+// For channel c, with x[-3..-1] = state[0..2] and x[t] = current[t, c]:
+//   y[t]   = w[c,0]*x[t-3] + w[c,1]*x[t-2] + w[c,2]*x[t-1] + w[c,3]*x[t]
+//   out[t] = silu(y[t]) = y * sigmoid(y)
+// Final state[0..2, c] = x[M-3 .. M-1] (the last 3 input tokens). Correct for
+// any M >= 0 because the window slides from the initial state.
+//
+// Layouts (all BF16):
+//   state:   [3, total_qkv]      channel-minor (state[tap,c] at tap*stride + c*2)
+//   current: [M, total_qkv]      row-major (token-major, channel-minor)
+//   weight:  [total_qkv, 1, 4]   4 BF16 per channel contiguous (c*8 bytes)
+//   out:     [M, total_qkv]      row-major
+//
+// Grid: (ceil(total_qkv / BLOCK), 1, 1).  Block: (128, 1, 1).
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+
+#define MINUS_LOG2E_F32 0fBFB8AA3B    // -1.4426950409
+#define ONE_F32   0f3F800000          // 1.0
+
+.visible .entry conv1d_silu_chunk_bf16(
+    .param .u64 param_state,      // [3, total_qkv] BF16 in/out
+    .param .u64 param_current,    // [M, total_qkv] BF16
+    .param .u64 param_weight,     // [total_qkv, 1, 4] BF16
+    .param .u64 param_out,        // [M, total_qkv] BF16
+    .param .u32 param_total_qkv,
+    .param .u32 param_m
+)
+{
+    .reg .b32  %r<16>;
+    .reg .b64  %rd<16>;
+    .reg .f32  %f<24>;
+    .reg .b16  %h<16>;
+    .reg .pred %p<4>;
+
+    // Channel index c = blockIdx.x * blockDim.x + threadIdx.x
+    mov.u32         %r0, %tid.x;
+    mov.u32         %r1, %ctaid.x;
+    mov.u32         %r2, %ntid.x;
+    mad.lo.u32      %r3, %r1, %r2, %r0;
+
+    ld.param.u32    %r4, [param_total_qkv];
+    setp.ge.u32     %p0, %r3, %r4;
+    @%p0 bra        done;
+    ld.param.u32    %r5, [param_m];
+
+    ld.param.u64    %rd0, [param_state];
+    ld.param.u64    %rd1, [param_current];
+    ld.param.u64    %rd2, [param_weight];
+    ld.param.u64    %rd3, [param_out];
+
+    // c*2 byte offset within a row; row/state stride = total_qkv*2 bytes
+    mul.wide.u32    %rd4, %r3, 2;
+    mul.lo.u32      %r6, %r4, 2;
+    cvt.u64.u32     %rd5, %r6;
+
+    // weight w0..w3 at c*8 bytes (4 contiguous BF16)
+    shl.b32         %r7, %r3, 3;
+    cvt.u64.u32     %rd6, %r7;
+    add.u64         %rd7, %rd2, %rd6;
+    ld.global.b16   %h4, [%rd7];
+    ld.global.b16   %h5, [%rd7 + 2];
+    ld.global.b16   %h6, [%rd7 + 4];
+    ld.global.b16   %h7, [%rd7 + 6];
+    cvt.f32.bf16    %f4, %h4;        // w0
+    cvt.f32.bf16    %f5, %h5;        // w1
+    cvt.f32.bf16    %f6, %h6;        // w2
+    cvt.f32.bf16    %f7, %h7;        // w3
+
+    // initial 3-tap window, kept as original bf16 in %h1,%h2,%h3
+    add.u64         %rd8, %rd0, %rd4;     // &state[0,c]
+    ld.global.b16   %h1, [%rd8];          // window0 = x[t-3]
+    add.u64         %rd9, %rd8, %rd5;     // &state[1,c]
+    ld.global.b16   %h2, [%rd9];          // window1 = x[t-2]
+    add.u64         %rd10, %rd9, %rd5;    // &state[2,c]
+    ld.global.b16   %h3, [%rd10];         // window2 = x[t-1]
+
+    // running token pointers for current[t,c] and out[t,c]
+    add.u64         %rd11, %rd1, %rd4;    // &current[0,c]
+    add.u64         %rd12, %rd3, %rd4;    // &out[0,c]
+
+    mov.u32         %r8, 0;               // t
+
+loop:
+    setp.ge.u32     %p1, %r8, %r5;
+    @%p1 bra        loop_end;
+
+    ld.global.b16   %h0, [%rd11];         // cur = x[t]
+    cvt.f32.bf16    %f0, %h0;
+    cvt.f32.bf16    %f1, %h1;             // window0
+    cvt.f32.bf16    %f2, %h2;             // window1
+    cvt.f32.bf16    %f3, %h3;             // window2
+
+    // y = w0*window0 + w1*window1 + w2*window2 + w3*cur  (same order as M=1 kernel)
+    mul.f32         %f8, %f4, %f1;
+    fma.rn.f32      %f8, %f5, %f2, %f8;
+    fma.rn.f32      %f8, %f6, %f3, %f8;
+    fma.rn.f32      %f8, %f7, %f0, %f8;
+
+    // silu(y) = y / (1 + 2^(-y*log2 e))
+    mul.f32         %f9, %f8, MINUS_LOG2E_F32;
+    ex2.approx.f32  %f10, %f9;
+    add.f32         %f11, %f10, ONE_F32;
+    rcp.approx.f32  %f12, %f11;
+    mul.f32         %f13, %f8, %f12;
+
+    cvt.rn.bf16.f32 %h8, %f13;
+    st.global.b16   [%rd12], %h8;
+
+    // slide window (bf16): window0<-window1, window1<-window2, window2<-cur
+    mov.b16         %h1, %h2;
+    mov.b16         %h2, %h3;
+    mov.b16         %h3, %h0;
+
+    add.u64         %rd11, %rd11, %rd5;
+    add.u64         %rd12, %rd12, %rd5;
+    add.u32         %r8, %r8, 1;
+    bra             loop;
+
+loop_end:
+    // final state = last 3 input tokens (original bf16) -> byte-exact
+    st.global.b16   [%rd8],  %h1;
+    st.global.b16   [%rd9],  %h2;
+    st.global.b16   [%rd10], %h3;
+
+done:
+    ret;
+}

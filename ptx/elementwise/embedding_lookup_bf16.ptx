@@ -1,0 +1,99 @@
+// embedding_lookup_bf16.ptx
+//
+// Token embedding lookup for BF16 embedding tables.
+//   out[b, d] = embedding_table[token_ids[b], d]  for d in [0, hidden_dim)
+//
+// Layout:
+//   token_ids: [num_tokens] u32
+//   embedding_table: [vocab_size, hidden_dim] bf16
+//   out: [num_tokens, hidden_dim] bf16
+//
+// Grid: (num_tokens, 1, 1)  — one CTA per token
+// Block: (256, 1, 1)
+// Each thread copies 4 BF16 values per iteration via packed v2.b32 I/O.
+// Optional: clamp token_id to [0, vocab_size-1] to guard against bad inputs.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+
+.visible .entry embedding_lookup_bf16(
+    .param .u64 param_token_ids,   // [num_tokens] u32
+    .param .u64 param_embedding,   // [vocab_size, hidden_dim] bf16
+    .param .u64 param_out,         // [num_tokens, hidden_dim] bf16
+    .param .u32 param_hidden_dim,  // embedding dimension
+    .param .u32 param_vocab_size   // for clamping safety
+)
+{
+    .reg .b32 %r<24>;
+    .reg .b64 %rd<16>;
+    .reg .pred %p<4>;
+
+    mov.u32         %r0, BLOCK_ID_X;            // token index
+    mov.u32         %r1, THREAD_ID;
+
+    ld.param.u64    %rd0, [param_token_ids];
+    ld.param.u64    %rd1, [param_embedding];
+    ld.param.u64    %rd2, [param_out];
+    ld.param.u32    %r2, [param_hidden_dim];
+    ld.param.u32    %r3, [param_vocab_size];
+
+    // Load token_id for this row (any thread can do it; the value is the same per CTA)
+    mul.wide.u32    %rd3, %r0, 4;
+    add.u64         %rd4, %rd0, %rd3;
+    ld.global.u32   %r4, [%rd4];                // token_id
+    // Clamp to valid range: min(token_id, vocab_size - 1)
+    sub.u32         %r5, %r3, 1;
+    min.u32         %r4, %r4, %r5;
+
+    // Compute source row in embedding table: token_id * hidden_dim
+    mul.lo.u32      %r6, %r4, %r2;
+    mul.wide.u32    %rd5, %r6, 2;
+    add.u64         %rd6, %rd1, %rd5;           // &embedding[token_id, 0]
+
+    // Destination row: out[batch_idx, :]
+    mul.lo.u32      %r7, %r0, %r2;
+    mul.wide.u32    %rd7, %r7, 2;
+    add.u64         %rd8, %rd2, %rd7;           // &out[batch_idx, 0]
+
+    mov.u32         %r8, %ntid.x;
+    shl.b32         %r9, %r8, 2;                // vec_stride = 4 * blockDim
+    sub.u32         %r10, %r9, 1;
+    not.b32         %r10, %r10;
+    and.b32         %r11, %r2, %r10;            // vec_limit = hidden rounded down to vec_stride
+
+    shl.b32         %r12, %r1, 2;               // i = tid * 4
+
+vec_loop:
+    setp.ge.u32     %p0, %r12, %r11;
+    @%p0 bra        vec_done;
+
+    mul.wide.u32    %rd9, %r12, 2;
+    add.u64         %rd10, %rd6, %rd9;
+    add.u64         %rd11, %rd8, %rd9;
+    ld.global.v2.b32 {%r14, %r15}, [%rd10];
+    st.global.v2.b32 [%rd11], {%r14, %r15};
+
+    add.u32         %r12, %r12, %r9;
+    bra             vec_loop;
+
+vec_done:
+    // Scalar tail
+    add.u32         %r12, %r11, %r1;
+
+tail:
+    setp.ge.u32     %p0, %r12, %r2;
+    @%p0 bra        done;
+    mul.wide.u32    %rd9, %r12, 2;
+    add.u64         %rd10, %rd6, %rd9;
+    add.u64         %rd11, %rd8, %rd9;
+    ld.global.b16   %r14, [%rd10];
+    st.global.b16   [%rd11], %r14;
+    add.u32         %r12, %r12, %r8;
+    bra             tail;
+
+done:
+    ret;
+}

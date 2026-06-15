@@ -1,0 +1,273 @@
+// fa_bf16_mla_decode_paged.ptx
+//
+// Multi-head Latent Attention (MLA) — BF16 decode with PAGED KV cache.
+// Used by DeepSeek V3 / GLM-4.5/5 in production serving (vLLM/SGLang style).
+//
+// Layout differences from non-paged MLA:
+//   c_kv:    [num_pages, page_size, D_C]  BF16 (page pool, shared across heads)
+//   k_rope:  [num_pages, page_size, D_R]  BF16
+//   page_table: [batch, max_pages] u32    physical page index per logical token block
+//   seq_lens:   [batch] u32                actual sequence length per batch
+//
+// For batch b, token s:
+//   page_idx     = page_table[b * max_pages + s / page_size]
+//   within_page  = s % page_size
+//   c_kv_row     = page_idx * page_size + within_page
+//   c_kv_addr    = c_kv_pool + c_kv_row * D_C * 2 (BF16)
+//
+// Grid (num_heads, batch). Block 128 threads.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+#include "reduction.ptxh"
+
+#define D_C 512
+#define D_R 64
+#define BLOCK_DIM 128
+#define NUM_WARPS 4
+
+.shared .align 4 .b8 smem_warp_sum_pg[16];
+.shared .align 4 .b8 smem_score_pg[4];
+.shared .align 16 .b8 smem_qc_pg[1024];
+.shared .align 4  .b8 smem_qr_pg[128];
+
+.visible .entry fa_bf16_mla_decode_paged(
+    .param .u64 param_Q_c,           // [B, H, D_C] BF16
+    .param .u64 param_Q_r,           // [B, H, D_R] BF16
+    .param .u64 param_c_kv,          // [num_pages, page_size, D_C] BF16
+    .param .u64 param_k_rope,        // [num_pages, page_size, D_R] BF16
+    .param .u64 param_page_table,    // [B, max_pages] u32
+    .param .u64 param_seq_lens,      // [B] u32
+    .param .u64 param_O,             // [B, H, D_C] BF16
+    .param .u32 param_num_heads,
+    .param .u32 param_max_pages,
+    .param .u32 param_page_size,
+    .param .f32 param_scale
+)
+{
+    .reg .b32 %r<64>;
+    .reg .b64 %rd<20>;
+    .reg .f32 %f<40>;
+    .reg .b16 %h<8>;
+    .reg .pred %p<8>;
+
+    mov.u32     %r0, %tid.x;
+    mov.u32     %r1, %ctaid.x;             // head
+    mov.u32     %r2, %ctaid.y;             // batch
+
+    ld.param.u64 %rd0, [param_Q_c];
+    ld.param.u64 %rd1, [param_Q_r];
+    ld.param.u64 %rd2, [param_c_kv];
+    ld.param.u64 %rd3, [param_k_rope];
+    ld.param.u64 %rd13, [param_page_table];
+    ld.param.u64 %rd14, [param_seq_lens];
+    ld.param.u64 %rd4, [param_O];
+    ld.param.u32 %r3, [param_num_heads];
+    ld.param.u32 %r40, [param_max_pages];
+    ld.param.u32 %r41, [param_page_size];
+    ld.param.f32 %f0, [param_scale];
+
+    shr.b32     %r5, %r0, 5;
+    and.b32     %r6, %r0, 31;
+
+    // Load this batch's seq length
+    mul.wide.u32 %rd5, %r2, 4;
+    add.u64     %rd6, %rd14, %rd5;
+    ld.global.u32 %r42, [%rd6];           // seq_len
+
+    // Q staging (same as non-paged decode)
+    mul.lo.u32  %r7, %r2, %r3;
+    add.u32     %r7, %r7, %r1;             // b*H + h
+    mul.lo.u32  %r8, %r7, D_C;
+    mul.wide.u32 %rd5, %r8, 2;
+    add.u64     %rd6, %rd0, %rd5;
+    mul.lo.u32  %r9, %r7, D_R;
+    mul.wide.u32 %rd5, %r9, 2;
+    add.u64     %rd7, %rd1, %rd5;
+
+    shl.b32     %r11, %r0, 3;
+    cvt.u64.u32 %rd10, %r11;
+    add.u64     %rd8, %rd6, %rd10;
+    ld.global.v2.b32 {%r12, %r13}, [%rd8];
+    mov.u32     %r14, smem_qc_pg;
+    add.u32     %r14, %r14, %r11;
+    st.shared.v2.b32 [%r14], {%r12, %r13};
+
+    setp.lt.u32 %p0, %r0, D_R;
+    @%p0 shl.b32   %r11, %r0, 1;
+    @%p0 cvt.u64.u32 %rd10, %r11;
+    @%p0 add.u64   %rd8, %rd7, %rd10;
+    @%p0 ld.global.b16 %h0, [%rd8];
+    @%p0 mov.u32   %r14, smem_qr_pg;
+    @%p0 add.u32   %r14, %r14, %r11;
+    @%p0 st.shared.b16 [%r14], %h0;
+
+    bar.sync 0;
+
+    mov.u32     %r14, smem_qc_pg;
+    shl.b32     %r11, %r0, 3;
+    add.u32     %r14, %r14, %r11;
+    ld.shared.v2.b32 {%r12, %r13}, [%r14];
+    mov.b32     {%h0, %h1}, %r12;
+    mov.b32     {%h2, %h3}, %r13;
+    CVT_BF16_F32(%f1, %h0)
+    CVT_BF16_F32(%f2, %h1)
+    CVT_BF16_F32(%f3, %h2)
+    CVT_BF16_F32(%f4, %h3)
+
+    @%p0 shl.b32   %r11, %r0, 1;
+    @%p0 mov.u32   %r14, smem_qr_pg;
+    @%p0 add.u32   %r14, %r14, %r11;
+    @%p0 ld.shared.b16 %h0, [%r14];
+    mov.f32     %f5, 0f00000000;
+    @%p0 CVT_BF16_F32(%f5, %h0)
+
+    mov.f32     %f10, 0.0;  mov.f32 %f11, 0.0;  mov.f32 %f12, 0.0;  mov.f32 %f13, 0.0;
+    mov.b32     %f6, 0xff800000;
+    mov.f32     %f7, 0.0;
+
+    // Page table base for this batch: page_table + b * max_pages * 4
+    mul.lo.u32  %r43, %r2, %r40;          // b * max_pages
+    mul.wide.u32 %rd5, %r43, 4;
+    add.u64     %rd15, %rd13, %rd5;       // &page_table[b, 0]
+
+    // Per-thread byte offset within a row of c_kv: t*8 (4 BF16)
+    shl.b32     %r17, %r0, 3;
+    cvt.u64.u32 %rd11, %r17;
+
+    // Per-thread byte offset within a row of k_rope: t*2 (1 BF16, threads 0-63)
+    @%p0 shl.b32 %r19, %r0, 1;
+    @%p0 cvt.u64.u32 %rd12, %r19;
+
+    // Main loop: s in [0, seq_len)
+    mov.u32     %r20, 0;
+s_loop:
+    setp.ge.u32 %p1, %r20, %r42;
+    @%p1 bra    s_done;
+
+    // page_idx = page_table[b, s / page_size]; within_page = s % page_size
+    div.u32     %r44, %r20, %r41;
+    rem.u32     %r45, %r20, %r41;
+    mul.wide.u32 %rd5, %r44, 4;
+    add.u64     %rd9, %rd15, %rd5;
+    ld.global.u32 %r46, [%rd9];           // page_idx (physical)
+
+    // c_kv row = page_idx * page_size + within_page
+    mul.lo.u32  %r47, %r46, %r41;
+    add.u32     %r47, %r47, %r45;         // c_kv row index
+    mul.lo.u32  %r48, %r47, D_C;          // row offset (elements)
+    mul.wide.u32 %rd5, %r48, 2;           // bytes
+    add.u64     %rd16, %rd2, %rd5;
+    add.u64     %rd16, %rd16, %rd11;    // + per-thread t*8
+    ld.global.v2.b32 {%r22, %r23}, [%rd16];
+    mov.b32     {%h0, %h1}, %r22;
+    mov.b32     {%h2, %h3}, %r23;
+    CVT_BF16_F32(%f20, %h0)
+    CVT_BF16_F32(%f21, %h1)
+    CVT_BF16_F32(%f22, %h2)
+    CVT_BF16_F32(%f23, %h3)
+
+    mul.f32     %f24, %f1, %f20;
+    fma.rn.f32  %f24, %f2, %f21, %f24;
+    fma.rn.f32  %f24, %f3, %f22, %f24;
+    fma.rn.f32  %f24, %f4, %f23, %f24;
+
+    // k_rope row offset
+    mul.lo.u32  %r49, %r47, D_R;
+    mul.wide.u32 %rd5, %r49, 2;
+    add.u64     %rd17, %rd3, %rd5;
+    mov.f32     %f25, 0f00000000;
+    @%p0 add.u64 %rd17, %rd17, %rd12;
+    @%p0 ld.global.b16 %h0, [%rd17];
+    @%p0 CVT_BF16_F32(%f25, %h0)
+
+    fma.rn.f32  %f24, %f5, %f25, %f24;
+
+    // Warp + block reduce
+    shfl.sync.bfly.b32  %f26|%p5, %f24, 0x10, 0x1f, 0xffffffff;
+    add.f32     %f24, %f24, %f26;
+    shfl.sync.bfly.b32  %f26|%p5, %f24, 0x08, 0x1f, 0xffffffff;
+    add.f32     %f24, %f24, %f26;
+    shfl.sync.bfly.b32  %f26|%p5, %f24, 0x04, 0x1f, 0xffffffff;
+    add.f32     %f24, %f24, %f26;
+    shfl.sync.bfly.b32  %f26|%p5, %f24, 0x02, 0x1f, 0xffffffff;
+    add.f32     %f24, %f24, %f26;
+    shfl.sync.bfly.b32  %f26|%p5, %f24, 0x01, 0x1f, 0xffffffff;
+    add.f32     %f24, %f24, %f26;
+
+    setp.eq.u32 %p2, %r6, 0;
+    shl.b32     %r25, %r5, 2;
+    mov.u32     %r26, smem_warp_sum_pg;
+    add.u32     %r26, %r26, %r25;
+    @%p2 st.shared.f32 [%r26], %f24;
+    bar.sync 0;
+
+    setp.lt.u32 %p3, %r0, NUM_WARPS;
+    mov.f32     %f27, 0f00000000;
+    @%p3 shl.b32 %r25, %r0, 2;
+    @%p3 mov.u32 %r26, smem_warp_sum_pg;
+    @%p3 add.u32 %r26, %r26, %r25;
+    @%p3 ld.shared.f32 %f27, [%r26];
+    shfl.sync.bfly.b32  %f28|%p5, %f27, 0x02, 0x1f, 0xffffffff;
+    add.f32     %f27, %f27, %f28;
+    shfl.sync.bfly.b32  %f28|%p5, %f27, 0x01, 0x1f, 0xffffffff;
+    add.f32     %f27, %f27, %f28;
+
+    setp.eq.u32 %p4, %r0, 0;
+    mul.f32     %f27, %f27, %f0;
+    mov.u32     %r26, smem_score_pg;
+    @%p4 st.shared.f32 [%r26], %f27;
+    bar.sync 0;
+
+    ld.shared.f32 %f29, [smem_score_pg];
+
+    max.f32     %f30, %f6, %f29;
+    sub.f32     %f31, %f6, %f30;
+    mul.f32     %f31, %f31, LOG2E;
+    ex2.approx.ftz.f32 %f31, %f31;
+    sub.f32     %f32, %f29, %f30;
+    mul.f32     %f32, %f32, LOG2E;
+    ex2.approx.ftz.f32 %f32, %f32;
+
+    mov.f32     %f6, %f30;
+    mul.f32     %f7, %f7, %f31;
+    add.f32     %f7, %f7, %f32;
+
+    mul.f32     %f10, %f10, %f31;  fma.rn.f32 %f10, %f32, %f20, %f10;
+    mul.f32     %f11, %f11, %f31;  fma.rn.f32 %f11, %f32, %f21, %f11;
+    mul.f32     %f12, %f12, %f31;  fma.rn.f32 %f12, %f32, %f22, %f12;
+    mul.f32     %f13, %f13, %f31;  fma.rn.f32 %f13, %f32, %f23, %f13;
+
+    add.u32     %r20, %r20, 1;
+    bra         s_loop;
+
+s_done:
+    setp.eq.f32 %p6, %f7, 0f00000000;
+    @%p6 mov.f32 %f7, 0f3f800000;
+    rcp.approx.f32 %f31, %f7;
+    mul.f32     %f10, %f10, %f31;
+    mul.f32     %f11, %f11, %f31;
+    mul.f32     %f12, %f12, %f31;
+    mul.f32     %f13, %f13, %f31;
+
+    mul.lo.u32  %r8, %r7, D_C;
+    mul.wide.u32 %rd5, %r8, 2;
+    add.u64     %rd12, %rd4, %rd5;
+    shl.b32     %r17, %r0, 3;
+    cvt.u64.u32 %rd10, %r17;
+    add.u64     %rd12, %rd12, %rd10;
+
+    cvt.rn.bf16.f32 %h0, %f10;
+    cvt.rn.bf16.f32 %h1, %f11;
+    mov.b32     %r12, {%h0, %h1};
+    cvt.rn.bf16.f32 %h0, %f12;
+    cvt.rn.bf16.f32 %h1, %f13;
+    mov.b32     %r13, {%h0, %h1};
+    st.global.v2.b32 [%rd12], {%r12, %r13};
+
+    ret;
+}

@@ -1,0 +1,325 @@
+// gemm_w8a16_grouped_mma.ptx
+//
+// MoE grouped W8A16 GEMM with MMA. Per expert:
+//   Y_e[row, n] = bf16(b_scale * (A_e[row, k] @ dequant(B_e_fp8[k, n])))
+// where the FP8 weight is in e4m3 format and `b_scale` is a per-tensor
+// scalar multiplied into the FP32 accumulators just before the BF16 cast.
+//
+// Derived from `gemm_bf16_grouped_mma` — identical 32x32 tile + ldmatrix +
+// MMA m16n8k16 + per-expert padding pattern. Only the B-load section
+// differs: each thread fetches 16 FP8 bytes (one v4.b32) instead of 32
+// BF16 bytes, runs the FP8 → BF16 dequant inline, and stores BF16 into
+// the same SMEM layout the ldmatrix consumes. The per-tensor scale is
+// applied once per output element at store time rather than per K-step.
+//
+// Used by the Gemma-4-26B-A4B Path B cross-seq xseq mode to replace the
+// `gemv_w8a16_grouped_split_k` calls when each per-expert tile has enough
+// tokens (M_e ≥ 16) to fill an MMA m-tile. At low M_e the kernel still
+// runs correctly but the m-row padding wastes compute — caller should
+// dispatch the grouped GEMV variant when avg M_e < 8.
+//
+// Layout:
+//   A: [total_tokens, K] BF16 row-major
+//   B: [num_experts, K, N] u8 (FP8 e4m3) row-major
+//   b_scale: f32 (per-tensor)
+//   C: [total_tokens, N] BF16 row-major
+//   expert_offsets: [num_experts+1] u32
+//
+// Grid: (ceil(N/32), ceil(max_tokens_per_expert/32), num_experts)
+// Block: (32, 1, 1) — 1 warp.
+// Requires N divisible by 32 and K divisible by 16. M per expert arbitrary.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+#include "mma.ptxh"
+
+.visible .entry gemm_w8a16_grouped_mma(
+    .param .u64 param_A,
+    .param .u64 param_B,
+    .param .u64 param_C,
+    .param .u64 param_expert_offsets,
+    .param .f32 param_b_scale,
+    .param .u32 param_N,
+    .param .u32 param_K
+)
+{
+    .reg .b32  %r<100>;
+    .reg .b64  %rd<12>;
+    .reg .f32  %f<35>;
+    .reg .b16  %h<20>;
+    .reg .pred %p<8>;
+
+    // SMEM: A tile 32x16 = 1024 B, B tile 16x32 = 1024 B → 2048 B total.
+    .shared .align 128 .b8 smem[2048];
+
+    mov.u32         %r40, %tid.x;
+    mov.u32         %r41, %ctaid.x;              // n_tile
+    mov.u32         %r42, %ctaid.y;              // m_tile
+    mov.u32         %r43, %ctaid.z;              // expert_id
+
+    ld.param.u64    %rd0, [param_A];
+    ld.param.u64    %rd1, [param_B];
+    ld.param.u64    %rd2, [param_C];
+    ld.param.u64    %rd3, [param_expert_offsets];
+    ld.param.f32    %f32, [param_b_scale];       // hoisted; applied at store time
+    ld.param.u32    %r44, [param_N];
+    ld.param.u32    %r45, [param_K];
+
+    // Expert token range.
+    mul.wide.u32    %rd4, %r43, 4;
+    add.u64         %rd5, %rd3, %rd4;
+    ld.global.u32   %r46, [%rd5];                // start_row
+    ld.global.u32   %r47, [%rd5 + 4];            // end_row
+    sub.u32         %r48, %r47, %r46;            // expert_tokens
+
+    shl.b32         %r49, %r42, 5;               // m_tile * 32
+    setp.ge.u32     %p0, %r49, %r48;
+    @%p0 ret;
+
+    shl.b32         %r50, %r41, 5;               // n_tile * 32 = n_off
+    setp.ge.u32     %p1, %r50, %r44;
+    @%p1 ret;
+
+    add.u32         %r51, %r46, %r49;            // first_row = start_row + m_tile*32
+    sub.u32         %r52, %r48, %r49;            // expert_tokens - m_tile*32
+    min.u32         %r52, %r52, 32;              // row_count (1..32)
+
+    // === A global base for this tile ===
+    mul.lo.u32      %r53, %r51, %r45;
+    mul.wide.u32    %rd6, %r53, 2;
+    add.u64         %rd6, %rd0, %rd6;            // &A[first_row, 0]
+
+    // === B global base for (expert, 0, n_off) — FP8 stride is 1 byte ===
+    mul.lo.u32      %r54, %r44, %r45;            // N*K  (elements; same as bytes for FP8)
+    mul.lo.u32      %r55, %r43, %r54;            // expert*K*N
+    add.u32         %r55, %r55, %r50;            // + n_off
+    cvt.u64.u32     %rd7, %r55;                  // byte offset (1 B per FP8)
+    add.u64         %rd7, %rd1, %rd7;            // &B[expert, 0, n_off] (FP8)
+
+    // Initialize 32 FP32 accumulators.
+    mov.f32 %f0, 0.0;  mov.f32 %f1, 0.0;  mov.f32 %f2, 0.0;  mov.f32 %f3, 0.0;
+    mov.f32 %f4, 0.0;  mov.f32 %f5, 0.0;  mov.f32 %f6, 0.0;  mov.f32 %f7, 0.0;
+    mov.f32 %f8, 0.0;  mov.f32 %f9, 0.0;  mov.f32 %f10, 0.0; mov.f32 %f11, 0.0;
+    mov.f32 %f12, 0.0; mov.f32 %f13, 0.0; mov.f32 %f14, 0.0; mov.f32 %f15, 0.0;
+    mov.f32 %f16, 0.0; mov.f32 %f17, 0.0; mov.f32 %f18, 0.0; mov.f32 %f19, 0.0;
+    mov.f32 %f20, 0.0; mov.f32 %f21, 0.0; mov.f32 %f22, 0.0; mov.f32 %f23, 0.0;
+    mov.f32 %f24, 0.0; mov.f32 %f25, 0.0; mov.f32 %f26, 0.0; mov.f32 %f27, 0.0;
+    mov.f32 %f28, 0.0; mov.f32 %f29, 0.0; mov.f32 %f30, 0.0; mov.f32 %f31, 0.0;
+
+    // === Precompute SMEM addresses for ldmatrix ===
+    mov.u32         %r57, smem;                  // smem_A base
+    add.u32         %r58, %r57, 1024;            // smem_B base
+
+    setp.lt.u32     %p2, %r40, 16;
+    @%p2 mul.lo.u32 %r59, %r40, 32;
+    @!%p2 sub.u32   %r59, %r40, 16;
+    @!%p2 mad.lo.u32 %r59, %r59, 32, 16;
+    add.u32         %r60, %r57, %r59;            // ldm_a_mg0
+    add.u32         %r61, %r60, 512;             // ldm_a_mg1 (+ 16*32)
+
+    and.b32         %r62, %r40, 15;
+    shl.b32         %r62, %r62, 6;               // (lane%16)*64
+    add.u32         %r63, %r58, %r62;            // ldm_b_base (ng=0)
+
+    shr.b32         %r64, %r40, 2;               // groupID
+    and.b32         %r65, %r40, 3;               // tidInGroup
+    shl.b32         %r66, %r65, 1;               // tidInGroup*2
+
+    // ==================== K LOOP ====================
+    mov.u32         %r70, 0;
+k_loop:
+    setp.ge.u32     %p3, %r70, %r45;
+    @%p3 bra        k_done;
+
+    // === Load A tile: 32 rows × 16 cols (BF16) ===
+    // Same as gemm_bf16_grouped_mma: each lane loads one row's 16 BF16.
+    add.u32         %r71, %r51, %r40;
+    setp.lt.u32     %p4, %r40, %r52;             // lane < row_count
+
+    mul.lo.u32      %r72, %r71, %r45;
+    add.u32         %r72, %r72, %r70;
+    mul.wide.u32    %rd8, %r72, 2;
+    add.u64         %rd8, %rd0, %rd8;
+
+    mul.lo.u32      %r73, %r40, 32;
+    add.u32         %r73, %r57, %r73;            // smem_A + lane*32
+
+    .reg .b32 _a0a, _a1a, _a2a, _a3a, _a0b, _a1b, _a2b, _a3b;
+    @%p4 ld.global.v4.b32 {_a0a, _a1a, _a2a, _a3a}, [%rd8];
+    @%p4 ld.global.v4.b32 {_a0b, _a1b, _a2b, _a3b}, [%rd8 + 16];
+    @!%p4 mov.b32   _a0a, 0;
+    @!%p4 mov.b32   _a1a, 0;
+    @!%p4 mov.b32   _a2a, 0;
+    @!%p4 mov.b32   _a3a, 0;
+    @!%p4 mov.b32   _a0b, 0;
+    @!%p4 mov.b32   _a1b, 0;
+    @!%p4 mov.b32   _a2b, 0;
+    @!%p4 mov.b32   _a3b, 0;
+    st.shared.v4.b32 [%r73],      {_a0a, _a1a, _a2a, _a3a};
+    st.shared.v4.b32 [%r73 + 16], {_a0b, _a1b, _a2b, _a3b};
+
+    // === Load B tile: 16 K-rows × 32 N-cols (FP8, dequant to BF16 in SMEM) ===
+    // Thread assignment: 32 threads × 16 FP8 = 512 B. Two threads per K-row:
+    //   k_row = lane / 2, n_chunk = lane % 2 (0 or 1).
+    //   Each thread fetches 16 FP8 bytes from (k_row, n_chunk*16).
+    shr.b32         %r74, %r40, 1;               // k_row_in_tile
+    and.b32         %r75, %r40, 1;               // n_chunk
+    shl.b32         %r80, %r75, 4;              // n_chunk * 16 (FP8 bytes)
+    shl.b32         %r76, %r75, 5;               // n_chunk * 32 (BF16 bytes for SMEM)
+
+    add.u32         %r77, %r70, %r74;            // k + k_row
+    mul.lo.u32      %r78, %r77, %r44;            // (k+k_row) * N (FP8 elements = bytes)
+    cvt.u64.u32     %rd9, %r78;
+    add.u64         %rd9, %rd7, %rd9;
+    cvt.u64.u32     %rd10, %r80;
+    add.u64         %rd9, %rd9, %rd10;           // &B_fp8[expert, k+k_row, n_off + n_chunk*16]
+
+    add.u32         %r84, %r50, %r80;           // n_off + n_chunk*16
+    setp.lt.u32     %p5, %r84, %r44;             // within N?
+
+    shl.b32         %r85, %r74, 6;               // k_row * 64 (BF16 bytes per SMEM K-row)
+    add.u32         %r85, %r85, %r76;            // + n_chunk*32 (BF16 bytes)
+    add.u32         %r85, %r58, %r85;            // &smem_B[k_row, n_chunk*16]
+
+    // 16-byte load: 1 × v4.b32 = 16 FP8.
+    .reg .b32 _b_fp8_0, _b_fp8_1, _b_fp8_2, _b_fp8_3;
+    @%p5 ld.global.v4.b32 {_b_fp8_0, _b_fp8_1, _b_fp8_2, _b_fp8_3}, [%rd9];
+    @!%p5 mov.b32   _b_fp8_0, 0;
+    @!%p5 mov.b32   _b_fp8_1, 0;
+    @!%p5 mov.b32   _b_fp8_2, 0;
+    @!%p5 mov.b32   _b_fp8_3, 0;
+
+    // Dequant 16 FP8 → 16 BF16. Pattern from gemv_w8a16_split_k:
+    //   each b32 = 4 e4m3 = 2 e4m3x2 pairs.
+    //   Per pair: cvt.rn.f16x2.e4m3x2, split f16x2, f16→f32, f32→bf16,
+    //   pack 2 bf16 back into b32 for SMEM store.
+    .reg .b16 _p0a, _p0b, _p1a, _p1b, _p2a, _p2b, _p3a, _p3b;
+    .reg .b32 _f16x2_0, _f16x2_1, _f16x2_2, _f16x2_3;
+    .reg .b32 _f16x2_4, _f16x2_5, _f16x2_6, _f16x2_7;
+    mov.b32 {_p0a, _p0b}, _b_fp8_0;
+    mov.b32 {_p1a, _p1b}, _b_fp8_1;
+    mov.b32 {_p2a, _p2b}, _b_fp8_2;
+    mov.b32 {_p3a, _p3b}, _b_fp8_3;
+    cvt.rn.f16x2.e4m3x2 _f16x2_0, _p0a;
+    cvt.rn.f16x2.e4m3x2 _f16x2_1, _p0b;
+    cvt.rn.f16x2.e4m3x2 _f16x2_2, _p1a;
+    cvt.rn.f16x2.e4m3x2 _f16x2_3, _p1b;
+    cvt.rn.f16x2.e4m3x2 _f16x2_4, _p2a;
+    cvt.rn.f16x2.e4m3x2 _f16x2_5, _p2b;
+    cvt.rn.f16x2.e4m3x2 _f16x2_6, _p3a;
+    cvt.rn.f16x2.e4m3x2 _f16x2_7, _p3b;
+
+    // Split each f16x2 → 2 f16 → 2 f32 → 2 bf16, pack 2 bf16 → b32 for SMEM.
+    // Per pair (lo, hi): output one b32 of bf16x2.
+#define DEQUANT_PAIR_TO_BF16(out_b32, in_f16x2) \
+    { .reg .b16 _lo, _hi; \
+      .reg .f32 _flo, _fhi; \
+      .reg .b16 _blo, _bhi; \
+      mov.b32 {_lo, _hi}, in_f16x2; \
+      cvt.f32.f16 _flo, _lo; \
+      cvt.f32.f16 _fhi, _hi; \
+      CVT_F32_BF16(_blo, _flo) \
+      CVT_F32_BF16(_bhi, _fhi) \
+      mov.b32 out_b32, {_blo, _bhi}; }
+    .reg .b32 _bf_0, _bf_1, _bf_2, _bf_3, _bf_4, _bf_5, _bf_6, _bf_7;
+    DEQUANT_PAIR_TO_BF16(_bf_0, _f16x2_0)
+    DEQUANT_PAIR_TO_BF16(_bf_1, _f16x2_1)
+    DEQUANT_PAIR_TO_BF16(_bf_2, _f16x2_2)
+    DEQUANT_PAIR_TO_BF16(_bf_3, _f16x2_3)
+    DEQUANT_PAIR_TO_BF16(_bf_4, _f16x2_4)
+    DEQUANT_PAIR_TO_BF16(_bf_5, _f16x2_5)
+    DEQUANT_PAIR_TO_BF16(_bf_6, _f16x2_6)
+    DEQUANT_PAIR_TO_BF16(_bf_7, _f16x2_7)
+
+    // Store 32 bytes (16 BF16) per thread to SMEM via 2 v4.b32.
+    st.shared.v4.b32 [%r85],      {_bf_0, _bf_1, _bf_2, _bf_3};
+    st.shared.v4.b32 [%r85 + 16], {_bf_4, _bf_5, _bf_6, _bf_7};
+
+    bar.sync        0;
+
+    // === A ldmatrix: 2 m-groups (same as bf16 version) ===
+    .reg .b32 %rA0, %rA1, %rA2, %rA3, %rA4, %rA5, %rA6, %rA7;
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%rA0, %rA1, %rA2, %rA3}, [%r60];
+    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%rA4, %rA5, %rA6, %rA7}, [%r61];
+
+    // === MMAs ===
+    .reg .b32 %rB0, %rB1;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%rB0, %rB1}, [%r63];
+    MMA_BF16_M16N8K16(%f0,  %f1,  %f2,  %f3,  %rA0, %rA1, %rA2, %rA3, %rB0, %rB1)
+    MMA_BF16_M16N8K16(%f16, %f17, %f18, %f19, %rA4, %rA5, %rA6, %rA7, %rB0, %rB1)
+    add.u32         %r88, %r63, 16;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%rB0, %rB1}, [%r88];
+    MMA_BF16_M16N8K16(%f4,  %f5,  %f6,  %f7,  %rA0, %rA1, %rA2, %rA3, %rB0, %rB1)
+    MMA_BF16_M16N8K16(%f20, %f21, %f22, %f23, %rA4, %rA5, %rA6, %rA7, %rB0, %rB1)
+    add.u32         %r88, %r63, 32;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%rB0, %rB1}, [%r88];
+    MMA_BF16_M16N8K16(%f8,  %f9,  %f10, %f11, %rA0, %rA1, %rA2, %rA3, %rB0, %rB1)
+    MMA_BF16_M16N8K16(%f24, %f25, %f26, %f27, %rA4, %rA5, %rA6, %rA7, %rB0, %rB1)
+    add.u32         %r88, %r63, 48;
+    ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%rB0, %rB1}, [%r88];
+    MMA_BF16_M16N8K16(%f12, %f13, %f14, %f15, %rA0, %rA1, %rA2, %rA3, %rB0, %rB1)
+    MMA_BF16_M16N8K16(%f28, %f29, %f30, %f31, %rA4, %rA5, %rA6, %rA7, %rB0, %rB1)
+
+    bar.sync        0;
+    add.u32         %r70, %r70, 16;
+    bra             k_loop;
+
+k_done:
+    // Multiply each accumulator by b_scale before bf16 cast. Saves
+    // 16 × num_K_steps multiplies vs scaling per K-iter.
+    mul.f32 %f0, %f0, %f32;   mul.f32 %f1, %f1, %f32;   mul.f32 %f2, %f2, %f32;   mul.f32 %f3, %f3, %f32;
+    mul.f32 %f4, %f4, %f32;   mul.f32 %f5, %f5, %f32;   mul.f32 %f6, %f6, %f32;   mul.f32 %f7, %f7, %f32;
+    mul.f32 %f8, %f8, %f32;   mul.f32 %f9, %f9, %f32;   mul.f32 %f10, %f10, %f32; mul.f32 %f11, %f11, %f32;
+    mul.f32 %f12, %f12, %f32; mul.f32 %f13, %f13, %f32; mul.f32 %f14, %f14, %f32; mul.f32 %f15, %f15, %f32;
+    mul.f32 %f16, %f16, %f32; mul.f32 %f17, %f17, %f32; mul.f32 %f18, %f18, %f32; mul.f32 %f19, %f19, %f32;
+    mul.f32 %f20, %f20, %f32; mul.f32 %f21, %f21, %f32; mul.f32 %f22, %f22, %f32; mul.f32 %f23, %f23, %f32;
+    mul.f32 %f24, %f24, %f32; mul.f32 %f25, %f25, %f32; mul.f32 %f26, %f26, %f32; mul.f32 %f27, %f27, %f32;
+    mul.f32 %f28, %f28, %f32; mul.f32 %f29, %f29, %f32; mul.f32 %f30, %f30, %f32; mul.f32 %f31, %f31, %f32;
+
+    // === Store 32×32 tile back to C[start_row + m_tile*32, n_off] ===
+#define STORE_TILE_W8A16(mg, ng, d0, d1, d2, d3) \
+    { .reg .b32 _row, _col, _off; \
+      .reg .b64 _p; \
+      .reg .b16 _b0, _b1; \
+      .reg .b32 _pk; \
+      .reg .pred _rin; \
+      add.u32 _row, %r51, 0; \
+      add.u32 _row, _row, mg*16; \
+      add.u32 _row, _row, %r64; \
+      add.u32 _col, %r50, ng*8; \
+      add.u32 _col, _col, %r66; \
+      setp.lt.u32 _rin, _row, %r47; \
+      mul.lo.u32 _off, _row, %r44; \
+      add.u32 _off, _off, _col; \
+      mul.wide.u32 _p, _off, 2; \
+      add.u64 _p, %rd2, _p; \
+      CVT_F32_BF16(_b0, d0) \
+      CVT_F32_BF16(_b1, d1) \
+      mov.b32 _pk, {_b0, _b1}; \
+      @_rin st.global.b32 [_p], _pk; \
+      add.u32 _row, _row, 8; \
+      setp.lt.u32 _rin, _row, %r47; \
+      mul.lo.u32 _off, _row, %r44; \
+      add.u32 _off, _off, _col; \
+      mul.wide.u32 _p, _off, 2; \
+      add.u64 _p, %rd2, _p; \
+      CVT_F32_BF16(_b0, d2) \
+      CVT_F32_BF16(_b1, d3) \
+      mov.b32 _pk, {_b0, _b1}; \
+      @_rin st.global.b32 [_p], _pk; \
+    }
+    STORE_TILE_W8A16(0, 0, %f0,  %f1,  %f2,  %f3)
+    STORE_TILE_W8A16(0, 1, %f4,  %f5,  %f6,  %f7)
+    STORE_TILE_W8A16(0, 2, %f8,  %f9,  %f10, %f11)
+    STORE_TILE_W8A16(0, 3, %f12, %f13, %f14, %f15)
+    STORE_TILE_W8A16(1, 0, %f16, %f17, %f18, %f19)
+    STORE_TILE_W8A16(1, 1, %f20, %f21, %f22, %f23)
+    STORE_TILE_W8A16(1, 2, %f24, %f25, %f26, %f27)
+    STORE_TILE_W8A16(1, 3, %f28, %f29, %f30, %f31)
+
+    ret;
+}

@@ -1,0 +1,254 @@
+// cross_entropy_bf16.ptx
+//
+// Row-wise cross-entropy loss for language-model logits.
+//   loss[i] = -log(softmax(logits[i])[target[i]])
+//           = log_sum_exp(logits[i]) - logits[i, target[i]]
+//
+// Numerically stable form:
+//   max_i = max(logits[i])
+//   loss[i] = log(sum_j exp(logits[i,j] - max_i)) + max_i - logits[i, target[i]]
+//
+// Useful for:
+//   - perplexity computation in inference
+//   - teacher-student distillation loss
+//   - validation scoring during model deployment
+//
+// Layout:
+//   logits: [num_tokens, vocab_size] bf16 (read-only)
+//   targets: [num_tokens] i32 (ground-truth token ids)
+//   losses: [num_tokens] f32 (output, one per token)
+//
+// Grid: (num_tokens, 1, 1), one CTA per token.
+// Block: (256, 1, 1). Vectorized v2.b32 I/O.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "reduction.ptxh"
+#include "convert.ptxh"
+
+.shared .align 128 .b8 smem_reduce[128];
+
+.visible .entry cross_entropy_bf16(
+    .param .u64 param_logits,    // [num_tokens, vocab] bf16
+    .param .u64 param_targets,   // [num_tokens] i32
+    .param .u64 param_losses,    // [num_tokens] f32
+    .param .u32 param_vocab      // vocab size
+)
+{
+    .reg .b32 %r<36>;
+    .reg .b64 %rd<20>;
+    .reg .f32 %f<16>;
+    .reg .b16 %h<8>;
+    .reg .pred %p<4>;
+
+    mov.u32         %r0, BLOCK_ID_X;
+    mov.u32         %r1, THREAD_ID;
+
+    ld.param.u64    %rd0, [param_logits];
+    ld.param.u64    %rd1, [param_targets];
+    ld.param.u64    %rd2, [param_losses];
+    ld.param.u32    %r2, [param_vocab];
+
+    // Row base for logits
+    mul.lo.u32      %r3, %r0, %r2;
+    mul.wide.u32    %rd3, %r3, 2;
+    add.u64         %rd4, %rd0, %rd3;           // &logits[token, 0]
+
+    mov.u32         %r4, %ntid.x;
+    shl.b32         %r20, %r4, 2;               // vec_stride
+    sub.u32         %r21, %r20, 1;
+    not.b32         %r21, %r21;
+    and.b32         %r22, %r2, %r21;
+
+    // ============ Pass 1: row max ============
+    mov.b32         %f1, 0xff800000;            // -inf
+    shl.b32         %r5, %r1, 2;                // i = tid * 4
+
+max_vec:
+    setp.ge.u32     %p0, %r5, %r22;
+    @%p0 bra        max_done;
+    mul.wide.u32    %rd5, %r5, 2;
+    add.u64         %rd6, %rd4, %rd5;
+    ld.global.v2.b32 {%r10, %r11}, [%rd6];
+    mov.b32         {%h0, %h1}, %r10;
+    mov.b32         {%h2, %h3}, %r11;
+    CVT_BF16_F32(%f2, %h0)
+    CVT_BF16_F32(%f3, %h1)
+    CVT_BF16_F32(%f4, %h2)
+    CVT_BF16_F32(%f5, %h3)
+    max.f32         %f1, %f1, %f2;
+    max.f32         %f1, %f1, %f3;
+    max.f32         %f1, %f1, %f4;
+    max.f32         %f1, %f1, %f5;
+    add.u32         %r5, %r5, %r20;
+    bra             max_vec;
+
+max_done:
+    add.u32         %r5, %r22, %r1;
+
+max_tail:
+    setp.ge.u32     %p0, %r5, %r2;
+    @%p0 bra        max_red;
+    mul.wide.u32    %rd5, %r5, 2;
+    add.u64         %rd6, %rd4, %rd5;
+    ld.global.b16   %h0, [%rd6];
+    CVT_BF16_F32(%f2, %h0)
+    max.f32         %f1, %f1, %f2;
+    add.u32         %r5, %r5, %r4;
+    bra             max_tail;
+
+max_red:
+    WARP_REDUCE_MAX_F32(%f1, %f3)
+    WARP_ID(%r6, %r1)
+    LANE_ID(%r7, %r1)
+
+    setp.eq.u32     %p1, %r7, 0;
+    @%p1 bra        mx_ws;
+    bra             mx_after;
+mx_ws:
+    mul.wide.u32    %rd10, %r6, 4;
+    mov.u64         %rd11, smem_reduce;
+    add.u64         %rd12, %rd11, %rd10;
+    st.shared.f32   [%rd12], %f1;
+mx_after:
+    bar.sync        0;
+
+    shr.u32         %r8, %r4, 5;
+    setp.lt.u32     %p2, %r6, 1;
+    @%p2 bra        mx_w0;
+    bra             mx_bcast_read;
+
+mx_w0:
+    setp.lt.u32     %p3, %r7, %r8;
+    @%p3 bra        mx_load;
+    mov.b32         %f1, 0xff800000;
+    bra             mx_final;
+mx_load:
+    mul.wide.u32    %rd10, %r7, 4;
+    mov.u64         %rd11, smem_reduce;
+    add.u64         %rd12, %rd11, %rd10;
+    ld.shared.f32   %f1, [%rd12];
+mx_final:
+    WARP_REDUCE_MAX_F32(%f1, %f3)
+    setp.eq.u32     %p1, %r7, 0;
+    @%p1 bra        mx_store;
+    bra             mx_bcast_read;
+mx_store:
+    mov.u64         %rd11, smem_reduce;
+    st.shared.f32   [%rd11], %f1;
+mx_bcast_read:
+    bar.sync        0;
+    mov.u64         %rd11, smem_reduce;
+    ld.shared.f32   %f6, [%rd11];               // row_max
+
+    // ============ Pass 2: sum(exp(x - row_max)) ============
+    mov.f32         %f7, 0.0;                   // sum accumulator
+    shl.b32         %r5, %r1, 2;
+
+// s = ex2(clamp(x - row_max) * LOG2E)
+#define EXP_STAB(dst, x) \
+    sub.f32 dst, x, %f6; \
+    mul.f32 dst, dst, LOG2E; \
+    max.f32 dst, dst, 0fC2FA0000; \
+    ex2.approx.ftz.f32 dst, dst;
+
+sum_vec:
+    setp.ge.u32     %p0, %r5, %r22;
+    @%p0 bra        sum_done;
+    mul.wide.u32    %rd5, %r5, 2;
+    add.u64         %rd6, %rd4, %rd5;
+    ld.global.v2.b32 {%r10, %r11}, [%rd6];
+    mov.b32         {%h0, %h1}, %r10;
+    mov.b32         {%h2, %h3}, %r11;
+    CVT_BF16_F32(%f2, %h0)
+    CVT_BF16_F32(%f3, %h1)
+    CVT_BF16_F32(%f4, %h2)
+    CVT_BF16_F32(%f5, %h3)
+    EXP_STAB(%f8, %f2)
+    EXP_STAB(%f9, %f3)
+    EXP_STAB(%f10, %f4)
+    EXP_STAB(%f11, %f5)
+    add.f32         %f7, %f7, %f8;
+    add.f32         %f7, %f7, %f9;
+    add.f32         %f7, %f7, %f10;
+    add.f32         %f7, %f7, %f11;
+    add.u32         %r5, %r5, %r20;
+    bra             sum_vec;
+
+sum_done:
+    add.u32         %r5, %r22, %r1;
+
+sum_tail:
+    setp.ge.u32     %p0, %r5, %r2;
+    @%p0 bra        sum_red;
+    mul.wide.u32    %rd5, %r5, 2;
+    add.u64         %rd6, %rd4, %rd5;
+    ld.global.b16   %h0, [%rd6];
+    CVT_BF16_F32(%f2, %h0)
+    EXP_STAB(%f8, %f2)
+    add.f32         %f7, %f7, %f8;
+    add.u32         %r5, %r5, %r4;
+    bra             sum_tail;
+
+sum_red:
+    WARP_REDUCE_SUM_F32(%f7, %f3)
+    setp.eq.u32     %p1, %r7, 0;
+    @%p1 bra        sm_ws;
+    bra             sm_after;
+sm_ws:
+    mul.wide.u32    %rd10, %r6, 4;
+    mov.u64         %rd11, smem_reduce;
+    add.u64         %rd12, %rd11, %rd10;
+    st.shared.f32   [%rd12], %f7;
+sm_after:
+    bar.sync        0;
+
+    setp.lt.u32     %p2, %r6, 1;
+    @%p2 bra        sm_w0;
+    bra             sm_epilogue;
+sm_w0:
+    setp.lt.u32     %p3, %r7, %r8;
+    @%p3 bra        sm_load;
+    mov.f32         %f7, 0.0;
+    bra             sm_final;
+sm_load:
+    mul.wide.u32    %rd10, %r7, 4;
+    mov.u64         %rd11, smem_reduce;
+    add.u64         %rd12, %rd11, %rd10;
+    ld.shared.f32   %f7, [%rd12];
+sm_final:
+    WARP_REDUCE_SUM_F32(%f7, %f3)
+    setp.eq.u32     %p1, %r7, 0;
+    @%p1 bra        sm_write_loss;
+    bra             sm_epilogue;
+
+sm_write_loss:
+    // Load the target token for this row
+    mul.wide.u32    %rd13, %r0, 4;
+    add.u64         %rd14, %rd1, %rd13;
+    ld.global.u32   %r30, [%rd14];              // target token id
+    // Load logit at target (clamp to [0, vocab))
+    sub.u32         %r31, %r2, 1;
+    min.u32         %r30, %r30, %r31;
+    mul.wide.u32    %rd15, %r30, 2;
+    add.u64         %rd16, %rd4, %rd15;
+    ld.global.b16   %h4, [%rd16];
+    CVT_BF16_F32(%f12, %h4)                     // target logit (unscaled)
+
+    // loss = log(sum) + row_max - target_logit
+    lg2.approx.f32  %f13, %f7;
+    mul.f32         %f13, %f13, 0f3F317218;     // ln(2) → natural log
+    add.f32         %f13, %f13, %f6;
+    sub.f32         %f13, %f13, %f12;
+
+    // Store
+    mul.wide.u32    %rd17, %r0, 4;
+    add.u64         %rd18, %rd2, %rd17;
+    st.global.f32   [%rd18], %f13;
+
+sm_epilogue:
+    ret;
+}

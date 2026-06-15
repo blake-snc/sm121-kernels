@@ -1,0 +1,244 @@
+// gdn_prefill.ptx
+//
+// Gated DeltaNet — BF16 prefill (seq_q > 1, sequential reference).
+//
+// Same recurrence as gdn_decode.ptx, but iterates over seq_q tokens within a
+// single kernel call, keeping the state resident in SMEM throughout. This
+// avoids re-loading the D×D state from global per token (big win at D=128:
+// 64 KB reload saved per step).
+//
+// NOTE: this is an O(L) *sequential* reference — each token still depends on
+// the previous. A chunk-based O(L) parallel algorithm is future work.
+//
+// Layouts:
+//   q, k, v, y: [B, seq_q, H, D=128] BF16
+//   alpha, beta: [B, seq_q, H] FP32
+//   state: [B, H, D, D] FP16 (loaded+widened at entry, narrowed+stored at exit; compute stays FP32 in SMEM)
+//
+// Grid: (num_heads, batch). Block: (128, 1, 1).
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+#define D 128
+#define BLOCK_DIM 128
+
+#define SMEM_STATE_OFF 0
+#define SMEM_Q_OFF     65536
+#define SMEM_K_OFF     66048
+#define SMEM_V_OFF     66560
+#define SMEM_TOTAL     67072
+
+.extern .shared .align 128 .b8 gdn_pf_smem[];
+
+.visible .entry gdn_prefill(
+    .param .u64 param_q,
+    .param .u64 param_k,
+    .param .u64 param_v,
+    .param .u64 param_alpha,      // [B, seq_q, H] FP32
+    .param .u64 param_beta,       // [B, seq_q, H] FP32
+    .param .u64 param_state,      // [B, H, D, D] FP16 (in-place; widen-on-load, narrow-on-store)
+    .param .u64 param_y,          // [B, seq_q, H, D] BF16
+    .param .u32 param_num_heads,
+    .param .u32 param_seq_q
+)
+{
+    .reg .b32 %r<64>;
+    .reg .b64 %rd<20>;
+    .reg .f32 %f<32>;
+    .reg .b16 %h<4>;
+    .reg .pred %p<8>;
+
+    mov.u32     %r0, %tid.x;
+    mov.u32     %r1, %ctaid.x;             // head
+    mov.u32     %r2, %ctaid.y;             // batch
+
+    ld.param.u64 %rd0, [param_q];
+    ld.param.u64 %rd1, [param_k];
+    ld.param.u64 %rd2, [param_v];
+    ld.param.u64 %rd3, [param_alpha];
+    ld.param.u64 %rd4, [param_beta];
+    ld.param.u64 %rd5, [param_state];
+    ld.param.u64 %rd6, [param_y];
+    ld.param.u32 %r3, [param_num_heads];
+    ld.param.u32 %r30, [param_seq_q];
+
+    // bh = b*H + h
+    mul.lo.u32  %r4, %r2, %r3;
+    add.u32     %r4, %r4, %r1;
+
+    // State row t base in global: state + (bh*D*D + t*D) * 2 = state + (bh*D + t) * D * 2 (FP16)
+    mul.lo.u32  %r10, %r4, D;
+    mul.lo.u32  %r10, %r10, D;             // bh*D*D element offset
+    mul.wide.u32 %rd8, %r10, 2;
+    add.u64     %rd14, %rd5, %rd8;         // &state[b,h,0,0]
+    mul.lo.u32  %r11, %r0, D;              // t * D element offset
+    mul.wide.u32 %rd9, %r11, 2;
+    add.u64     %rd14, %rd14, %rd9;        // &state[b,h,t,0]
+
+    mov.u32     %r7, gdn_pf_smem;
+    shl.b32     %r12, %r11, 2;             // SMEM row t offset = t*D*4
+    add.u32     %r12, %r7, %r12;           // SMEM row t base
+
+    // Load state row t once at entry
+    mov.u32     %r14, 0;
+load_row:
+    setp.ge.u32 %p1, %r14, D;
+    @%p1 bra    load_row_done;
+    shl.b32     %r15, %r14, 2;             // SMEM col offset (state stays f32 in SMEM)
+    shl.b32     %r40, %r14, 1;             // global col offset (state is FP16)
+    cvt.u64.u32 %rd15, %r40;
+    add.u64     %rd15, %rd14, %rd15;
+    ld.global.b16 %h1, [%rd15];            // FP16 state load
+    cvt.f32.f16 %f6, %h1;                  // widen to f32 for compute
+    add.u32     %r16, %r12, %r15;
+    st.shared.f32 [%r16], %f6;
+    add.u32     %r14, %r14, 1;
+    bra         load_row;
+load_row_done:
+    bar.sync 0;
+
+    // seq_q loop
+    mov.u32     %r20, 0;                   // t_idx
+seq_loop:
+    setp.ge.u32 %p1, %r20, %r30;
+    @%p1 bra    seq_done;
+
+    // Load q[b, t_idx, h, 0..D], k, v
+    // Row offset: ((b*seq_q + t_idx)*H + h)*D + thread_row
+    mul.lo.u32  %r21, %r2, %r30;
+    add.u32     %r21, %r21, %r20;
+    mul.lo.u32  %r21, %r21, %r3;
+    add.u32     %r21, %r21, %r1;           // (b*Sq + t)*H + h
+    mul.lo.u32  %r22, %r21, D;
+    mul.wide.u32 %rd8, %r22, 2;
+    shl.b32     %r23, %r0, 1;               // thread_d * 2 bytes
+    cvt.u64.u32 %rd15, %r23;
+
+    add.u64     %rd16, %rd0, %rd8;
+    add.u64     %rd16, %rd16, %rd15;
+    ld.global.b16 %h0, [%rd16];            // q[b,t,h,thread_d]
+    CVT_BF16_F32(%f1, %h0)
+    add.u64     %rd16, %rd1, %rd8;
+    add.u64     %rd16, %rd16, %rd15;
+    ld.global.b16 %h0, [%rd16];            // k[b,t,h,thread_d]
+    CVT_BF16_F32(%f2, %h0)
+    add.u64     %rd16, %rd2, %rd8;
+    add.u64     %rd16, %rd16, %rd15;
+    ld.global.b16 %h0, [%rd16];            // v[b,t,h,thread_d]
+    CVT_BF16_F32(%f3, %h0)
+
+    // Broadcast q/k/v through SMEM (thread t writes its dim, then bar.sync)
+    add.u32     %r16, %r7, SMEM_Q_OFF;
+    shl.b32     %r17, %r0, 2;
+    add.u32     %r16, %r16, %r17;
+    st.shared.f32 [%r16], %f1;
+    add.u32     %r16, %r7, SMEM_K_OFF;
+    add.u32     %r16, %r16, %r17;
+    st.shared.f32 [%r16], %f2;
+    add.u32     %r16, %r7, SMEM_V_OFF;
+    add.u32     %r16, %r16, %r17;
+    st.shared.f32 [%r16], %f3;
+
+    // Load alpha, beta scalars for (b, t, h)
+    mul.wide.u32 %rd8, %r21, 4;
+    add.u64     %rd16, %rd3, %rd8;
+    ld.global.f32 %f4, [%rd16];
+    add.u64     %rd16, %rd4, %rd8;
+    ld.global.f32 %f5, [%rd16];
+
+    bar.sync 0;
+
+    // Step 1: temp[t] = Σ_j S[t,j] * k[j]
+    mov.f32     %f10, 0.0;
+    mov.u32     %r14, 0;
+step1:
+    setp.ge.u32 %p1, %r14, D;
+    @%p1 bra    step1_done;
+    shl.b32     %r15, %r14, 2;
+    add.u32     %r16, %r12, %r15;
+    ld.shared.f32 %f6, [%r16];
+    add.u32     %r17, %r7, SMEM_K_OFF;
+    add.u32     %r17, %r17, %r15;
+    ld.shared.f32 %f7, [%r17];
+    fma.rn.f32  %f10, %f6, %f7, %f10;
+    add.u32     %r14, %r14, 1;
+    bra         step1;
+step1_done:
+
+    sub.f32     %f11, %f3, %f10;           // diff[t]
+
+    // Step 3: new_state[t,j] = alpha * S[t,j] + beta * diff[t] * k[j]
+    mov.u32     %r14, 0;
+step3:
+    setp.ge.u32 %p1, %r14, D;
+    @%p1 bra    step3_done;
+    shl.b32     %r15, %r14, 2;
+    add.u32     %r16, %r12, %r15;
+    ld.shared.f32 %f6, [%r16];
+    add.u32     %r17, %r7, SMEM_K_OFF;
+    add.u32     %r17, %r17, %r15;
+    ld.shared.f32 %f7, [%r17];
+    mul.f32     %f8, %f5, %f11;
+    fma.rn.f32  %f9, %f8, %f7, 0.0;
+    fma.rn.f32  %f6, %f4, %f6, %f9;
+    st.shared.f32 [%r16], %f6;
+    add.u32     %r14, %r14, 1;
+    bra         step3;
+step3_done:
+    bar.sync 0;
+
+    // Step 4: y[t] = Σ_j new_S[t,j] * q[j]
+    mov.f32     %f13, 0.0;
+    mov.u32     %r14, 0;
+step4:
+    setp.ge.u32 %p1, %r14, D;
+    @%p1 bra    step4_done;
+    shl.b32     %r15, %r14, 2;
+    add.u32     %r16, %r12, %r15;
+    ld.shared.f32 %f6, [%r16];
+    add.u32     %r17, %r7, SMEM_Q_OFF;
+    add.u32     %r17, %r17, %r15;
+    ld.shared.f32 %f7, [%r17];
+    fma.rn.f32  %f13, %f6, %f7, %f13;
+    add.u32     %r14, %r14, 1;
+    bra         step4;
+step4_done:
+
+    // Store y[b, t_idx, h, thread_d]
+    add.u64     %rd16, %rd6, %rd8;         // wrong base (rd8 is scalar offset);
+                                           // rebuild with D-scale offset
+    mul.lo.u32  %r22, %r21, D;
+    mul.wide.u32 %rd8, %r22, 2;
+    add.u64     %rd16, %rd6, %rd8;
+    add.u64     %rd16, %rd16, %rd15;
+    cvt.rn.bf16.f32 %h0, %f13;
+    st.global.b16 [%rd16], %h0;
+
+    add.u32     %r20, %r20, 1;
+    bra         seq_loop;
+
+seq_done:
+    // Store final state back to global
+    mov.u32     %r14, 0;
+store_row:
+    setp.ge.u32 %p1, %r14, D;
+    @%p1 bra    store_done;
+    shl.b32     %r15, %r14, 2;             // SMEM col offset (state stays f32 in SMEM)
+    add.u32     %r16, %r12, %r15;
+    ld.shared.f32 %f6, [%r16];
+    shl.b32     %r40, %r14, 1;             // global col offset (state is FP16)
+    cvt.u64.u32 %rd15, %r40;
+    add.u64     %rd15, %rd14, %rd15;
+    cvt.rn.f16.f32 %h1, %f6;               // narrow to FP16 for store
+    st.global.b16 [%rd15], %h1;
+    add.u32     %r14, %r14, 1;
+    bra         store_row;
+store_done:
+
+    ret;
+}

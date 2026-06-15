@@ -1,0 +1,20 @@
+// mbarrier_helpers.ptxh
+// mbarrier initialization, arrive, and wait patterns for TMA integration
+
+#ifndef SPARK_MBARRIER_PTXH
+#define SPARK_MBARRIER_PTXH
+
+// Initialize an mbarrier. Call from thread 0 only.
+// MBARRIER_INIT(smem_addr, expected_count)
+#define MBARRIER_INIT(addr, count) \
+    mbarrier.init.shared.b64 [addr], count;
+
+// Arrive at mbarrier (no transaction bytes)
+#define MBARRIER_ARRIVE(addr) \
+    mbarrier.arrive.shared.b64 _, [addr];
+
+// Arrive with expected transaction bytes (for TMA)
+#define MBARRIER_ARRIVE_TX(addr, bytes) \
+    mbarrier.arrive.expect_tx.shared.b64 _, [addr], bytes;
+
+#endif

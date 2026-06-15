@@ -1,0 +1,169 @@
+// kv_cache_nvfp4_write.ptx
+//
+// Fused BF16→NVFP4 quantization + paged KV-cache write.
+// NVFP4 format (used by GLM-5, TransformerEngine):
+//   - 4-bit FP4 E2M1 values packed 2 per byte
+//   - 16-element blocks each with one FP8 E4M3 scale
+//   - Dequant: f32_val = fp4_val * fp8_scale
+//
+// This kernel expects PRE-COMPUTED scales (computed by a separate quant pass
+// or caller-side). For fused on-the-fly scaling, a companion variant would
+// compute block absmax → scale inside the CTA — left as future work.
+//
+// Layouts:
+//   new_k, new_v:   [B, H, D=128] BF16
+//   k_cache_packed: [num_pages, page_size, H, D/2] u8 (2 FP4 per byte)
+//   v_cache_packed: [num_pages, page_size, H, D/2] u8
+//   k_scales:       [B, H, D/16] u8 (FP8 E4M3 — one scale per 16-element block)
+//   v_scales:       [B, H, D/16] u8
+//   scale_out_k:    [num_pages, page_size, H, D/16] u8 (destination for scales)
+//   scale_out_v:    [num_pages, page_size, H, D/16] u8
+//   page_indices, slot_in_page: [B] u32
+//
+// Grid: (num_heads, batch). Block: (32, 1, 1) — one warp; thread t handles
+// 4 packed elements (= 8 FP4 values = half a 16-element block pair).
+// D=128 → 16 blocks of 16 elements → 32 threads × 4 bytes (8 FP4s) = 128 total.
+
+.version 8.8
+.target sm_121a
+.address_size 64
+
+#include "macros.ptxh"
+#include "convert.ptxh"
+
+#define D 128
+#define FP4_BLOCK 16
+
+.visible .entry kv_cache_nvfp4_write(
+    .param .u64 param_new_k,
+    .param .u64 param_new_v,
+    .param .u64 param_k_cache,
+    .param .u64 param_v_cache,
+    .param .u64 param_k_scales_in,
+    .param .u64 param_v_scales_in,
+    .param .u64 param_k_scales_out,
+    .param .u64 param_v_scales_out,
+    .param .u64 param_page_indices,
+    .param .u64 param_slot_in_page,
+    .param .u32 param_num_heads,
+    .param .u32 param_page_size
+)
+{
+    .reg .b32 %r<32>;
+    .reg .b64 %rd<20>;
+    .reg .f32 %f<16>;
+    .reg .b16 %h<8>;
+
+    mov.u32     %r0, %tid.x;           // 0..31
+    mov.u32     %r1, %ctaid.x;         // head
+    mov.u32     %r2, %ctaid.y;         // batch
+
+    ld.param.u64 %rd0, [param_new_k];
+    ld.param.u64 %rd1, [param_new_v];
+    ld.param.u64 %rd2, [param_k_cache];
+    ld.param.u64 %rd3, [param_v_cache];
+    ld.param.u64 %rd4, [param_k_scales_in];
+    ld.param.u64 %rd5, [param_v_scales_in];
+    ld.param.u64 %rd6, [param_k_scales_out];
+    ld.param.u64 %rd7, [param_v_scales_out];
+    ld.param.u64 %rd8, [param_page_indices];
+    ld.param.u64 %rd9, [param_slot_in_page];
+    ld.param.u32 %r3, [param_num_heads];
+    ld.param.u32 %r4, [param_page_size];
+
+    // Per-batch page + slot
+    mul.wide.u32 %rd10, %r2, 4;
+    add.u64     %rd11, %rd8, %rd10;
+    ld.global.u32 %r5, [%rd11];         // page_idx
+    add.u64     %rd11, %rd9, %rd10;
+    ld.global.u32 %r6, [%rd11];         // slot
+
+    // --- Source: bf16 [B, H, D] (2 bytes/elem)
+    mul.lo.u32  %r7, %r2, %r3;
+    add.u32     %r7, %r7, %r1;
+    mul.lo.u32  %r8, %r7, D;
+    mul.wide.u32 %rd12, %r8, 2;
+    shl.b32     %r9, %r0, 3;                 // thread t handles 4 bf16 = 8 bytes (will output 4 fp4 = 2 bytes packed)
+    cvt.u64.u32 %rd13, %r9;
+    add.u64     %rd14, %rd0, %rd12;
+    add.u64     %rd14, %rd14, %rd13;         // &new_k[b,h,t*4]
+    add.u64     %rd15, %rd1, %rd12;
+    add.u64     %rd15, %rd15, %rd13;         // &new_v[b,h,t*4]
+
+    // --- Scale source: fp8 [B, H, D/16] (1 byte/elem)
+    // Block index this thread belongs to: (t*4) / 16 = t/4
+    shr.b32     %r10, %r0, 2;                 // block_in_head for this thread
+    mul.lo.u32  %r11, %r7, 8;                  // (b*H+h) * (D/16) = *8
+    add.u32     %r11, %r11, %r10;
+    cvt.u64.u32 %rd13, %r11;
+    add.u64     %rd16, %rd4, %rd13;           // &k_scale_in[b,h,block]
+    add.u64     %rd17, %rd5, %rd13;           // &v_scale_in[b,h,block]
+
+    // --- Destination (packed fp4): [num_pages, page_size, H, D/2] (0.5 bytes/elem)
+    //   dest_row = page_idx*page_size + slot
+    //   byte_in_row = h*(D/2) + (t*4/2) = h*64 + t*2
+    mul.lo.u32  %r12, %r5, %r4;
+    add.u32     %r12, %r12, %r6;               // dest_row
+    mul.lo.u32  %r13, %r12, %r3;
+    add.u32     %r13, %r13, %r1;               // row*H + h
+    mul.lo.u32  %r13, %r13, 64;                // * D/2
+    shl.b32     %r14, %r0, 1;                  // t*2 bytes
+    add.u32     %r13, %r13, %r14;
+    cvt.u64.u32 %rd13, %r13;
+    add.u64     %rd18, %rd2, %rd13;           // &k_cache[...]
+    add.u64     %rd19, %rd3, %rd13;           // &v_cache[...]
+
+    // --- Destination scale: [num_pages, page_size, H, D/16]
+    mul.lo.u32  %r15, %r12, %r3;
+    add.u32     %r15, %r15, %r1;
+    mul.lo.u32  %r15, %r15, 8;
+    add.u32     %r15, %r15, %r10;
+    cvt.u64.u32 %rd13, %r15;
+    // scale destinations reuse rd6 (k_scales_out) and rd7 (v_scales_out)
+    .reg .b64 _kso, _vso;
+    add.u64     _kso, %rd6, %rd13;
+    add.u64     _vso, %rd7, %rd13;
+
+    // Macro: load 4 BF16 → 4 FP32, divide by scale, convert to FP4, pack, store
+    // FP4 E2M1 has max magnitude 6.0. Use cvt.rn.satfinite.e2m1x2.f32 (pair).
+    #define WRITE_FP4_4(src_ptr, scale_src_ptr, dst_packed, dst_scale_ptr) \
+        { .reg .b32 _a, _b; \
+          .reg .b16 _s8_in, _s8_out; \
+          .reg .f32 _scale, _inv; \
+          .reg .f32 _v0, _v1, _v2, _v3; \
+          ld.global.v2.b32 {_a, _b}, [src_ptr]; \
+          ld.global.u8 _s8_in, [scale_src_ptr]; \
+          /* Dequantize FP8 E4M3 scale to FP32 */ \
+          { .reg .b32 _f16_pair; \
+            cvt.rn.f16x2.e4m3x2 _f16_pair, _s8_in; \
+            .reg .b16 _hlo, _hhi; \
+            mov.b32 {_hlo, _hhi}, _f16_pair; \
+            cvt.f32.f16 _scale, _hlo; \
+          } \
+          /* value / scale = value * (1/scale) */ \
+          rcp.approx.f32 _inv, _scale; \
+          mov.b32 {%h0, %h1}, _a; \
+          mov.b32 {%h2, %h3}, _b; \
+          CVT_BF16_F32(_v0, %h0) \
+          CVT_BF16_F32(_v1, %h1) \
+          CVT_BF16_F32(_v2, %h2) \
+          CVT_BF16_F32(_v3, %h3) \
+          mul.f32 _v0, _v0, _inv; \
+          mul.f32 _v1, _v1, _inv; \
+          mul.f32 _v2, _v2, _inv; \
+          mul.f32 _v3, _v3, _inv; \
+          /* Paired FP32 -> FP4 E2M1, packed 2 per byte */ \
+          .reg .b8 _p01, _p23; \
+          cvt.rn.satfinite.e2m1x2.f32 _p01, _v1, _v0; \
+          cvt.rn.satfinite.e2m1x2.f32 _p23, _v3, _v2; \
+          /* Pack into 16 bits: [byte0=lo(_p01), byte1=lo(_p23)] — each byte holds 2 FP4 */ \
+          mov.b16 _s8_out, {_p01, _p23}; \
+          st.global.b16 [dst_packed], _s8_out; \
+          /* Pass scale through unchanged (caller pre-computed) */ \
+          st.global.u8 [dst_scale_ptr], _s8_in; }
+
+    WRITE_FP4_4(%rd14, %rd16, %rd18, _kso)
+    WRITE_FP4_4(%rd15, %rd17, %rd19, _vso)
+
+    ret;
+}
