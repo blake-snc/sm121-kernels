@@ -4,10 +4,10 @@
 
 To our knowledge, this is the first open-source library of hand-written PTX kernels targeting SM121 — the compute capability of the DGX Spark's GB10 superchip, and a close sibling of SM120 (the RTX 50-series). Every kernel is hand-written PTX assembly, assembled to SASS at build time by `ptxas`, embedded in a Rust binary, and dispatched through [`cudarc`](https://github.com/coreylowman/cudarc). Zero runtime CUDA-toolkit dependency: only the driver (`libcuda.so`) is needed on the box that runs it.
 
-**259 hand-written PTX kernels** (each assembled to its own SASS cubin at build time; the exact count is reported by `build.rs`) across:
+**259 hand-written PTX kernel files** (each assembled to its own SASS cubin at build time; a few are templated into multiple dtype/shape variants) across:
 
 - **Flash attention** — BF16 + FP8 forward (causal, GQA, paged-KV, split-KV, varlen, SWA, softcap, MLA), backward (BF16), FP8-KV decode and chunked-prefill paths
-- **GEMM** — BF16 MMA (incl. a warp-specialized + TMA v4), FP8, W8A16, W4A16, NVFP4/MXFP4/MXFP8 block-scaled, deterministic split-K variants, backward
+- **GEMM** — BF16 MMA (incl. register-blocked and warp-specialized + TMA variants), FP8, W8A16, W4A16, NVFP4/MXFP4/MXFP8 block-scaled, deterministic split-K variants, backward
 - **Gated DeltaNet (GDN) linear attention** — to our knowledge the only *raw hand-PTX* GDN kernel suite for SM12x (GDN otherwise lives in Triton via `flash-linear-attention`, or in CUDA): chunked prefill, MMA decode, TMA decode, state update, conv1d+SiLU, alpha/beta — the full Qwen3-Next-style hybrid-layer surface
 - **MoE** — routing, permute/unpermute, grouped GEMM in BF16/FP8/MXFP8/MXFP4/NVFP4
 - **Quantization** — FP8 per-token and 1×128-block, MXFP8, MXFP4, NVFP4 (+ KV-cache variants)
