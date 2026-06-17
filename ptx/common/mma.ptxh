@@ -37,8 +37,11 @@
     mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 \
         {d0, d1, d2, d3}, {a0, a1, a2, a3}, {b0, b1}, {d0, d1, d2, d3};
 
-// NVFP4 block-scaled MMA: m16n8k32, row.col, f32 accumulation with UE8M0 scales
-// K=32 means 32 bytes = 64 e2m1 elements per K-step.
+// MXFP4 block-scaled MMA (kind::mxf8f6f4, UE8M0/MX scales): m16n8k32, row.col, f32 accum.
+// NOTE: named MMA_NVFP4 for historical reasons, but this is MXFP4 (UE8M0 scale), NOT true
+// NVFP4 (true NVFP4 = kind::mxf4nvf4, m16n8k64, UE4M3 scale, scale_vec::4X).
+// K=32: the MMA computes K=32 (32 e2m1 per K-step) = same MAC count as FP8 m16n8k32 — the
+// HALF-RATE FP4 path (~2x BF16), NOT the 4x FP4 peak (that needs kind::mxf4nvf4 at m16n8k64).
 // Register layout identical to FP8 m16n8k32 (inherits SM80 int8 layout).
 // a0..a3: .b32 A-operand regs (nibble-packed e2m1)
 // b0,b1:  .b32 B-operand regs (nibble-packed e2m1)
