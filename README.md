@@ -2,7 +2,7 @@
 
 **CUDA/PTX kernels for the NVIDIA DGX Spark (GB10, SM121).**
 
-To our knowledge, this is the first open-source library of hand-written PTX kernels targeting SM121 — the compute capability of the DGX Spark's GB10 superchip, and a close sibling of SM120 (the RTX 50-series). Every kernel is hand-written PTX assembly, assembled to SASS at build time by `ptxas`, embedded in a Rust binary, and dispatched through [`cudarc`](https://github.com/coreylowman/cudarc). Zero runtime CUDA-toolkit dependency: only the driver (`libcuda.so`) is needed on the box that runs it.
+To our knowledge, this is the first open-source library of hand(and Claude)-written PTX kernels targeting SM121 — the compute capability of the DGX Spark's GB10 superchip, and a close sibling of SM120 (the RTX 50-series). Every kernel is hand-written PTX assembly, assembled to SASS at build time by `ptxas`, embedded in a Rust binary, and dispatched through [`cudarc`](https://github.com/coreylowman/cudarc). Zero runtime CUDA-toolkit dependency: only the driver (`libcuda.so`) is needed on the box that runs it.
 
 **259 hand-written PTX kernel files** (each assembled to its own SASS cubin at build time; a few are templated into multiple dtype/shape variants) across:
 
