@@ -4,7 +4,7 @@
 
 To our knowledge, this is the first open-source library of hand(and Claude)-written PTX kernels targeting SM121 — the compute capability of the DGX Spark's GB10 superchip, and a close sibling of SM120 (the RTX 50-series). Every kernel is hand-written PTX assembly, assembled to SASS at build time by `ptxas`, embedded in a Rust binary, and dispatched through [`cudarc`](https://github.com/coreylowman/cudarc). Zero runtime CUDA-toolkit dependency: only the driver (`libcuda.so`) is needed on the box that runs it.
 
-**259 hand-written PTX kernel files** (each assembled to its own SASS cubin at build time; a few are templated into multiple dtype/shape variants) across:
+**259 hand(and Claude)-written PTX kernel files** (each assembled to its own SASS cubin at build time; a few are templated into multiple dtype/shape variants) across:
 
 - **Flash attention** — BF16 + FP8 forward (causal, GQA, paged-KV, split-KV, varlen, SWA, softcap, MLA), backward (BF16), FP8-KV decode and chunked-prefill paths
 - **GEMM** — BF16 MMA (incl. register-blocked and warp-specialized + TMA variants), FP8, W8A16, W4A16, NVFP4/MXFP4/MXFP8 block-scaled, deterministic split-K variants, backward
@@ -18,7 +18,7 @@ On top of the kernels, the crate also ships a Rust-level multi-node layer (`Nccl
 
 These kernels are built to run a full Qwen3-Next-style **GDN-hybrid** assistant on a single DGX Spark — a model surface no off-the-shelf toolchain covers end to end on SM121. The point of the library is **complete, deterministic, driver-only coverage** of that surface on a chip the mainstream stack doesn't fully support — not out-benchmarking NVIDIA's mature attention/GEMM libraries.
 
-## Why hand-written PTX for this chip?
+## Why PTX for this chip?
 
 SM120/SM121 sits in an awkward spot: it has TMA and the MMAv2 (`mma.sync.aligned`) tensor-core ISA, but **not** the tcgen05/TMEM/WGMMA path that FlashAttention-4, CUTLASS's flagship Blackwell kernels, and most "Blackwell" tooling target. As of June 2026: upstream FlashAttention-4 does not run on SM120 (ports exist only as open PRs), and NVIDIA's TensorRT-LLM FMHA cubins are SM100/SM103-only with no SM120/121 plan stated ([TensorRT-LLM #11799](https://github.com/NVIDIA/TensorRT-LLM/issues/11799)). First-party SM120 flash attention from CUTLASS and a fully stable Triton path on SM120 were both still in progress at that date (see [docs/cutlass_comparison.md](docs/cutlass_comparison.md) for the dated, linked status of each). Writing PTX directly against the MMAv2 + TMA ISA sidesteps the gap — and documents, kernel by kernel, what this hardware can actually do.
 
