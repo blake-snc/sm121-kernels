@@ -130,7 +130,7 @@ templated (non-additive mask/softmax) and remain hand files.
 |--------|--------|-------|
 | `gemm_bf16_*.ptx` | BF16 MMA m16n8k16 | Multiple variants |
 | `gemm_fp8_*.ptx` | FP8 E4M3 MMA m16n8k32 | Per-tensor scale |
-| `gemm_nvfp4_*.ptx` | NVFP4 block-scaled MMA | 16-block scales |
+| `gemm_nvfp4_*.ptx` | FP4 e2m1 block-scaled MMA (dense `gemm_nvfp4_mma` = MX/UE8M0 `mxf8f6f4` m16n8k32, half-rate; grouped = E4M3 NVFP4) | per-block scales |
 | `gemm_w4a16_*.ptx` | W4A16 quantized weights | Register dequant |
 | `gemv_bf16_split_k_w16.ptx` | Wide-block BF16 split-K GEMV | 16 cols/thread, 2048 cols/block — for large-N lm_head in BF16-only mode |
 
