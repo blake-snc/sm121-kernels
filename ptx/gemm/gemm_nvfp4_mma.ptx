@@ -4,8 +4,13 @@
 // A: [M, K/2] row-major, e2m1 nibble-packed along K (K elements = K/2 bytes per row)
 // B: [K/2, N] row-major, e2m1 K-packed (each byte = 2 consecutive K-elements for 1 N-col)
 // C: [M, N] row-major, BF16 output
-// scale_a: [ceil(M/16) * ceil(K/64)] UE8M0 (one per MMA A-fragment)
-// scale_b: [ceil(K/64) * ceil(N/8)] UE8M0 (one per MMA B-fragment)
+// scale_a: [ceil(M/16) * ceil(K/64)] UE8M0 (one per 64-K-element block, reused across the two K=32 MMAs in that block)
+// scale_b: [ceil(K/64) * ceil(N/8)] UE8M0 (one per 64-K-element block, reused across the two K=32 MMAs in that block)
+//
+// NOTE: this is MX-scaled FP4 (UE8M0), NOT NVFP4 — pair with quant_bf16_to_mxfp4.ptx (UE8M0).
+// Feeding quant_bf16_to_nvfp4.ptx output (E4M3 scales) here decodes them as UE8M0 = silently
+// wrong. Scale block = 64 elements (non-standard; coarser than OCP MXFP4=32 / NVFP4=16): not
+// drop-in for standard MXFP4/NVFP4 weights without re-blocking.
 //
 // Uses mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32
 // K=32 in the MMA means 32 FP4 ELEMENTS (one per 8-bit register container).
