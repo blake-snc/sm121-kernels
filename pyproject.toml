@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sm121-kernels"
-version = "0.1.0"
+version = "0.2.0"
 description = "Python ctypes bindings for sm121-kernels — CUDA/PTX kernels for the NVIDIA DGX Spark (GB10, SM121)"
 readme = "README.md"
 license = { text = "MIT OR Apache-2.0" }

@@ -3831,13 +3831,44 @@ pub fn flash_attn_fp8_v11_tma(
     Ok(())
 }
 
+/// The D-row stride (in FP8 elements = bytes) for the transposed `[D, B*H*Skv]` V^T layout.
+///
+/// Normally the D-rows are contiguous, so the stride is `total_kv_rows` (= B*H*Skv). But when
+/// `total_kv_rows` is a power of two the stride aliases a single DRAM channel (the S=4096 camping
+/// notch — see the `V12c` FP8 path), costing ~18% at 2^18 (256 KB). Since a padded stride is
+/// numerically inert (it changes only addresses, not values, and reads the same `total_kv_rows`
+/// valid tokens per row), this auto-applies a +512-element pad (~0.2% memory) on exactly the
+/// power-of-two strides that alias, moving them off the boundary with no user action. 512 keeps the
+/// TMA 16-byte alignment (FP8 = 1 B/elem). `QWEN_VT_PAD` overrides: an explicit value (including 0)
+/// forces that pad and disables the auto behavior — used for the pad-off/pad-on A/B.
+///
+/// This is the V^T layout contract: a caller that pre-transposes V must lay out the buffer at this
+/// stride (`fp8_vt_row_stride(total_kv_rows)` elements per D-row, `head_dim` rows). The dispatch's
+/// size check enforces it, so a contiguous buffer on an aliasing shape errors loudly rather than
+/// reading the wrong addresses.
+pub fn fp8_vt_row_stride(total_kv_rows: u32) -> u32 {
+    if let Ok(s) = std::env::var("QWEN_VT_PAD") {
+        if let Ok(pad) = s.parse::<u32>() {
+            return total_kv_rows + pad;
+        }
+    }
+    if total_kv_rows.is_power_of_two() {
+        total_kv_rows + 512
+    } else {
+        total_kv_rows
+    }
+}
+
 /// Create a TMA descriptor for FP8 V in transposed [D, B*H*Skv] GMEM layout.
 ///
-/// V_T[d, t] at byte d*total_kv_rows + t, where d=0..127 and t is the flat token index.
+/// V_T[d, t] at byte d*row_stride + t, where d=0..127 and t is the flat token index. `row_stride`
+/// is the D-row stride (>= total_kv_rows; see `fp8_vt_row_stride`); the fast-axis extent stays
+/// `total_kv_rows` so only the real tokens are addressable and any pad is unread.
 /// TMA loads a [tile_d × tile_tokens] = [128 × 64] tile using coord = {kv_row, 0}.
 fn create_tma_desc_fp8_vt(
     global_ptr: *mut core::ffi::c_void,
-    total_kv_rows: u32, // B * H * Skv (flat token count, = D-row stride in bytes)
+    total_kv_rows: u32, // B * H * Skv (flat token count = fast-axis extent)
+    row_stride: u32,    // D-row stride in FP8 elements (= total_kv_rows unless padded)
     head_dim: u32,      // D = 128
     tile_tokens: u32,   // 64
     tile_d: u32,        // 128
@@ -3848,8 +3879,10 @@ fn create_tma_desc_fp8_vt(
 
     // dim[0] = fast (token axis = B*H*Skv), dim[1] = slow (D axis = 128)
     let global_dim: [u64; 2] = [total_kv_rows as u64, head_dim as u64];
-    // stride[0] = bytes per D-row = total_kv_rows
-    let global_strides: [u64; 1] = [total_kv_rows as u64];
+    // stride[0] = bytes per D-row = row_stride (>= total_kv_rows; padded off a power-of-two alias
+    // when the caller requests it via fp8_vt_row_stride). The extent (global_dim[0]) stays
+    // total_kv_rows, so the pad region is never addressed.
+    let global_strides: [u64; 1] = [row_stride as u64];
     let box_dim: [u32; 2] = [tile_tokens, tile_d];
     let elem_strides: [u32; 2] = [1, 1];
 
@@ -4095,11 +4128,32 @@ pub fn flash_attn_fp8_v12c_vt(
     let total_q_rows = batch * num_heads * seq_q;
     let total_kv_rows = batch * num_heads * seq_kv;
 
+    // V_T row stride is auto-padded off a power-of-two DRAM-channel alias (the S=4096 notch); the
+    // caller lays out V_T at this stride. Enforced loudly so a contiguous buffer on an aliasing
+    // shape errors rather than silently reading the wrong addresses.
+    let vt_row_stride = fp8_vt_row_stride(total_kv_rows);
+    let vt_need = vt_row_stride as usize * HEAD_DIM as usize;
+    if v_t.len() < vt_need {
+        return Err(SparkError::InvalidArgument(format!(
+            "V_T buffer too small for padded row stride: {} < {vt_need} (B*H*Skv={total_kv_rows} \
+             is a power of two, so V_T must be laid out at fp8_vt_row_stride() = {vt_row_stride} \
+             elements per D-row to avoid the DRAM-channel notch; set QWEN_VT_PAD=0 to opt out)",
+            v_t.len()
+        )));
+    }
+
     // Q/K: SWIZZLE_128B. V_T: transposed layout [D, B*H*Skv], SWIZZLE_NONE.
     let q_tma = create_tma_desc_fp8_swizzle(q_dptr as *mut _, total_q_rows, HEAD_DIM, 64, 128)?;
     let k_tma = create_tma_desc_fp8_swizzle(k_dptr as *mut _, total_kv_rows, HEAD_DIM, 64, 128)?;
     // V_T descriptor: global_dim=[B*H*Skv, D=128], box=[64 tokens, 128 D], coord={kv_row, 0}
-    let vt_tma = create_tma_desc_fp8_vt(vt_dptr as *mut _, total_kv_rows, HEAD_DIM, 64, 128)?;
+    let vt_tma = create_tma_desc_fp8_vt(
+        vt_dptr as *mut _,
+        total_kv_rows,
+        vt_row_stride,
+        HEAD_DIM,
+        64,
+        128,
+    )?;
 
     let q_tma_u32: [u32; 32] = unsafe { core::mem::transmute(q_tma) };
     let k_tma_u32: [u32; 32] = unsafe { core::mem::transmute(k_tma) };
@@ -4231,7 +4285,14 @@ pub fn flash_attn_fp8_v12c_vt_causal(
 
     let q_tma = create_tma_desc_fp8_swizzle(q_dptr as *mut _, total_q_rows, HEAD_DIM, 64, 128)?;
     let k_tma = create_tma_desc_fp8_swizzle(k_dptr as *mut _, total_kv_rows, HEAD_DIM, 64, 128)?;
-    let vt_tma = create_tma_desc_fp8_vt(vt_dptr as *mut _, total_kv_rows, HEAD_DIM, 64, 128)?;
+    let vt_tma = create_tma_desc_fp8_vt(
+        vt_dptr as *mut _,
+        total_kv_rows,
+        total_kv_rows,
+        HEAD_DIM,
+        64,
+        128,
+    )?;
 
     let q_tma_u32: [u32; 32] = unsafe { core::mem::transmute(q_tma) };
     let k_tma_u32: [u32; 32] = unsafe { core::mem::transmute(k_tma) };
@@ -4369,8 +4430,14 @@ pub fn flash_attn_fp8_v12c_vt_varlen(
         create_tma_desc_fp8_swizzle(q_dptr as *mut _, num_heads * total_q, HEAD_DIM, 64, 128)?;
     let k_tma =
         create_tma_desc_fp8_swizzle(k_dptr as *mut _, num_heads * total_kv, HEAD_DIM, 64, 128)?;
-    let vt_tma =
-        create_tma_desc_fp8_vt(vt_dptr as *mut _, num_heads * total_kv, HEAD_DIM, 64, 128)?;
+    let vt_tma = create_tma_desc_fp8_vt(
+        vt_dptr as *mut _,
+        num_heads * total_kv,
+        num_heads * total_kv,
+        HEAD_DIM,
+        64,
+        128,
+    )?;
 
     let q_tma_u32: [u32; 32] = unsafe { core::mem::transmute(q_tma) };
     let k_tma_u32: [u32; 32] = unsafe { core::mem::transmute(k_tma) };
@@ -4509,8 +4576,14 @@ pub fn flash_attn_fp8_v12c_vt_varlen_causal(
         create_tma_desc_fp8_swizzle(q_dptr as *mut _, num_heads * total_q, HEAD_DIM, 64, 128)?;
     let k_tma =
         create_tma_desc_fp8_swizzle(k_dptr as *mut _, num_heads * total_kv, HEAD_DIM, 64, 128)?;
-    let vt_tma =
-        create_tma_desc_fp8_vt(vt_dptr as *mut _, num_heads * total_kv, HEAD_DIM, 64, 128)?;
+    let vt_tma = create_tma_desc_fp8_vt(
+        vt_dptr as *mut _,
+        num_heads * total_kv,
+        num_heads * total_kv,
+        HEAD_DIM,
+        64,
+        128,
+    )?;
 
     let q_tma_u32: [u32; 32] = unsafe { core::mem::transmute(q_tma) };
     let k_tma_u32: [u32; 32] = unsafe { core::mem::transmute(k_tma) };
@@ -4633,7 +4706,14 @@ pub fn flash_attn_fp8_v12c_vt_gqa(
 
     let q_tma = create_tma_desc_fp8_swizzle(q_dptr as *mut _, total_q_rows, HEAD_DIM, 64, 128)?;
     let k_tma = create_tma_desc_fp8_swizzle(k_dptr as *mut _, total_kv_rows, HEAD_DIM, 64, 128)?;
-    let vt_tma = create_tma_desc_fp8_vt(vt_dptr as *mut _, total_kv_rows, HEAD_DIM, 64, 128)?;
+    let vt_tma = create_tma_desc_fp8_vt(
+        vt_dptr as *mut _,
+        total_kv_rows,
+        total_kv_rows,
+        HEAD_DIM,
+        64,
+        128,
+    )?;
 
     let q_tma_u32: [u32; 32] = unsafe { core::mem::transmute(q_tma) };
     let k_tma_u32: [u32; 32] = unsafe { core::mem::transmute(k_tma) };
@@ -4747,7 +4827,14 @@ pub fn flash_attn_fp8_v12c_vt_gqa_causal(
 
     let q_tma = create_tma_desc_fp8_swizzle(q_dptr as *mut _, total_q_rows, HEAD_DIM, 64, 128)?;
     let k_tma = create_tma_desc_fp8_swizzle(k_dptr as *mut _, total_kv_rows, HEAD_DIM, 64, 128)?;
-    let vt_tma = create_tma_desc_fp8_vt(vt_dptr as *mut _, total_kv_rows, HEAD_DIM, 64, 128)?;
+    let vt_tma = create_tma_desc_fp8_vt(
+        vt_dptr as *mut _,
+        total_kv_rows,
+        total_kv_rows,
+        HEAD_DIM,
+        64,
+        128,
+    )?;
 
     let q_tma_u32: [u32; 32] = unsafe { core::mem::transmute(q_tma) };
     let k_tma_u32: [u32; 32] = unsafe { core::mem::transmute(k_tma) };
@@ -4889,6 +4976,7 @@ pub fn flash_attn_fp8_v12c_vt_varlen_gqa(
         create_tma_desc_fp8_swizzle(k_dptr as *mut _, num_heads_kv * total_kv, HEAD_DIM, 64, 128)?;
     let vt_tma = create_tma_desc_fp8_vt(
         vt_dptr as *mut _,
+        num_heads_kv * total_kv,
         num_heads_kv * total_kv,
         HEAD_DIM,
         64,
@@ -5033,6 +5121,7 @@ pub fn flash_attn_fp8_v12c_vt_varlen_gqa_causal(
         create_tma_desc_fp8_swizzle(k_dptr as *mut _, num_heads_kv * total_kv, HEAD_DIM, 64, 128)?;
     let vt_tma = create_tma_desc_fp8_vt(
         vt_dptr as *mut _,
+        num_heads_kv * total_kv,
         num_heads_kv * total_kv,
         HEAD_DIM,
         64,

@@ -5,13 +5,13 @@
 //
 // Per (batch, head, channel) state h is a vector of length D_state.
 // Update:
-//   decay[i] = exp(A_log[i] * delta)
+//   decay[i] = exp(a[i] * delta)   // a = A = -exp(A_log): the decay rate, NOT raw A_log
 //   h[i]     = h[i] * decay[i] + B[i] * x * delta
 //   y        = Σ_i C[i] * h[i]
 //
 // Layouts:
 //   x, delta, y: [B, H]              FP32
-//   A_log, B, C: [B, H, D_state=128] FP32
+//   a (=A=-exp(A_log)), B, C: [B, H, D_state=128] FP32
 //   h: [B, H, D_state]                FP32 (in-place update)
 //
 // Grid: (num_heads, batch). Block: (128, 1, 1) — one thread per state element.

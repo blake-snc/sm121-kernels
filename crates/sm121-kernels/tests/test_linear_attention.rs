@@ -111,7 +111,7 @@ fn run_mamba2_decode_test(npz_name: &str, tol_y: f32, tol_state: f32) {
     let mut npz = load_npz(npz_name);
     let x: ndarray::Array2<f32> = npz.by_name("x").unwrap();
     let delta: ndarray::Array2<f32> = npz.by_name("delta").unwrap();
-    let a_log: ndarray::Array3<f32> = npz.by_name("A_log").unwrap();
+    let a_log: ndarray::Array3<f32> = npz.by_name("a").unwrap();
     let b_proj: ndarray::Array3<f32> = npz.by_name("B").unwrap();
     let c_proj: ndarray::Array3<f32> = npz.by_name("C").unwrap();
     let h_in: ndarray::Array3<f32> = npz.by_name("h_in").unwrap();
@@ -180,6 +180,74 @@ fn test_mamba2_decode_b1_h4() {
 #[test]
 fn test_mamba2_decode_b2_h8() {
     run_mamba2_decode_test("mamba2_decode_B2_H8.npz", 0.001, 0.0001);
+}
+
+/// Negative-convention guard. The `a` argument is the decay rate A = -exp(A_log), NOT the raw
+/// `A_log` weight. A caller who reads the signature and passes the raw parameter would get
+/// plausible-but-wrong numerics and, if they generated their golden the same way, never notice —
+/// the exact GDN failure structure, at the interface layer. This feeds the raw-A_log convention
+/// (a_raw = ln(-a) = A_log) through the public interface and asserts it diverges loudly from the
+/// golden, so the wrong convention can never pass silently.
+#[test]
+fn test_mamba2_decode_raw_alog_convention_diverges() {
+    let ctx = device::init_device(0).expect("failed to init SM121");
+    let stream = ctx.default_stream();
+
+    let mut npz = load_npz("mamba2_decode_B1_H4.npz");
+    let x: ndarray::Array2<f32> = npz.by_name("x").unwrap();
+    let delta: ndarray::Array2<f32> = npz.by_name("delta").unwrap();
+    let a: ndarray::Array3<f32> = npz.by_name("a").unwrap(); // A = -exp(A_log), stored negative
+    let b_proj: ndarray::Array3<f32> = npz.by_name("B").unwrap();
+    let c_proj: ndarray::Array3<f32> = npz.by_name("C").unwrap();
+    let h_in: ndarray::Array3<f32> = npz.by_name("h_in").unwrap();
+    let y_expected: ndarray::Array2<f32> = npz.by_name("y").unwrap();
+    let batch: ndarray::Array0<u32> = npz.by_name("batch").unwrap();
+    let num_heads: ndarray::Array0<u32> = npz.by_name("num_heads").unwrap();
+    let batch = batch.into_scalar();
+    let num_heads = num_heads.into_scalar();
+
+    let x_flat: Vec<f32> = x.into_raw_vec_and_offset().0;
+    let delta_flat: Vec<f32> = delta.into_raw_vec_and_offset().0;
+    // Reconstruct the RAW A_log a naive caller would pass: A_log = ln(-A), since A = -exp(A_log).
+    let a_raw: Vec<f32> = a
+        .into_raw_vec_and_offset()
+        .0
+        .iter()
+        .map(|v| (-v).ln())
+        .collect();
+    let b_flat: Vec<f32> = b_proj.into_raw_vec_and_offset().0;
+    let c_flat: Vec<f32> = c_proj.into_raw_vec_and_offset().0;
+    let h_flat: Vec<f32> = h_in.into_raw_vec_and_offset().0;
+    let y_expected_flat: Vec<f32> = y_expected.into_raw_vec_and_offset().0;
+
+    let x_dev = stream.memcpy_stod(&x_flat).unwrap();
+    let delta_dev = stream.memcpy_stod(&delta_flat).unwrap();
+    let a_dev = stream.memcpy_stod(&a_raw).unwrap();
+    let b_dev = stream.memcpy_stod(&b_flat).unwrap();
+    let c_dev = stream.memcpy_stod(&c_flat).unwrap();
+    let mut h_dev = stream.memcpy_stod(&h_flat).unwrap();
+    let mut y_dev = stream.alloc_zeros::<f32>(x_flat.len()).unwrap();
+
+    linear_attention::mamba2_selective_scan_decode(
+        &ctx, &stream, &x_dev, &delta_dev, &a_dev, &b_dev, &c_dev, &mut h_dev, &mut y_dev, batch,
+        num_heads,
+    )
+    .expect("Mamba2 decode failed");
+
+    let y_host = stream.memcpy_dtov(&y_dev).unwrap();
+    let mut max_y_diff: f32 = 0.0;
+    for (p, q) in y_host.iter().zip(y_expected_flat.iter()) {
+        max_y_diff = max_y_diff.max((p - q).abs());
+    }
+    eprintln!(
+        "raw-A_log convention: y max_diff={max_y_diff:.6} (correct convention passes at <=0.001)"
+    );
+    // Correct convention passes at <=0.001; the raw-A_log convention must diverge well beyond that.
+    assert!(
+        max_y_diff > 0.01,
+        "raw-A_log convention did not diverge loudly (max_diff={max_y_diff}); the a = -exp(A_log) \
+         guard would let the wrong convention pass silently",
+    );
 }
 
 fn run_gdn_prefill_test(npz_name: &str, tol_y: f32, tol_state: f32) {
@@ -407,7 +475,7 @@ fn run_mamba2_prefill_test(npz_name: &str, tol_y: f32, tol_state: f32) {
     let mut npz = load_npz(npz_name);
     let x: ndarray::Array3<f32> = npz.by_name("x").unwrap();
     let delta: ndarray::Array3<f32> = npz.by_name("delta").unwrap();
-    let a_log: ndarray::Array4<f32> = npz.by_name("A_log").unwrap();
+    let a_log: ndarray::Array4<f32> = npz.by_name("a").unwrap();
     let b_proj: ndarray::Array4<f32> = npz.by_name("B").unwrap();
     let c_proj: ndarray::Array4<f32> = npz.by_name("C").unwrap();
     let h_in: ndarray::Array3<f32> = npz.by_name("h_in").unwrap();

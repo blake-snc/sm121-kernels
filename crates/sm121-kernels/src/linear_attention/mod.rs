@@ -1175,13 +1175,18 @@ pub const MAMBA2_D_STATE: u32 = 128;
 
 /// Launch Mamba2 selective scan decode (single token).
 /// Used by Nemotron-H and Mamba2 family models.
+///
+/// `a` is the decay rate A = -exp(A_log): already negated and exponentiated, NOT the raw `A_log`
+/// weight. A caller holding the raw parameter must pass `-exp(A_log)`, not `A_log` (passing the raw
+/// value gives plausible-but-wrong numerics; guarded by the negative-convention test in
+/// test_linear_attention).
 #[allow(clippy::too_many_arguments)]
 pub fn mamba2_selective_scan_decode(
     ctx: &Arc<CudaContext>,
     stream: &Arc<CudaStream>,
     x: &CudaSlice<f32>,
     delta: &CudaSlice<f32>,
-    a_log: &CudaSlice<f32>,
+    a: &CudaSlice<f32>,
     b: &CudaSlice<f32>,
     c: &CudaSlice<f32>,
     h: &mut CudaSlice<f32>,
@@ -1201,10 +1206,7 @@ pub fn mamba2_selective_scan_decode(
             "Mamba2 x/delta/y buffer too small".into(),
         ));
     }
-    if a_log.len() < state_need
-        || b.len() < state_need
-        || c.len() < state_need
-        || h.len() < state_need
+    if a.len() < state_need || b.len() < state_need || c.len() < state_need || h.len() < state_need
     {
         return Err(SparkError::InvalidArgument(
             "Mamba2 state buffer too small".into(),
@@ -1215,7 +1217,7 @@ pub fn mamba2_selective_scan_decode(
 
     let (x_ptr, _a) = x.device_ptr(stream);
     let (delta_ptr, _b) = delta.device_ptr(stream);
-    let (a_log_ptr, _c) = a_log.device_ptr(stream);
+    let (a_ptr, _c) = a.device_ptr(stream);
     let (b_ptr, _d) = b.device_ptr(stream);
     let (c_ptr, _e) = c.device_ptr(stream);
     let (h_ptr, _h) = h.device_ptr(stream);
@@ -1231,7 +1233,7 @@ pub fn mamba2_selective_scan_decode(
     let params: [*mut core::ffi::c_void; 8] = [
         &x_ptr as *const u64 as *mut _,
         &delta_ptr as *const u64 as *mut _,
-        &a_log_ptr as *const u64 as *mut _,
+        &a_ptr as *const u64 as *mut _,
         &b_ptr as *const u64 as *mut _,
         &c_ptr as *const u64 as *mut _,
         &h_ptr as *const u64 as *mut _,
@@ -1366,13 +1368,16 @@ pub fn gdn_prefill(
 
 /// Launch Mamba2 selective scan prefill (sequential reference).
 /// Holds state element per thread across all seq_q tokens in one kernel call.
+///
+/// `a` is the decay rate A = -exp(A_log), same convention as the decode path: pass the negated,
+/// exponentiated rate, not the raw `A_log` weight.
 #[allow(clippy::too_many_arguments)]
 pub fn mamba2_selective_scan_prefill(
     ctx: &Arc<CudaContext>,
     stream: &Arc<CudaStream>,
     x: &CudaSlice<f32>,
     delta: &CudaSlice<f32>,
-    a_log: &CudaSlice<f32>,
+    a: &CudaSlice<f32>,
     b: &CudaSlice<f32>,
     c: &CudaSlice<f32>,
     h: &mut CudaSlice<f32>,
@@ -1391,7 +1396,7 @@ pub fn mamba2_selective_scan_prefill(
 
     let (x_ptr, _a) = x.device_ptr(stream);
     let (delta_ptr, _b) = delta.device_ptr(stream);
-    let (a_log_ptr, _c) = a_log.device_ptr(stream);
+    let (a_ptr, _c) = a.device_ptr(stream);
     let (b_ptr, _d) = b.device_ptr(stream);
     let (c_ptr, _e) = c.device_ptr(stream);
     let (h_ptr, _h) = h.device_ptr(stream);
@@ -1407,7 +1412,7 @@ pub fn mamba2_selective_scan_prefill(
     let params: [*mut core::ffi::c_void; 9] = [
         &x_ptr as *const u64 as *mut _,
         &delta_ptr as *const u64 as *mut _,
-        &a_log_ptr as *const u64 as *mut _,
+        &a_ptr as *const u64 as *mut _,
         &b_ptr as *const u64 as *mut _,
         &c_ptr as *const u64 as *mut _,
         &h_ptr as *const u64 as *mut _,

@@ -10,7 +10,7 @@
 //
 // Layouts:
 //   x, delta, y: [B, seq_q, H] FP32
-//   A_log, B, C: [B, seq_q, H, D_state=128] FP32  (per-token selective)
+//   a (=A=-exp(A_log)), B, C: [B, seq_q, H, D_state=128] FP32  (per-token selective)
 //     (Non-selective A_log variant would broadcast — here we take full selective.)
 //   h: [B, H, D_state] FP32 (initial state; updated in place)
 //

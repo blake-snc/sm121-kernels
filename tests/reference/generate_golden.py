@@ -1316,7 +1316,7 @@ def gen_mamba2_decode():
         np.savez(
             OUT / f"mamba2_decode_B{B}_H{H}.npz",
             x=x.cpu().numpy(), delta=delta.cpu().numpy(),
-            A_log=A_log.cpu().numpy(), B=B_proj.cpu().numpy(), C=C_proj.cpu().numpy(),
+            a=A_log.cpu().numpy(), B=B_proj.cpu().numpy(), C=C_proj.cpu().numpy(),
             h_in=h_in.cpu().numpy(), h_out=h_out.cpu().numpy(), y=y.cpu().numpy(),
             batch=np.uint32(B), num_heads=np.uint32(H),
         )
@@ -1344,7 +1344,7 @@ def gen_mamba2_prefill():
         np.savez(
             OUT / f"mamba2_prefill_B{B}_H{H}_Sq{Sq}.npz",
             x=x.cpu().numpy(), delta=delta.cpu().numpy(),
-            A_log=A_log.cpu().numpy(), B=B_proj.cpu().numpy(), C=C_proj.cpu().numpy(),
+            a=A_log.cpu().numpy(), B=B_proj.cpu().numpy(), C=C_proj.cpu().numpy(),
             h_in=h_in.cpu().numpy(), h_out=h.cpu().numpy(), y=y.cpu().numpy(),
             batch=np.uint32(B), num_heads=np.uint32(H), seq_q=np.uint32(Sq),
         )
