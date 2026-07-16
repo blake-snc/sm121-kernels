@@ -2,9 +2,9 @@
 
 **CUDA/PTX kernels for the NVIDIA DGX Spark (GB10, SM121).**
 
-To our knowledge, this is the first open-source library of hand(and Claude)-written PTX kernels targeting SM121 — the compute capability of the DGX Spark's GB10 superchip, and a close sibling of SM120 (the RTX 50-series). Every kernel is hand-written PTX assembly, assembled to SASS at build time by `ptxas`, embedded in a Rust binary, and dispatched through [`cudarc`](https://github.com/coreylowman/cudarc). Zero runtime CUDA-toolkit dependency: only the driver (`libcuda.so`) is needed on the box that runs it.
+To our knowledge, this is the first open-source library of hand-written PTX kernels targeting SM121 — the compute capability of the DGX Spark's GB10 superchip, and a close sibling of SM120 (the RTX 50-series). Every kernel is hand-written PTX assembly, assembled to SASS at build time by `ptxas`, embedded in a Rust binary, and dispatched through [`cudarc`](https://github.com/coreylowman/cudarc). Zero runtime CUDA-toolkit dependency: only the driver (`libcuda.so`) is needed on the box that runs it.
 
-**259 hand(and Claude)-written PTX kernel files** (each assembled to its own SASS cubin at build time; a few are templated into multiple dtype/shape variants) across:
+**259 hand-written PTX kernel files** (each assembled to its own SASS cubin at build time; a few are templated into multiple dtype/shape variants) across:
 
 - **Flash attention** — BF16 + FP8 forward (causal, GQA, paged-KV, split-KV, varlen, SWA, softcap, MLA), backward (BF16), FP8-KV decode and chunked-prefill paths
 - **GEMM** — BF16 MMA (incl. register-blocked and warp-specialized + TMA variants), FP8, W8A16, W4A16, NVFP4/MXFP4/MXFP8 block-scaled, deterministic split-K variants, backward
